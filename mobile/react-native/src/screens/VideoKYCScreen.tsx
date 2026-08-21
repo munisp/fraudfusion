@@ -1,0 +1,1 @@
+import React from 'react'; import { ApiScreen } from './ApiScreen'; import { MobileApi } from '../services/MobileApi'; export default function VideoKYCScreen(): React.JSX.Element { return <ApiScreen title="Video KYC" load={MobileApi.profile} />; }

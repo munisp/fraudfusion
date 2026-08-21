@@ -1,0 +1,1 @@
+import React from 'react'; import { ApiScreen } from './ApiScreen'; import { MobileApi } from '../services/MobileApi'; export default function SettingsScreen(): React.JSX.Element { return <ApiScreen title="Settings" load={MobileApi.profile} />; }

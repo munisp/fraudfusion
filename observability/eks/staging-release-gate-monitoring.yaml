@@ -1,0 +1,250 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fraudfusion-observability
+  labels:
+    app.kubernetes.io/part-of: fraudfusion
+    environment: staging
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: release-gate-metrics
+  namespace: fraudfusion-observability
+  annotations:
+    # Replace with the IAM role that can read only the named staging secret.
+    eks.amazonaws.com/role-arn: arn:aws:iam::<AWS_ACCOUNT_ID>:role/fraudfusion-staging-release-gate-metrics
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: release-gate-metrics-secrets
+  namespace: fraudfusion-observability
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: aws-secrets-manager
+  target:
+    name: release-gate-metrics-secrets
+    creationPolicy: Owner
+  data:
+    - secretKey: hmac-keys-json
+      remoteRef:
+        key: /fraudfusion/staging/release-gate-metrics
+        property: hmac_keys_json
+    - secretKey: pagerduty-routing-key
+      remoteRef:
+        key: /fraudfusion/staging/alertmanager
+        property: pagerduty_routing_key
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: release-gate-metrics
+  namespace: fraudfusion-observability
+  labels:
+    app.kubernetes.io/name: release-gate-metrics
+    app.kubernetes.io/part-of: fraudfusion
+    environment: staging
+spec:
+  # A single replica preserves in-memory replay-idempotency until a durable shared replay store is introduced.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: release-gate-metrics
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: release-gate-metrics
+        app.kubernetes.io/part-of: fraudfusion
+        environment: staging
+    spec:
+      serviceAccountName: release-gate-metrics
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: metrics
+          image: <ECR_REGISTRY>/fraudfusion/release-gate-metrics:<IMMUTABLE_IMAGE_DIGEST>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ENVIRONMENT
+              value: staging
+            - name: RELEASE_GATE_INGEST_HMAC_KEYS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: release-gate-metrics-secrets
+                  key: hmac-keys-json
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: release-gate-metrics
+  namespace: fraudfusion-observability
+  labels:
+    app.kubernetes.io/name: release-gate-metrics
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: release-gate-metrics
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: release-gate-metrics-ingress
+  namespace: fraudfusion-observability
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: release-gate-metrics
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        # Self-hosted GitHub Actions runners inside the staging VPC.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: github-runners
+        # Prometheus scrapes metrics only from its namespace.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # The service has no required outbound network dependencies.
+    []
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: release-gate-metrics
+  namespace: fraudfusion-observability
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: release-gate-metrics
+  namespaceSelector:
+    matchNames: [fraudfusion-observability]
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fraudfusion-release-gates
+  namespace: fraudfusion-observability
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: fraudfusion.release_gates
+      interval: 30s
+      rules:
+        - record: fraudfusion_release_gate_failures
+          expr: fraudfusion_release_gate_failures_total
+        - alert: FraudFusionVulnerabilityGateFailure
+          expr: increase(fraudfusion_release_gate_failures_total{environment="staging",gate="dependency-security"}[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            service: fraudfusion-ci
+            release_gate: dependency-security
+          annotations:
+            summary: FraudFusion dependency-security gate failed
+            description: A staging CI run reported a high or critical production dependency vulnerability. Promotion remains blocked.
+            runbook_url: https://runbooks.example.invalid/fraudfusion/vulnerability-gate
+        - alert: FraudFusionGoVulnerabilityGateFailure
+          expr: increase(fraudfusion_release_gate_failures_total{environment="staging",gate="govulncheck"}[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            service: fraudfusion-ci
+            release_gate: govulncheck
+          annotations:
+            summary: FraudFusion Go vulnerability scan failed
+            description: A reachable Go vulnerability was reported. Promotion remains blocked.
+            runbook_url: https://runbooks.example.invalid/fraudfusion/go-vulnerability-gate
+        - alert: FraudFusionIntegrationRegression
+          expr: increase(fraudfusion_e2e_scenario_total{environment="staging",result="failure"}[15m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+            service: fraudfusion-e2e
+            release_gate: integration
+          annotations:
+            summary: FraudFusion mobile-to-backend integration scenario failed
+            description: An authenticated staging scenario failed. Promotion remains blocked pending a successful rerun.
+            runbook_url: https://runbooks.example.invalid/fraudfusion/integration-regression
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: fraudfusion-release-gates
+  namespace: fraudfusion-observability
+  labels:
+    release: kube-prometheus-stack
+spec:
+  route:
+    receiver: pagerduty-security-oncall
+    groupBy: [alertname, service, environment]
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 4h
+    routes:
+      - receiver: pagerduty-security-oncall
+        matchers:
+          - name: severity
+            matchType: "="
+            value: critical
+  receivers:
+    - name: pagerduty-security-oncall
+      pagerdutyConfigs:
+        - routingKey:
+            name: release-gate-metrics-secrets
+            key: pagerduty-routing-key
+          sendResolved: true
+          description: '{{ .CommonAnnotations.summary }} — {{ .CommonAnnotations.description }}'
+          details:
+            environment: staging
+            alertname: '{{ .CommonLabels.alertname }}'
+            service: '{{ .CommonLabels.service }}'
+            release_gate: '{{ .CommonLabels.release_gate }}'

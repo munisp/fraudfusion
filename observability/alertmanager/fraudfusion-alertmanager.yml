@@ -1,0 +1,37 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: platform-security-oncall
+  group_by: [alertname, service, environment]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - severity="critical"
+      receiver: platform-security-oncall
+      continue: false
+    - matchers:
+        - severity="warning"
+      receiver: platform-engineering-oncall
+      continue: false
+
+receivers:
+  - name: platform-security-oncall
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/security-oncall-webhook-url
+        send_resolved: true
+        max_alerts: 0
+  - name: platform-engineering-oncall
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/engineering-oncall-webhook-url
+        send_resolved: true
+        max_alerts: 0
+
+inhibit_rules:
+  - source_matchers:
+      - alertname="FraudFusionVulnerabilityGateFailure"
+    target_matchers:
+      - alertname="FraudFusionIntegrationRegression"
+    equal: [service]

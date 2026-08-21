@@ -1,0 +1,1 @@
+import React from 'react'; import { ApiScreen } from './ApiScreen'; import { MobileApi } from '../services/MobileApi'; export default function FraudAlertsScreen(): React.JSX.Element { return <ApiScreen title="Fraud alerts" load={MobileApi.alerts} />; }

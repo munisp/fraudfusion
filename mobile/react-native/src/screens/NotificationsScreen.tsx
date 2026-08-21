@@ -1,0 +1,1 @@
+import React from 'react'; import { ApiScreen } from './ApiScreen'; import { MobileApi } from '../services/MobileApi'; export default function NotificationsScreen(): React.JSX.Element { return <ApiScreen title="Notifications" load={MobileApi.notifications} />; }

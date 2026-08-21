@@ -1,0 +1,1 @@
+import React from 'react'; import { ApiScreen } from './ApiScreen'; import { MobileApi } from '../services/MobileApi'; export default function DocumentUploadScreen(): React.JSX.Element { return <ApiScreen title="Document upload" load={MobileApi.documents} />; }

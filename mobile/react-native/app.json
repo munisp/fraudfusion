@@ -1,0 +1,16 @@
+{
+  "name": "FraudFusion",
+  "displayName": "FraudFusion",
+  "react-native": {
+    "android": {
+      "packageName": "com.fraudfusion.mobile"
+    },
+    "ios": {
+      "bundleIdentifier": "com.fraudfusion.mobile",
+      "infoPlist": {
+        "NSFaceIDUsageDescription": "FraudFusion uses Face ID to protect your session and confirm sensitive actions.",
+        "NSUserNotificationUsageDescription": "FraudFusion sends security and case-status notifications only after you grant permission."
+      }
+    }
+  }
+}

@@ -1,0 +1,1 @@
+import React from 'react'; import { ApiScreen } from './ApiScreen'; import { MobileApi } from '../services/MobileApi'; export default function KYCStatusScreen(): React.JSX.Element { return <ApiScreen title="KYC status" load={MobileApi.dashboard} />; }
