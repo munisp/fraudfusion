@@ -19,3 +19,6 @@ artifacts/
 
 # Go test binaries
 *.test
+
+# Local contract-test build output
+local-e2e/go-mobile-mock/go-mobile-mock
