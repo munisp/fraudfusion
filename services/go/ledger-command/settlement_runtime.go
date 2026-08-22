@@ -78,16 +78,29 @@ func newSettlementProviderFromEnv() (*settlementProvider, error) {
 	if strings.TrimSpace(name) == "" {
 		return nil, errors.New("SETTLEMENT_PROVIDER_NAME is empty")
 	}
-	submitURL := requiredEnv("SETTLEMENT_PROVIDER_SUBMIT_URL")
-	parsedURL, err := url.ParseRequestURI(submitURL)
-	if err != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" {
-		return nil, errors.New("SETTLEMENT_PROVIDER_SUBMIT_URL must be an https URL")
+	submitURL, err := requiredHTTPSURL("SETTLEMENT_PROVIDER_SUBMIT_URL")
+	if err != nil {
+		return nil, err
+	}
+	parsedURL, _ := url.ParseRequestURI(submitURL)
+	allowedHosts := strings.Split(requiredEnv("SETTLEMENT_PROVIDER_ALLOWED_HOSTS"), ",")
+	if !hostAllowed(parsedURL.Hostname(), allowedHosts) {
+		return nil, errors.New("SETTLEMENT_PROVIDER_SUBMIT_URL host is not allowlisted")
 	}
 	callbackKey := []byte(requiredEnv("SETTLEMENT_PROVIDER_CALLBACK_HMAC_SECRET"))
 	if len(callbackKey) < 32 {
 		return nil, errors.New("SETTLEMENT_PROVIDER_CALLBACK_HMAC_SECRET must contain at least 32 bytes")
 	}
 	return &settlementProvider{name: name, submitURL: submitURL, callbackKey: callbackKey, httpClient: &http.Client{Timeout: providerRequestTimeout}, maxAttempts: outboxMaxAttempts}, nil
+}
+
+func hostAllowed(host string, allowedHosts []string) bool {
+	for _, allowedHost := range allowedHosts {
+		if strings.EqualFold(strings.TrimSpace(allowedHost), host) {
+			return true
+		}
+	}
+	return false
 }
 
 func newSettlementDispatcher(db *pgxpool.Pool, provider *settlementProvider) (*settlementDispatcher, error) {
@@ -198,7 +211,9 @@ func (d *settlementDispatcher) submitEvent(ctx context.Context, event leasedOutb
 }
 
 func (d *settlementDispatcher) markPublished(ctx context.Context, event leasedOutboxEvent, submission providerSubmission) error {
-	tx, err := d.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// The lease predicate and settlement row predicate provide ownership and state safety;
+	// read committed avoids unrelated serializable aborts across dispatcher replicas after a provider has accepted a request.
+	tx, err := d.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return err
 	}

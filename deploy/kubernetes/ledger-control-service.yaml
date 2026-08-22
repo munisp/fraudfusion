@@ -4,12 +4,17 @@ metadata:
   name: fraudfusion-financial
   labels:
     app.kubernetes.io/part-of: fraudfusion
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: ledger-control-service
   namespace: fraudfusion-financial
+automountServiceAccountToken: false
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -22,6 +27,11 @@ metadata:
 spec:
   replicas: 3
   revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: ledger-control-service
@@ -32,14 +42,31 @@ spec:
         app.kubernetes.io/part-of: fraudfusion
     spec:
       serviceAccountName: ledger-control-service
+      automountServiceAccountToken: false
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ledger-control-service
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: ledger-control-service
       containers:
         - name: ledger-control-service
-          image: registry.example.invalid/fraudfusion/ledger-control-service@sha256:<REPLACE_WITH_SIGNED_IMMUTABLE_DIGEST>
+          image: __LEDGER_IMAGE_REFERENCE__
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -47,9 +74,57 @@ spec:
           env:
             - name: LISTEN_ADDR
               value: ":8098"
-          envFrom:
-            - secretRef:
-                name: ledger-control-service-secrets
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-control-service-secrets
+                  key: database-url
+            - name: KEYCLOAK_INTROSPECTION_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-control-service-secrets
+                  key: keycloak-introspection-url
+            - name: KEYCLOAK_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-control-service-secrets
+                  key: keycloak-client-id
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-control-service-secrets
+                  key: keycloak-client-secret
+            - name: SETTLEMENT_PROVIDER_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-control-service-secrets
+                  key: settlement-provider-name
+            - name: SETTLEMENT_PROVIDER_SUBMIT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-control-service-secrets
+                  key: settlement-provider-submit-url
+            - name: SETTLEMENT_PROVIDER_ALLOWED_HOSTS
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-control-service-secrets
+                  key: settlement-provider-allowed-hosts
+            - name: SETTLEMENT_PROVIDER_CALLBACK_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: ledger-control-service-secrets
+                  key: settlement-provider-callback-hmac-secret
+            - name: HTTPS_PROXY
+              value: http://ledger-egress-proxy.fraudfusion-egress.svc.cluster.local:8443
+            - name: NO_PROXY
+              value: .svc,.cluster.local,localhost,127.0.0.1
+          startupProbe:
+            httpGet:
+              path: /api/v1/ledger/health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 12
           readinessProbe:
             httpGet:
               path: /api/v1/ledger/health
@@ -169,11 +244,15 @@ spec:
         - protocol: TCP
           port: 8443
     - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fraudfusion-egress
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ledger-egress-proxy
       ports:
         - protocol: TCP
-          port: 443
+          port: 8443
     - to:
         - namespaceSelector:
             matchLabels:
@@ -190,13 +269,13 @@ metadata:
   name: ledger-control-service
   namespace: fraudfusion-financial
   annotations:
-    kubernetes.io/ingress.class: <REPLACE_WITH_APPROVED_INGRESS_CLASS>
+    kubernetes.io/ingress.class: __LEDGER_INGRESS_CLASS__
 spec:
   tls:
-    - hosts: [ledger-control.staging.example.invalid]
-      secretName: ledger-control-service-tls
+    - hosts: [__LEDGER_HOSTNAME__]
+      secretName: __LEDGER_TLS_SECRET_NAME__
   rules:
-    - host: ledger-control.staging.example.invalid
+    - host: __LEDGER_HOSTNAME__
       http:
         paths:
           - path: /api/v1/ledger

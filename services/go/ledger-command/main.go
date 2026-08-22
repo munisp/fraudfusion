@@ -80,7 +80,7 @@ func main() {
 	defer stop()
 	startupCtx, cancel := context.WithTimeout(runtimeCtx, requestTimeout)
 	defer cancel()
-	pool, err := pgxpool.New(startupCtx, requiredEnv("DATABASE_URL"))
+	pool, err := newProductionPool(startupCtx)
 	if err != nil {
 		panic(fmt.Sprintf("connect PostgreSQL: %v", err))
 	}
@@ -302,10 +302,34 @@ func (s *service) authenticate(requiredRole string) gin.HandlerFunc {
 }
 
 func newKeycloakClient() (*keycloakClient, error) {
-	url := requiredEnv("KEYCLOAK_INTROSPECTION_URL")
+	url, err := requiredHTTPSURL("KEYCLOAK_INTROSPECTION_URL")
+	if err != nil {
+		return nil, err
+	}
 	clientID := requiredEnv("KEYCLOAK_CLIENT_ID")
 	secret := requiredEnv("KEYCLOAK_CLIENT_SECRET")
 	return &keycloakClient{introspectionURL: url, clientID: clientID, clientSecret: secret, httpClient: &http.Client{Timeout: 5 * time.Second}}, nil
+}
+
+func newProductionPool(ctx context.Context) (*pgxpool.Pool, error) {
+	databaseURL := requiredEnv("DATABASE_URL")
+	parsed, err := url.Parse(databaseURL)
+	if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Hostname() == "" {
+		return nil, errors.New("DATABASE_URL must be an absolute PostgreSQL URL")
+	}
+	if parsed.Query().Get("sslmode") != "verify-full" {
+		return nil, errors.New("DATABASE_URL must use sslmode=verify-full")
+	}
+	return pgxpool.New(ctx, databaseURL)
+}
+
+func requiredHTTPSURL(key string) (string, error) {
+	value := requiredEnv(key)
+	parsed, err := url.ParseRequestURI(value)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+		return "", fmt.Errorf("%s must be an absolute https URL without userinfo", key)
+	}
+	return value, nil
 }
 
 func (k *keycloakClient) introspect(ctx context.Context, token string) (principal, error) {

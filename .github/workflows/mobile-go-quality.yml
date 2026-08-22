@@ -160,10 +160,32 @@ jobs:
       - name: Build immutable ledger control service container
         run: docker build --pull --tag fraudfusion/ledger-control-service:ci services/go/ledger-command
 
+  ledger_manifest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render immutable ledger deployment manifest
+        env:
+          LEDGER_IMAGE_REFERENCE: registry.example.test/fraudfusion/ledger-control-service@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          LEDGER_INGRESS_CLASS: nginx
+          LEDGER_HOSTNAME: ledger-control.staging.example.test
+          LEDGER_TLS_SECRET_NAME: ledger-control-service-tls
+        run: |
+          set -euo pipefail
+          chmod 700 deploy/kubernetes/render-ledger-control-manifest.sh
+          deploy/kubernetes/render-ledger-control-manifest.sh > /tmp/ledger-control-service.yaml
+          test "$(grep -c '^---$' /tmp/ledger-control-service.yaml)" -ge 7
+          ! grep -q '__LEDGER_' /tmp/ledger-control-service.yaml
+      - name: Verify non-root ledger container metadata
+        run: |
+          set -euo pipefail
+          docker build --pull --tag fraudfusion/ledger-control-service:manifest-check services/go/ledger-command
+          test "$(docker image inspect fraudfusion/ledger-control-service:manifest-check --format '{{.Config.User}}')" = "nonroot:nonroot"
+
   release-gate-notification:
     runs-on: ubuntu-24.04
-    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres, ledger_container]
-    if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.mobile-quality.result == 'failure' || needs.local-contract-smoke.result == 'failure' || needs.go-race.result == 'failure' || needs.dependency-security.result == 'failure' || needs.ledger_postgres.result == 'failure' || needs.ledger_container.result == 'failure') }}
+    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres, ledger_container, ledger_manifest]
+    if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.mobile-quality.result == 'failure' || needs.local-contract-smoke.result == 'failure' || needs.go-race.result == 'failure' || needs.dependency-security.result == 'failure' || needs.ledger_postgres.result == 'failure' || needs.ledger_container.result == 'failure' || needs.ledger_manifest.result == 'failure') }}
     permissions:
       contents: read
     env:
@@ -178,6 +200,7 @@ jobs:
           DEPENDENCY_SECURITY_RESULT: ${{ needs.dependency-security.result }}
           LEDGER_POSTGRES_RESULT: ${{ needs.ledger_postgres.result }}
           LEDGER_CONTAINER_RESULT: ${{ needs.ledger_container.result }}
+          LEDGER_MANIFEST_RESULT: ${{ needs.ledger_manifest.result }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           SHA: ${{ github.sha }}
@@ -195,7 +218,8 @@ jobs:
             --arg dependency_security "$DEPENDENCY_SECURITY_RESULT" \
             --arg ledger_postgres "$LEDGER_POSTGRES_RESULT" \
             --arg ledger_container "$LEDGER_CONTAINER_RESULT" \
-            '{event:$event,repository:$repository,run_id:$run_id,sha:$sha,gates:{mobile_quality:$mobile_quality,local_contract_smoke:$local_contract_smoke,go_race:$go_race,dependency_security:$dependency_security,ledger_postgres:$ledger_postgres,ledger_container:$ledger_container}}')"
+            --arg ledger_manifest "$LEDGER_MANIFEST_RESULT" \
+            '{event:$event,repository:$repository,run_id:$run_id,sha:$sha,gates:{mobile_quality:$mobile_quality,local_contract_smoke:$local_contract_smoke,go_race:$go_race,dependency_security:$dependency_security,ledger_postgres:$ledger_postgres,ledger_container:$ledger_container,ledger_manifest:$ledger_manifest}}')"
           curl --fail --silent --show-error --retry 3 \
             --connect-timeout 5 --max-time 15 \
             -H 'Content-Type: application/json' \
@@ -205,7 +229,7 @@ jobs:
 
   release-gate-metrics:
     runs-on: ubuntu-24.04
-    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres, ledger_container]
+    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres, ledger_container, ledger_manifest]
     if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
     permissions:
       contents: read
@@ -223,6 +247,7 @@ jobs:
           DEPENDENCY_SECURITY_RESULT: ${{ needs.dependency-security.result }}
           LEDGER_POSTGRES_RESULT: ${{ needs.ledger_postgres.result }}
           LEDGER_CONTAINER_RESULT: ${{ needs.ledger_container.result }}
+          LEDGER_MANIFEST_RESULT: ${{ needs.ledger_manifest.result }}
         run: |
           set -euo pipefail
           chmod 700 observability/release-gate-metrics/report-ci-results.sh
