@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.25.9'
       - name: Test each declared Go module with race detection
         shell: bash
         run: |
@@ -82,7 +82,7 @@ jobs:
           npm audit --omit=dev --audit-level=high
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.24.x'
+          go-version: '1.25.9'
       - name: Scan reachable Go vulnerabilities
         shell: bash
         run: |
