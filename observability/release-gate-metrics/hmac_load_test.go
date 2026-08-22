@@ -59,13 +59,14 @@ func TestHMACIngestionHighConcurrencyUniqueAndReplay(t *testing.T) {
 		return
 	}
 
-	if got := store.releaseGateFailure["dependency-security"]; got != uniqueRequests {
+	if got := store.releaseGateFailure["dependency-security"].Load(); got != uint64(uniqueRequests) {
 		t.Fatalf("expected %d unique failure events, got %d", uniqueRequests, got)
 	}
-	if got := store.e2eScenario["kyc-session-create"]["success"]; got != 1 {
+	if got := store.e2eScenario["kyc-session-create"]["success"].Load(); got != 1 {
 		t.Fatalf("expected exactly one replay-safe E2E event, got %d", got)
 	}
-	if got := len(store.seenEvents); got != uniqueRequests+1 {
+	replay := store.replay.(*memoryReplayStore)
+	if got := len(replay.claims); got != uniqueRequests+1 {
 		t.Fatalf("expected %d replay-cache entries, got %d", uniqueRequests+1, got)
 	}
 }

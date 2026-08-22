@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -14,15 +15,16 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	maxRequestBytes  = 16 << 10
-	clockSkew        = 5 * time.Minute
-	maxReplayEntries = 10_000
-	defaultKeyID     = "current"
+	maxRequestBytes = 16 << 10
+	clockSkew       = 5 * time.Minute
+	defaultKeyID    = "current"
+	replayTTL       = 24 * time.Hour
+	replayOpTimeout = 2 * time.Second
 )
 
 type ingestEvent struct {
@@ -36,19 +38,23 @@ type ingestEvent struct {
 
 type keyring map[string][]byte
 
-type recordResult uint8
+type claimResult uint8
 
 const (
-	recordAccepted recordResult = iota
-	recordDuplicate
-	recordCapacityExceeded
+	claimAccepted claimResult = iota
+	claimDuplicate
 )
 
+type replayStore interface {
+	Claim(context.Context, string) (claimResult, error)
+	Health(context.Context) error
+	Close() error
+}
+
 type metricsStore struct {
-	mu                 sync.RWMutex
-	releaseGateFailure map[string]uint64
-	e2eScenario        map[string]map[string]uint64
-	seenEvents         map[string]time.Time
+	replay             replayStore
+	releaseGateFailure map[string]*atomic.Uint64
+	e2eScenario        map[string]map[string]*atomic.Uint64
 }
 
 var allowedGates = map[string]struct{}{
@@ -75,6 +81,10 @@ func main() {
 }
 
 func run(listen func(*http.Server) error) error {
+	return runWithReplay(loadRedisReplayStore, listen)
+}
+
+func runWithReplay(loadReplay func(context.Context) (replayStore, error), listen func(*http.Server) error) error {
 	keys, err := loadKeyring()
 	if err != nil {
 		return err
@@ -83,21 +93,34 @@ func run(listen func(*http.Server) error) error {
 	if environment == "" {
 		return fmt.Errorf("ENVIRONMENT is required")
 	}
-	server := newServer(keys, environment)
-	log.Printf("release-gate-metrics started environment=%q key_count=%d", environment, len(keys))
+	ctx, cancel := context.WithTimeout(context.Background(), replayOpTimeout)
+	defer cancel()
+	replay, err := loadReplay(ctx)
+	if err != nil {
+		return fmt.Errorf("initialize distributed replay store: %w", err)
+	}
+	defer replay.Close()
+	server := newServer(keys, environment, replay)
+	log.Printf("release-gate-metrics started environment=%q key_count=%d replay_store=%q", environment, len(keys), "redis")
 	return listen(server)
 }
 
-func newServer(keys keyring, environment string) *http.Server {
-	store := &metricsStore{
-		releaseGateFailure: make(map[string]uint64),
-		e2eScenario:        make(map[string]map[string]uint64),
-		seenEvents:         make(map[string]time.Time),
-	}
+func newServer(keys keyring, environment string, replay replayStore) *http.Server {
+	store := newMetricsStore(replay)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), replayOpTimeout)
+		defer cancel()
+		if err := replay.Health(ctx); err != nil {
+			http.Error(w, "replay store unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ready"}`))
 	})
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
 		store.writeMetrics(w, environment)
@@ -111,6 +134,24 @@ func newServer(keys keyring, environment string) *http.Server {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+}
+
+func newMetricsStore(replay replayStore) *metricsStore {
+	store := &metricsStore{
+		replay:             replay,
+		releaseGateFailure: make(map[string]*atomic.Uint64, len(allowedGates)),
+		e2eScenario:        make(map[string]map[string]*atomic.Uint64, len(allowedScenarios)),
+	}
+	for gate := range allowedGates {
+		store.releaseGateFailure[gate] = &atomic.Uint64{}
+	}
+	for scenario := range allowedScenarios {
+		store.e2eScenario[scenario] = map[string]*atomic.Uint64{
+			"success": &atomic.Uint64{},
+			"failure": &atomic.Uint64{},
+		}
+	}
+	return store
 }
 
 func loadKeyring() (keyring, error) {
@@ -131,7 +172,6 @@ func loadKeyring() (keyring, error) {
 		}
 		return keys, nil
 	}
-
 	legacy := os.Getenv("RELEASE_GATE_INGEST_HMAC_SECRET")
 	if len(legacy) < 32 {
 		return nil, fmt.Errorf("set RELEASE_GATE_INGEST_HMAC_KEYS_JSON or a legacy RELEASE_GATE_INGEST_HMAC_SECRET of at least 32 bytes")
@@ -193,17 +233,35 @@ func (s *metricsStore) ingestHandler(keys keyring) http.HandlerFunc {
 			http.Error(w, "invalid release gate event", http.StatusBadRequest)
 			return
 		}
-		switch s.record(event) {
-		case recordDuplicate:
-			w.WriteHeader(http.StatusAccepted)
+		claimCtx, cancel := context.WithTimeout(r.Context(), replayOpTimeout)
+		defer cancel()
+		claim, err := s.replay.Claim(claimCtx, replayEventID(event))
+		if err != nil {
+			http.Error(w, "replay store unavailable; retry request", http.StatusServiceUnavailable)
 			return
-		case recordCapacityExceeded:
-			http.Error(w, "replay cache capacity exceeded; retry after cleanup", http.StatusServiceUnavailable)
-			return
-		case recordAccepted:
-			log.Printf("release_gate_event accepted event=%q gate=%q scenario=%q result=%q run_id=%q key_id=%q", event.Event, event.Gate, event.Scenario, event.Result, event.RunID, keyID)
-			w.WriteHeader(http.StatusAccepted)
 		}
+		if claim == claimDuplicate {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		s.recordMetric(event)
+		log.Printf("release_gate_event accepted event=%q gate=%q scenario=%q result=%q run_id=%q key_id=%q", event.Event, event.Gate, event.Scenario, event.Result, event.RunID, keyID)
+		w.WriteHeader(http.StatusAccepted)
+	}
+}
+
+func replayEventID(event ingestEvent) string {
+	identity := event.Event + ":" + event.RunID + ":" + event.Gate + ":" + event.Scenario
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *metricsStore) recordMetric(event ingestEvent) {
+	if event.Event == "ci_gate" && event.Result == "failure" {
+		s.releaseGateFailure[event.Gate].Add(1)
+	}
+	if event.Event == "e2e_scenario" {
+		s.e2eScenario[event.Scenario][event.Result].Add(1)
 	}
 }
 
@@ -218,8 +276,7 @@ func validSignature(key []byte, keyID, timestamp string, body []byte, presented 
 	_, _ = mac.Write([]byte(timestamp))
 	_, _ = mac.Write([]byte("\n"))
 	_, _ = mac.Write(body)
-	expected := mac.Sum(nil)
-	return subtle.ConstantTimeCompare(decoded, expected) == 1
+	return subtle.ConstantTimeCompare(decoded, mac.Sum(nil)) == 1
 }
 
 func validEvent(event ingestEvent) bool {
@@ -238,49 +295,22 @@ func validEvent(event ingestEvent) bool {
 	}
 }
 
-func (s *metricsStore) record(event ingestEvent) recordResult {
-	eventID := event.Event + ":" + event.RunID + ":" + event.Gate + ":" + event.Scenario
-	now := time.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for id, recordedAt := range s.seenEvents {
-		if now.Sub(recordedAt) > 24*time.Hour {
-			delete(s.seenEvents, id)
-		}
-	}
-	if _, alreadySeen := s.seenEvents[eventID]; alreadySeen {
-		return recordDuplicate
-	}
-	if len(s.seenEvents) >= maxReplayEntries {
-		return recordCapacityExceeded
-	}
-	s.seenEvents[eventID] = now
-	if event.Event == "ci_gate" && event.Result == "failure" {
-		s.releaseGateFailure[event.Gate]++
-	}
-	if event.Event == "e2e_scenario" {
-		if s.e2eScenario[event.Scenario] == nil {
-			s.e2eScenario[event.Scenario] = make(map[string]uint64)
-		}
-		s.e2eScenario[event.Scenario][event.Result]++
-	}
-	return recordAccepted
-}
-
 func (s *metricsStore) writeMetrics(w http.ResponseWriter, environment string) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	_, _ = fmt.Fprintln(w, "# HELP fraudfusion_release_gate_failures_total Count of failed release-gate executions received from CI.")
 	_, _ = fmt.Fprintln(w, "# TYPE fraudfusion_release_gate_failures_total counter")
 	for _, gate := range sortedKeys(s.releaseGateFailure) {
-		_, _ = fmt.Fprintf(w, "fraudfusion_release_gate_failures_total{environment=%q,gate=%q} %d\n", environment, gate, s.releaseGateFailure[gate])
+		if count := s.releaseGateFailure[gate].Load(); count > 0 {
+			_, _ = fmt.Fprintf(w, "fraudfusion_release_gate_failures_total{environment=%q,gate=%q} %d\n", environment, gate, count)
+		}
 	}
 	_, _ = fmt.Fprintln(w, "# HELP fraudfusion_e2e_scenario_total Count of real E2E scenario outcomes received from the test runner.")
 	_, _ = fmt.Fprintln(w, "# TYPE fraudfusion_e2e_scenario_total counter")
 	for _, scenario := range sortedNestedKeys(s.e2eScenario) {
 		for _, result := range sortedKeys(s.e2eScenario[scenario]) {
-			_, _ = fmt.Fprintf(w, "fraudfusion_e2e_scenario_total{environment=%q,scenario=%q,result=%q} %d\n", environment, scenario, result, s.e2eScenario[scenario][result])
+			if count := s.e2eScenario[scenario][result].Load(); count > 0 {
+				_, _ = fmt.Fprintf(w, "fraudfusion_e2e_scenario_total{environment=%q,scenario=%q,result=%q} %d\n", environment, scenario, result, count)
+			}
 		}
 	}
 }
@@ -294,6 +324,6 @@ func sortedKeys[V any](values map[string]V) []string {
 	return keys
 }
 
-func sortedNestedKeys(values map[string]map[string]uint64) []string {
+func sortedNestedKeys(values map[string]map[string]*atomic.Uint64) []string {
 	return sortedKeys(values)
 }

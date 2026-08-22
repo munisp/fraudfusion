@@ -37,6 +37,14 @@ spec:
       remoteRef:
         key: /fraudfusion/staging/alertmanager
         property: pagerduty_routing_key
+    - secretKey: redis-username
+      remoteRef:
+        key: /fraudfusion/staging/release-gate-redis
+        property: username
+    - secretKey: redis-password
+      remoteRef:
+        key: /fraudfusion/staging/release-gate-redis
+        property: password
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -48,8 +56,8 @@ metadata:
     app.kubernetes.io/part-of: fraudfusion
     environment: staging
 spec:
-  # A single replica preserves in-memory replay-idempotency until a durable shared replay store is introduced.
-  replicas: 1
+  # Redis SET NX EX provides distributed replay idempotency across replicas.
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: release-gate-metrics
@@ -80,9 +88,27 @@ spec:
                 secretKeyRef:
                   name: release-gate-metrics-secrets
                   key: hmac-keys-json
+            - name: REDIS_ADDR
+              value: release-gate-redis.fraudfusion-data.svc.cluster.local:6379
+            - name: REDIS_TLS
+              value: "true"
+            - name: REDIS_TLS_SERVER_NAME
+              value: release-gate-redis.fraudfusion-data.svc.cluster.local
+            - name: REDIS_REPLAY_KEY_PREFIX
+              value: fraudfusion:release-gate:replay:v1:
+            - name: REDIS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: release-gate-metrics-secrets
+                  key: redis-username
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: release-gate-metrics-secrets
+                  key: redis-password
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
             initialDelaySeconds: 2
             periodSeconds: 10
@@ -145,8 +171,27 @@ spec:
         - protocol: TCP
           port: 8080
   egress:
-    # The service has no required outbound network dependencies.
-    []
+    # Redis is the only stateful replay dependency; TLS is required by REDIS_TLS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fraudfusion-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: release-gate-redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Kubernetes DNS is required to resolve the Redis service name.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor

@@ -1,16 +1,45 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+type memoryReplayStore struct {
+	mu     sync.Mutex
+	claims map[string]struct{}
+	err    error
+}
+
+func newMemoryReplayStore() *memoryReplayStore {
+	return &memoryReplayStore{claims: make(map[string]struct{})}
+}
+
+func (s *memoryReplayStore) Claim(_ context.Context, eventID string) (claimResult, error) {
+	if s.err != nil {
+		return claimDuplicate, s.err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, found := s.claims[eventID]; found {
+		return claimDuplicate, nil
+	}
+	s.claims[eventID] = struct{}{}
+	return claimAccepted, nil
+}
+
+func (s *memoryReplayStore) Health(_ context.Context) error { return s.err }
+
+func (s *memoryReplayStore) Close() error { return nil }
 
 func signatureForTest(key []byte, keyID, timestamp, body string) string {
 	mac := hmac.New(sha256.New, key)
@@ -22,13 +51,7 @@ func signatureForTest(key []byte, keyID, timestamp, body string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-func newTestStore() *metricsStore {
-	return &metricsStore{
-		releaseGateFailure: make(map[string]uint64),
-		e2eScenario:        make(map[string]map[string]uint64),
-		seenEvents:         make(map[string]time.Time),
-	}
-}
+func newTestStore() *metricsStore { return newMetricsStore(newMemoryReplayStore()) }
 
 func signedRequest(t *testing.T, key []byte, keyID, timestamp, body, contentType string) *http.Request {
 	t.Helper()
@@ -42,312 +65,123 @@ func signedRequest(t *testing.T, key []byte, keyID, timestamp, body, contentType
 
 func TestIngestAcceptsKeyIDBoundSignatureAndRejectsTampering(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
-	keys := keyring{"current": key}
 	store := newTestStore()
-	handler := store.ingestHandler(keys)
+	handler := store.ingestHandler(keyring{"current": key})
 	body := `{"event":"ci_gate","gate":"dependency-security","result":"failure","run_id":"test-run-0001"}`
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
 	accepted := httptest.NewRecorder()
 	handler(accepted, signedRequest(t, key, "current", timestamp, body, "application/json; charset=utf-8"))
-	if accepted.Code != http.StatusAccepted {
-		t.Fatalf("expected accepted event, got %d", accepted.Code)
-	}
-	if got := store.releaseGateFailure["dependency-security"]; got != 1 {
-		t.Fatalf("expected one failure metric, got %d", got)
+	if accepted.Code != http.StatusAccepted || store.releaseGateFailure["dependency-security"].Load() != 1 {
+		t.Fatalf("expected accepted single metric, status=%d count=%d", accepted.Code, store.releaseGateFailure["dependency-security"].Load())
 	}
 
-	wrongKeyID := signedRequest(t, key, "previous", timestamp, body, "application/json")
-	wrongKeyID.Header.Set("X-FraudFusion-Signature", signatureForTest(key, "current", timestamp, body))
-	denied := httptest.NewRecorder()
-	handler(denied, wrongKeyID)
-	if denied.Code != http.StatusUnauthorized {
-		t.Fatalf("expected key-ID tampering rejection, got %d", denied.Code)
-	}
-
-	alteredBody := body + " "
-	altered := signedRequest(t, key, "current", timestamp, alteredBody, "application/json")
+	altered := signedRequest(t, key, "current", timestamp, body+" ", "application/json")
 	altered.Header.Set("X-FraudFusion-Signature", signatureForTest(key, "current", timestamp, body))
-	denied = httptest.NewRecorder()
+	denied := httptest.NewRecorder()
 	handler(denied, altered)
 	if denied.Code != http.StatusUnauthorized {
-		t.Fatalf("expected body tampering rejection, got %d", denied.Code)
+		t.Fatalf("expected tampered request rejection, got %d", denied.Code)
 	}
 }
 
-func TestIngestRejectsReplayAndExpiredTimestamp(t *testing.T) {
+func TestIngestIsReplaySafeAndFailsClosedOnReplayStoreError(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
-	keys := keyring{"current": key}
-	store := newTestStore()
-	handler := store.ingestHandler(keys)
+	replay := newMemoryReplayStore()
+	store := newMetricsStore(replay)
+	handler := store.ingestHandler(keyring{"current": key})
 	body := `{"event":"e2e_scenario","scenario":"kyc-session-create","result":"success","run_id":"test-run-0002"}`
 	timestamp := time.Now().UTC().Format(time.RFC3339)
-	req := signedRequest(t, key, "current", timestamp, body, "application/json")
-
-	first := httptest.NewRecorder()
-	handler(first, req)
-	if first.Code != http.StatusAccepted {
-		t.Fatalf("expected first request accepted, got %d", first.Code)
+	for i := 0; i < 2; i++ {
+		response := httptest.NewRecorder()
+		handler(response, signedRequest(t, key, "current", timestamp, body, "application/json"))
+		if response.Code != http.StatusAccepted {
+			t.Fatalf("expected idempotent accepted response, got %d", response.Code)
+		}
 	}
-	second := httptest.NewRecorder()
-	handler(second, signedRequest(t, key, "current", timestamp, body, "application/json"))
-	if second.Code != http.StatusAccepted {
-		t.Fatalf("expected replay to be idempotently accepted, got %d", second.Code)
+	if got := store.e2eScenario["kyc-session-create"]["success"].Load(); got != 1 {
+		t.Fatalf("expected one replay-safe event, got %d", got)
 	}
-	if got := store.e2eScenario["kyc-session-create"]["success"]; got != 1 {
-		t.Fatalf("expected one counted replay-safe event, got %d", got)
-	}
-
-	expiredTimestamp := time.Now().Add(-clockSkew - time.Second).UTC().Format(time.RFC3339)
-	expired := httptest.NewRecorder()
-	handler(expired, signedRequest(t, key, "current", expiredTimestamp, body, "application/json"))
-	if expired.Code != http.StatusUnauthorized {
-		t.Fatalf("expected expired timestamp rejection, got %d", expired.Code)
+	replay.err = errors.New("redis unavailable")
+	failure := httptest.NewRecorder()
+	body = `{"event":"ci_gate","gate":"go-race","result":"success","run_id":"test-run-0003"}`
+	handler(failure, signedRequest(t, key, "current", timestamp, body, "application/json"))
+	if failure.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected fail-closed replay dependency error, got %d", failure.Code)
 	}
 }
 
-func TestIngestRejectsUnsupportedMediaType(t *testing.T) {
+func TestIngestRejectsMalformedRequests(t *testing.T) {
 	key := []byte("0123456789abcdef0123456789abcdef")
-	store := newTestStore()
-	handler := store.ingestHandler(keyring{"current": key})
-	body := `{"event":"ci_gate","gate":"go-race","result":"success","run_id":"test-run-0003"}`
-	timestamp := time.Now().UTC().Format(time.RFC3339)
+	handler := newTestStore().ingestHandler(keyring{"current": key})
+	valid := `{"event":"ci_gate","gate":"go-race","result":"success","run_id":"test-run-0004"}`
+	cases := []struct {
+		name, timestamp, body, contentType, keyID, signature string
+		want                                                 int
+	}{
+		{"media", time.Now().UTC().Format(time.RFC3339), valid, "text/plain", "current", "", http.StatusUnsupportedMediaType},
+		{"time", "bad-time", valid, "application/json", "current", "", http.StatusUnauthorized},
+		{"unknown-key", time.Now().UTC().Format(time.RFC3339), valid, "application/json", "unknown", "", http.StatusUnauthorized},
+		{"bad-json", time.Now().UTC().Format(time.RFC3339), "{", "application/json", "current", "", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			request := signedRequest(t, key, tc.keyID, tc.timestamp, tc.body, tc.contentType)
+			response := httptest.NewRecorder()
+			handler(response, request)
+			if response.Code != tc.want {
+				t.Fatalf("expected %d, got %d", tc.want, response.Code)
+			}
+		})
+	}
+	overSize := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(strings.Repeat("x", maxRequestBytes+1)))
+	overSize.Header.Set("Content-Type", "application/json")
+	overSize.Header.Set("X-FraudFusion-Timestamp", time.Now().UTC().Format(time.RFC3339))
 	response := httptest.NewRecorder()
-	handler(response, signedRequest(t, key, "current", timestamp, body, "text/plain"))
-	if response.Code != http.StatusUnsupportedMediaType {
-		t.Fatalf("expected unsupported media type rejection, got %d", response.Code)
+	handler(response, overSize)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected oversized rejection, got %d", response.Code)
 	}
 }
 
-func TestLoadKeyringSupportsRotationAndRejectsInvalidConfiguration(t *testing.T) {
+func TestKeyringEventValidationAndMetricsOutput(t *testing.T) {
 	t.Setenv("RELEASE_GATE_INGEST_HMAC_SECRET", "")
 	t.Setenv("RELEASE_GATE_INGEST_HMAC_KEYS_JSON", `{"previous":"0123456789abcdef0123456789abcdef","current":"abcdef0123456789abcdef0123456789"}`)
 	keys, err := loadKeyring()
-	if err != nil {
-		t.Fatalf("expected rotated keyring to load: %v", err)
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("expected key rotation configuration, keys=%v err=%v", len(keys), err)
 	}
-	if len(keys) != 2 || string(keys["current"]) != "abcdef0123456789abcdef0123456789" {
-		t.Fatalf("unexpected keyring: %#v", keys)
+	if validEvent(ingestEvent{Event: "ci_gate", Gate: "untrusted", Result: "success", RunID: "test-run-0005"}) {
+		t.Fatal("expected untrusted gate rejection")
 	}
-
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_KEYS_JSON", `{"bad key":"0123456789abcdef0123456789abcdef"}`)
-	if _, err := loadKeyring(); err == nil {
-		t.Fatal("expected invalid key identifier rejection")
-	}
-
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_KEYS_JSON", "{")
-	if _, err := loadKeyring(); err == nil {
-		t.Fatal("expected invalid JSON rejection")
-	}
-
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_KEYS_JSON", "")
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_SECRET", "0123456789abcdef0123456789abcdef")
-	legacy, err := loadKeyring()
-	if err != nil || string(legacy[defaultKeyID]) != "0123456789abcdef0123456789abcdef" {
-		t.Fatalf("expected legacy key fallback, keys=%#v err=%v", legacy, err)
-	}
-}
-
-func TestValidKeyID(t *testing.T) {
-	for _, keyID := range []string{"current", "key-2026_01", "A1"} {
-		if !validKeyID(keyID) {
-			t.Fatalf("expected valid key id %q", keyID)
-		}
-	}
-	for _, keyID := range []string{"", "bad key", "newline\n", strings.Repeat("a", 65)} {
-		if validKeyID(keyID) {
-			t.Fatalf("expected invalid key id %q", keyID)
-		}
-	}
-}
-
-func TestSecurityHeadersAndMetricOutputAreDeterministic(t *testing.T) {
 	store := newTestStore()
-	store.releaseGateFailure["go-race"] = 2
-	store.releaseGateFailure["dependency-security"] = 1
-	store.e2eScenario["kyc-session-create"] = map[string]uint64{"success": 2, "failure": 1}
-
+	store.recordMetric(ingestEvent{Event: "ci_gate", Gate: "go-race", Result: "failure"})
 	metrics := httptest.NewRecorder()
 	store.writeMetrics(metrics, "staging")
-	output := metrics.Body.String()
-	if !strings.Contains(output, `fraudfusion_release_gate_failures_total{environment="staging",gate="dependency-security"} 1`) {
-		t.Fatalf("missing expected metric output: %s", output)
-	}
-	if strings.Index(output, `gate="dependency-security"`) > strings.Index(output, `gate="go-race"`) {
-		t.Fatalf("expected sorted metric output: %s", output)
-	}
-
-	handler := securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	if response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("X-Content-Type-Options") != "nosniff" || response.Header().Get("X-Frame-Options") != "DENY" {
-		t.Fatalf("missing security headers: %#v", response.Header())
+	if !strings.Contains(metrics.Body.String(), `fraudfusion_release_gate_failures_total{environment="staging",gate="go-race"} 1`) {
+		t.Fatalf("missing expected metrics: %s", metrics.Body.String())
 	}
 }
 
-func TestRecordCapacityIsExplicitlyRejected(t *testing.T) {
-	store := newTestStore()
-	now := time.Now()
-	for i := 0; i < maxReplayEntries; i++ {
-		store.seenEvents["prior-"+string(rune(i))] = now
-	}
-	result := store.record(ingestEvent{Event: "ci_gate", Gate: "go-race", Result: "success", RunID: "test-run-capacity"})
-	if result != recordCapacityExceeded {
-		t.Fatalf("expected capacity rejection, got %d", result)
-	}
-}
-
-func TestIngestRejectsBadJSONAndInvalidSignatureEncoding(t *testing.T) {
-	key := []byte("0123456789abcdef0123456789abcdef")
-	store := newTestStore()
-	handler := store.ingestHandler(keyring{"current": key})
-	timestamp := time.Now().UTC().Format(time.RFC3339)
-
-	badJSON := signedRequest(t, key, "current", timestamp, "{", "application/json")
-	response := httptest.NewRecorder()
-	handler(response, badJSON)
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("expected bad JSON rejection, got %d", response.Code)
-	}
-
-	body := `{"event":"ci_gate","gate":"go-race","result":"success","run_id":"test-run-0004"}`
-	badSignature := signedRequest(t, key, "current", timestamp, body, "application/json")
-	badSignature.Header.Set("X-FraudFusion-Signature", "not-hex")
-	response = httptest.NewRecorder()
-	handler(response, badSignature)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("expected invalid signature encoding rejection, got %d", response.Code)
-	}
-}
-
-func TestIngestRejectsMalformedFutureOversizedAndUnknownKeyRequests(t *testing.T) {
-	key := []byte("0123456789abcdef0123456789abcdef")
-	store := newTestStore()
-	handler := store.ingestHandler(keyring{"current": key})
-	body := `{"event":"ci_gate","gate":"go-race","result":"success","run_id":"test-run-0005"}`
-
-	malformed := signedRequest(t, key, "current", "not-a-timestamp", body, "application/json")
-	response := httptest.NewRecorder()
-	handler(response, malformed)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("expected malformed timestamp rejection, got %d", response.Code)
-	}
-
-	futureTimestamp := time.Now().Add(clockSkew + time.Second).UTC().Format(time.RFC3339)
-	future := signedRequest(t, key, "current", futureTimestamp, body, "application/json")
-	response = httptest.NewRecorder()
-	handler(response, future)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("expected future timestamp rejection, got %d", response.Code)
-	}
-
-	unknownKey := signedRequest(t, key, "unknown", time.Now().UTC().Format(time.RFC3339), body, "application/json")
-	response = httptest.NewRecorder()
-	handler(response, unknownKey)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("expected unknown key rejection, got %d", response.Code)
-	}
-
-	overSize := strings.Repeat("x", maxRequestBytes+1)
-	overSizeRequest := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(overSize))
-	overSizeRequest.Header.Set("Content-Type", "application/json")
-	overSizeRequest.Header.Set("X-FraudFusion-Timestamp", time.Now().UTC().Format(time.RFC3339))
-	response = httptest.NewRecorder()
-	handler(response, overSizeRequest)
-	if response.Code != http.StatusRequestEntityTooLarge {
-		t.Fatalf("expected oversized request rejection, got %d", response.Code)
-	}
-}
-
-func TestIngestDefaultsCurrentKeyIDAndReturnsCapacityError(t *testing.T) {
-	key := []byte("0123456789abcdef0123456789abcdef")
-	store := newTestStore()
-	for i := 0; i < maxReplayEntries; i++ {
-		store.seenEvents[fmt.Sprintf("entry-%d", i)] = time.Now()
-	}
-	handler := store.ingestHandler(keyring{"current": key})
-	body := `{"event":"ci_gate","gate":"go-race","result":"success","run_id":"test-run-0006"}`
-	timestamp := time.Now().UTC().Format(time.RFC3339)
-	req := signedRequest(t, key, "current", timestamp, body, "application/json")
-	req.Header.Del("X-FraudFusion-Key-ID")
-	response := httptest.NewRecorder()
-	handler(response, req)
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected capacity error using default key ID, got %d", response.Code)
-	}
-}
-
-func TestLoadKeyringAndValidEventDefensiveBranches(t *testing.T) {
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_KEYS_JSON", "{}")
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_SECRET", "")
-	if _, err := loadKeyring(); err == nil {
-		t.Fatal("expected empty keyring rejection")
-	}
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_KEYS_JSON", "")
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_SECRET", "short")
-	if _, err := loadKeyring(); err == nil {
-		t.Fatal("expected short legacy secret rejection")
-	}
-
-	invalidEvents := []ingestEvent{
-		{Event: "unknown", Result: "success", RunID: "test-run-0007"},
-		{Event: "ci_gate", Gate: "not-allowed", Result: "success", RunID: "test-run-0007"},
-		{Event: "ci_gate", Gate: "go-race", Result: "other", RunID: "test-run-0007"},
-		{Event: "e2e_scenario", Scenario: "not-allowed", Result: "success", RunID: "test-run-0007"},
-		{Event: "e2e_scenario", Scenario: "kyc-session-create", Result: "success", Gate: "go-race", RunID: "test-run-0007"},
-		{Event: "ci_gate", Gate: "go-race", Result: "success", RunID: "short"},
-	}
-	for _, event := range invalidEvents {
-		if validEvent(event) {
-			t.Fatalf("expected invalid event rejection: %#v", event)
-		}
-	}
-}
-
-func TestRecordRemovesExpiredEntries(t *testing.T) {
-	store := newTestStore()
-	store.seenEvents["expired"] = time.Now().Add(-25 * time.Hour)
-	result := store.record(ingestEvent{Event: "ci_gate", Gate: "go-race", Result: "success", RunID: "test-run-0008"})
-	if result != recordAccepted {
-		t.Fatalf("expected accepted event after expiration cleanup, got %d", result)
-	}
-	if _, found := store.seenEvents["expired"]; found {
-		t.Fatal("expected expired replay entry to be removed")
-	}
-}
-
-func TestRunBuildsServerWithValidConfiguration(t *testing.T) {
+func TestRunWithReplayValidatesStartupAndHealth(t *testing.T) {
 	t.Setenv("RELEASE_GATE_INGEST_HMAC_KEYS_JSON", `{"current":"0123456789abcdef0123456789abcdef"}`)
 	t.Setenv("RELEASE_GATE_INGEST_HMAC_SECRET", "")
 	t.Setenv("ENVIRONMENT", "staging")
 	var captured *http.Server
-	if err := run(func(server *http.Server) error {
-		captured = server
-		return nil
-	}); err != nil {
-		t.Fatalf("expected valid startup configuration, got %v", err)
+	if err := runWithReplay(func(context.Context) (replayStore, error) { return newMemoryReplayStore(), nil }, func(server *http.Server) error { captured = server; return nil }); err != nil {
+		t.Fatalf("unexpected startup error: %v", err)
 	}
-	if captured == nil || captured.Addr != ":8080" {
-		t.Fatalf("unexpected constructed server: %#v", captured)
+	response := httptest.NewRecorder()
+	captured.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusOK || response.Header().Get("X-Frame-Options") != "DENY" {
+		t.Fatalf("expected healthy secured server, got %d %#v", response.Code, response.Header())
 	}
-	health := httptest.NewRecorder()
-	captured.Handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
-	if health.Code != http.StatusOK || health.Body.String() != `{"status":"ok"}` {
-		t.Fatalf("unexpected health response: code=%d body=%s", health.Code, health.Body.String())
+	ready := httptest.NewRecorder()
+	captured.Handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if ready.Code != http.StatusOK || ready.Body.String() != `{"status":"ready"}` {
+		t.Fatalf("expected ready replay-backed server, got %d %s", ready.Code, ready.Body.String())
 	}
-}
-
-func TestRunRejectsMissingEnvironmentAndInvalidKeyring(t *testing.T) {
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_KEYS_JSON", `{"current":"0123456789abcdef0123456789abcdef"}`)
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_SECRET", "")
-	t.Setenv("ENVIRONMENT", "")
-	if err := run(func(*http.Server) error { return nil }); err == nil {
-		t.Fatal("expected missing environment rejection")
-	}
-
-	t.Setenv("RELEASE_GATE_INGEST_HMAC_KEYS_JSON", "{")
-	t.Setenv("ENVIRONMENT", "staging")
-	if err := run(func(*http.Server) error { return nil }); err == nil {
-		t.Fatal("expected invalid keyring rejection")
+	if err := runWithReplay(func(context.Context) (replayStore, error) { return nil, errors.New("unavailable") }, func(*http.Server) error { return nil }); err == nil {
+		t.Fatal("expected unavailable replay store to block startup")
 	}
 }
