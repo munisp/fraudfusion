@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"regexp"
 	"testing"
 	"time"
 
@@ -25,7 +26,7 @@ func TestValidAmount(t *testing.T) {
 
 func TestRandomUUID(t *testing.T) {
 	id, err := randomUUID()
-	if err != nil || len(id) != 36 || id[14] != '4' {
+	if err != nil || !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(id) {
 		t.Fatalf("invalid UUID %q: %v", id, err)
 	}
 }

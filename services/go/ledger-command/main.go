@@ -14,8 +14,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -45,8 +47,9 @@ type keycloakClient struct {
 }
 
 type service struct {
-	db       *pgxpool.Pool
-	keycloak *keycloakClient
+	db         *pgxpool.Pool
+	keycloak   *keycloakClient
+	dispatcher *settlementDispatcher
 }
 
 type journalRequest struct {
@@ -73,29 +76,63 @@ type journalResponse struct {
 }
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	runtimeCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	startupCtx, cancel := context.WithTimeout(runtimeCtx, requestTimeout)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, requiredEnv("DATABASE_URL"))
+	pool, err := pgxpool.New(startupCtx, requiredEnv("DATABASE_URL"))
 	if err != nil {
 		panic(fmt.Sprintf("connect PostgreSQL: %v", err))
 	}
 	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
+	if err := pool.Ping(startupCtx); err != nil {
 		panic(fmt.Sprintf("ping PostgreSQL: %v", err))
 	}
 	keycloak, err := newKeycloakClient()
 	if err != nil {
 		panic(err)
 	}
-	application := &service{db: pool, keycloak: keycloak}
+	provider, err := newSettlementProviderFromEnv()
+	if err != nil {
+		panic(err)
+	}
+	dispatcher, err := newSettlementDispatcher(pool, provider)
+	if err != nil {
+		panic(err)
+	}
+	application := &service{db: pool, keycloak: keycloak, dispatcher: dispatcher}
 	router := gin.New()
 	router.Use(gin.Recovery(), bodyLimit(maxRequestBytes))
 	router.GET("/api/v1/ledger/health", application.health)
-	api := router.Group("/api/v1/ledger")
-	api.Use(application.authenticate())
-	api.POST("/journals", application.createJournal)
-	api.GET("/journals/:id", application.getJournal)
-	if err := (&http.Server{Addr: envOr("LISTEN_ADDR", ":8098"), Handler: router, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}).ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	router.POST("/api/v1/ledger/provider-events/:provider", application.providerCallback)
+	ledgerAPI := router.Group("/api/v1/ledger")
+	ledgerAPI.Use(application.authenticate("ledger:write"))
+	ledgerAPI.POST("/journals", application.createJournal)
+	ledgerAPI.GET("/journals/:id", application.getJournal)
+	reconciliationAPI := router.Group("/api/v1/ledger")
+	reconciliationAPI.Use(application.authenticate("finance:reconcile"))
+	reconciliationAPI.POST("/reconciliation-runs", application.createReconciliationRun)
+	reconciliationAPI.GET("/reconciliation-breaks", application.listReconciliationBreaks)
+	reconciliationAPI.POST("/reconciliation-breaks/:id/resolve", application.resolveReconciliationBreak)
+	closeRequestAPI := router.Group("/api/v1/ledger")
+	closeRequestAPI.Use(application.authenticate("finance:close_request"))
+	closeRequestAPI.POST("/financial-closes", application.createFinancialClose)
+	closeRequestAPI.POST("/financial-closes/:id/submit", application.submitFinancialClose)
+	closeApprovalAPI := router.Group("/api/v1/ledger")
+	closeApprovalAPI.Use(application.authenticate("finance:close_approve"))
+	closeApprovalAPI.POST("/financial-closes/:id/approve", application.approveFinancialClose)
+	closeAdminAPI := router.Group("/api/v1/ledger")
+	closeAdminAPI.Use(application.authenticate("finance:close_admin"))
+	closeAdminAPI.POST("/financial-closes/:id/reopen", application.reopenFinancialClose)
+	server := &http.Server{Addr: envOr("LISTEN_ADDR", ":8098"), Handler: router, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
+	go dispatcher.run(runtimeCtx)
+	go func() {
+		<-runtimeCtx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer shutdownCancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		panic(err)
 	}
 }
@@ -231,7 +268,7 @@ func (s *service) postJournal(ctx context.Context, principal principal, request 
 		if err != nil {
 			return journalResponse{}, err
 		}
-		payload, _ := json.Marshal(gin.H{"settlement_id": uuidFromDigest(settlementID), "provider": request.Settlement.Provider})
+		payload, _ := json.Marshal(gin.H{"settlement_id": uuidFromDigest(settlementID), "provider": request.Settlement.Provider, "journal_id": journalID, "tenant_id": principal.TenantID})
 		outboxID, randomErr := randomUUID()
 		if randomErr != nil {
 			return journalResponse{}, randomErr
@@ -247,7 +284,7 @@ func (s *service) postJournal(ctx context.Context, principal principal, request 
 	return journalResponse{JournalID: journalID, Created: true, Status: "posted"}, nil
 }
 
-func (s *service) authenticate() gin.HandlerFunc {
+func (s *service) authenticate(requiredRole string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		header := c.GetHeader("Authorization")
 		if !strings.HasPrefix(header, "Bearer ") {
@@ -255,7 +292,7 @@ func (s *service) authenticate() gin.HandlerFunc {
 			return
 		}
 		principal, err := s.keycloak.introspect(c.Request.Context(), strings.TrimPrefix(header, "Bearer "))
-		if err != nil || !hasRole(principal.Roles, "ledger:write") {
+		if err != nil || !hasRole(principal.Roles, requiredRole) {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "ledger authorization denied"})
 			return
 		}
@@ -348,5 +385,6 @@ func randomUUID() (string, error) {
 	}
 	bytes[6] = (bytes[6] & 0x0f) | 0x40
 	bytes[8] = (bytes[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", bytes[0:4], bytes[4:6], bytes[6:8], bytes[8:10], bytes[10:16]), nil
+	encoded := hex.EncodeToString(bytes)
+	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32], nil
 }

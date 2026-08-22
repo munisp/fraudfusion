@@ -10,6 +10,7 @@ RELEASE_GATE_HMAC_KEY_ID="${RELEASE_GATE_HMAC_KEY_ID:-current}"
 : "${CONTRACT_RESULT:?CONTRACT_RESULT is required}"
 : "${GO_RACE_RESULT:?GO_RACE_RESULT is required}"
 : "${DEPENDENCY_SECURITY_RESULT:?DEPENDENCY_SECURITY_RESULT is required}"
+: "${LEDGER_POSTGRES_RESULT:?LEDGER_POSTGRES_RESULT is required}"
 
 emit_ci_gate() {
   local gate="$1"
@@ -44,3 +45,4 @@ emit_ci_gate mobile-quality "$MOBILE_QUALITY_RESULT"
 emit_ci_gate local-contract-smoke "$CONTRACT_RESULT"
 emit_ci_gate go-race "$GO_RACE_RESULT"
 emit_ci_gate dependency-security "$DEPENDENCY_SECURITY_RESULT"
+emit_ci_gate ledger-postgres "$LEDGER_POSTGRES_RESULT"

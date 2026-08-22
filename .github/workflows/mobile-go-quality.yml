@@ -57,6 +57,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.13'
+          cache-dependency-path: |
+            services/go/**/go.sum
+            orchestrator/go/**/go.sum
+            observability/release-gate-metrics/go.sum
       - name: Test each declared Go module with race detection
         shell: bash
         run: |
@@ -83,6 +87,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.13'
+          cache-dependency-path: |
+            services/go/**/go.sum
+            orchestrator/go/**/go.sum
+            observability/release-gate-metrics/go.sum
       - name: Scan reachable Go vulnerabilities
         shell: bash
         run: |
@@ -92,10 +100,63 @@ jobs:
           done < <({ find services/go orchestrator/go -name go.mod -printf '%h\n' 2>/dev/null; printf '%s\n' observability/release-gate-metrics; } | sort -u)
 
 
+  ledger_postgres:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: fraudfusion_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fraudfusion_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGPASSWORD: postgres
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      PGUSER: postgres
+      PGDATABASE: fraudfusion_ci
+      LEDGER_INTEGRATION_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/fraudfusion_ci?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.13'
+          cache-dependency-path: services/go/ledger-command/go.sum
+      - name: Apply ordered financial-control migrations
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -f database/chargeback_fraud_schema.sql
+          psql -v ON_ERROR_STOP=1 -f database/20260820_chargeback_persistence_hardening.sql
+          psql -v ON_ERROR_STOP=1 -f database/20260822_chargeback_funds_flow_integrity.sql
+          psql -v ON_ERROR_STOP=1 -f database/20260822_double_entry_ledger_settlement_reconciliation.sql
+          psql -v ON_ERROR_STOP=1 -f database/20260822_ledger_outbox_and_financial_close.sql
+          psql -v ON_ERROR_STOP=1 -f database/20260822_financial_control_service_runtime.sql
+      - name: Verify financial database invariants
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -f database/tests/20260822_ledger_integrity_verification.sql
+          psql -v ON_ERROR_STOP=1 -f database/tests/20260822_financial_close_verification.sql
+      - name: Run ledger command PostgreSQL integration suite
+        working-directory: services/go/ledger-command
+        run: go test -race ./...
+      - name: Run bounded concurrent multi-tenant ledger stress gate
+        env:
+          LEDGER_STRESS_TENANTS: '6'
+          LEDGER_STRESS_TRANSACTIONS_PER_TENANT: '20'
+          LEDGER_STRESS_CONCURRENCY: '12'
+        run: database/tests/run_ledger_multitenant_stress.sh
+
   release-gate-notification:
     runs-on: ubuntu-24.04
-    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security]
-    if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.mobile-quality.result == 'failure' || needs.local-contract-smoke.result == 'failure' || needs.go-race.result == 'failure' || needs.dependency-security.result == 'failure') }}
+    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres]
+    if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.mobile-quality.result == 'failure' || needs.local-contract-smoke.result == 'failure' || needs.go-race.result == 'failure' || needs.dependency-security.result == 'failure' || needs.ledger_postgres.result == 'failure') }}
     permissions:
       contents: read
     env:
@@ -108,6 +169,7 @@ jobs:
           CONTRACT_RESULT: ${{ needs.local-contract-smoke.result }}
           GO_RACE_RESULT: ${{ needs.go-race.result }}
           DEPENDENCY_SECURITY_RESULT: ${{ needs.dependency-security.result }}
+          LEDGER_POSTGRES_RESULT: ${{ needs.ledger_postgres.result }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           SHA: ${{ github.sha }}
@@ -123,7 +185,8 @@ jobs:
             --arg local_contract_smoke "$CONTRACT_RESULT" \
             --arg go_race "$GO_RACE_RESULT" \
             --arg dependency_security "$DEPENDENCY_SECURITY_RESULT" \
-            '{event:$event,repository:$repository,run_id:$run_id,sha:$sha,gates:{mobile_quality:$mobile_quality,local_contract_smoke:$local_contract_smoke,go_race:$go_race,dependency_security:$dependency_security}}')"
+            --arg ledger_postgres "$LEDGER_POSTGRES_RESULT" \
+            '{event:$event,repository:$repository,run_id:$run_id,sha:$sha,gates:{mobile_quality:$mobile_quality,local_contract_smoke:$local_contract_smoke,go_race:$go_race,dependency_security:$dependency_security,ledger_postgres:$ledger_postgres}}')"
           curl --fail --silent --show-error --retry 3 \
             --connect-timeout 5 --max-time 15 \
             -H 'Content-Type: application/json' \
@@ -133,7 +196,7 @@ jobs:
 
   release-gate-metrics:
     runs-on: ubuntu-24.04
-    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security]
+    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres]
     if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
     permissions:
       contents: read
@@ -149,6 +212,7 @@ jobs:
           CONTRACT_RESULT: ${{ needs.local-contract-smoke.result }}
           GO_RACE_RESULT: ${{ needs.go-race.result }}
           DEPENDENCY_SECURITY_RESULT: ${{ needs.dependency-security.result }}
+          LEDGER_POSTGRES_RESULT: ${{ needs.ledger_postgres.result }}
         run: |
           set -euo pipefail
           chmod 700 observability/release-gate-metrics/report-ci-results.sh

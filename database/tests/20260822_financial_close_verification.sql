@@ -8,10 +8,12 @@ BEGIN
   INSERT INTO financial_close_periods (id, tenant_id, period_start, period_end, requested_by, approved_by, ledger_snapshot_sha256)
   VALUES (close_id, 'close-test-tenant', DATE '2026-08-01', DATE '2026-08-31', 'requester', 'requester', repeat('a',64));
   BEGIN
+    UPDATE financial_close_periods SET status = 'review' WHERE id = close_id;
     UPDATE financial_close_periods SET status = 'closed' WHERE id = close_id;
   EXCEPTION WHEN others THEN rejected := true;
   END;
   IF NOT rejected THEN RAISE EXCEPTION 'financial close accepted same-person approval'; END IF;
+  UPDATE financial_close_periods SET status = 'review' WHERE id = close_id;
   UPDATE financial_close_periods SET approved_by = 'approver', status = 'closed' WHERE id = close_id;
   IF (SELECT status FROM financial_close_periods WHERE id = close_id) <> 'closed' THEN RAISE EXCEPTION 'valid close did not complete'; END IF;
 END;
@@ -38,6 +40,7 @@ BEGIN
   INSERT INTO financial_close_periods (id,tenant_id,period_start,period_end,requested_by,approved_by,ledger_snapshot_sha256)
   VALUES (close_id,'close-break-tenant',DATE '2026-08-01',DATE '2026-08-31','requester','approver',repeat('d',64));
   BEGIN
+    UPDATE financial_close_periods SET status='review' WHERE id=close_id;
     UPDATE financial_close_periods SET status='closed' WHERE id=close_id;
   EXCEPTION WHEN others THEN rejected := true;
   END;
