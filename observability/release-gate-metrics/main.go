@@ -43,10 +43,11 @@ type claimResult uint8
 const (
 	claimAccepted claimResult = iota
 	claimDuplicate
+	claimRateLimited
 )
 
 type replayStore interface {
-	Claim(context.Context, string) (claimResult, error)
+	Claim(context.Context, string, string) (claimResult, error)
 	Health(context.Context) error
 	Close() error
 }
@@ -235,13 +236,18 @@ func (s *metricsStore) ingestHandler(keys keyring) http.HandlerFunc {
 		}
 		claimCtx, cancel := context.WithTimeout(r.Context(), replayOpTimeout)
 		defer cancel()
-		claim, err := s.replay.Claim(claimCtx, replayEventID(event))
+		claim, err := s.replay.Claim(claimCtx, replayEventID(event), keyID)
 		if err != nil {
 			http.Error(w, "replay store unavailable; retry request", http.StatusServiceUnavailable)
 			return
 		}
 		if claim == claimDuplicate {
 			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		if claim == claimRateLimited {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "ingestion rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 		s.recordMetric(event)

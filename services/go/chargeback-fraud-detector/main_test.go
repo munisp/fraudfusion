@@ -1,6 +1,37 @@
 package main
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+)
+
+func TestTenantFromClaimsAndRequestContext(t *testing.T) {
+	if tenant, ok := tenantFromClaims(map[string]interface{}{"tenant_id": "tenant-a"}); !ok || tenant != "tenant-a" {
+		t.Fatalf("tenant claim = %q, %t; want tenant-a, true", tenant, ok)
+	}
+	if _, ok := tenantFromClaims(map[string]interface{}{"tenant_id": " "}); ok {
+		t.Fatal("blank tenant claim must be rejected")
+	}
+	gin.SetMode(gin.TestMode)
+	writer := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(writer)
+	context.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	context.Set("tenant", "tenant-a")
+	if tenant, ok := tenantFromHeader(context); !ok || tenant != "tenant-a" {
+		t.Fatalf("authenticated tenant = %q, %t; want tenant-a, true", tenant, ok)
+	}
+	writer = httptest.NewRecorder()
+	context, _ = gin.CreateTestContext(writer)
+	context.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	context.Request.Header.Set("X-Tenant-ID", "tenant-b")
+	context.Set("tenant", "tenant-a")
+	if _, ok := tenantFromHeader(context); ok || writer.Code != http.StatusForbidden {
+		t.Fatalf("mismatched X-Tenant-ID must be forbidden; ok=%t status=%d", ok, writer.Code)
+	}
+}
 
 func TestCalculateTransactionRiskUsesHistoryAndTransactionAttributes(t *testing.T) {
 	request := transactionRequest{

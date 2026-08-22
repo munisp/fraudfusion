@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -32,7 +33,7 @@ type transactionRequest struct {
 	TransactionID string  `json:"transaction_id" binding:"required"`
 	CustomerID    string  `json:"customer_id" binding:"required"`
 	MerchantID    string  `json:"merchant_id" binding:"required"`
-	Amount        float64 `json:"amount" binding:"gte=0"`
+	Amount        float64 `json:"amount" binding:"gt=0"`
 	Currency      string  `json:"currency" binding:"required"`
 	Timestamp     string  `json:"timestamp"`
 	PaymentMethod string  `json:"payment_method"`
@@ -380,8 +381,22 @@ func (a *app) getMerchantRiskScore(c *gin.Context) {
 }
 
 func (a *app) persistTransaction(ctx context.Context, req transactionRequest) error {
-	_, err := a.db.Exec(ctx, `INSERT INTO chargeback_transactions (tenant_id, transaction_id, customer_id, merchant_id, amount, currency, created_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT (tenant_id, transaction_id) DO UPDATE SET customer_id=EXCLUDED.customer_id, merchant_id=EXCLUDED.merchant_id, amount=EXCLUDED.amount, currency=EXCLUDED.currency`, req.TenantID, req.TransactionID, req.CustomerID, req.MerchantID, req.Amount, req.Currency)
-	return err
+	var customerID, merchantID, currency string
+	var amount float64
+	err := a.db.QueryRow(ctx, `INSERT INTO chargeback_transactions (tenant_id, transaction_id, customer_id, merchant_id, amount, currency, created_at) VALUES ($1,$2,$3,$4,$5,$6,NOW()) ON CONFLICT (tenant_id, transaction_id) DO NOTHING RETURNING customer_id, merchant_id, amount, currency`, req.TenantID, req.TransactionID, req.CustomerID, req.MerchantID, req.Amount, req.Currency).Scan(&customerID, &merchantID, &amount, &currency)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if err := a.db.QueryRow(ctx, `SELECT customer_id, merchant_id, amount, currency FROM chargeback_transactions WHERE tenant_id=$1 AND transaction_id=$2`, req.TenantID, req.TransactionID).Scan(&customerID, &merchantID, &amount, &currency); err != nil {
+		return err
+	}
+	if customerID != req.CustomerID || merchantID != req.MerchantID || amount != req.Amount || currency != req.Currency {
+		return fmt.Errorf("transaction idempotency conflict for tenant transaction")
+	}
+	return nil
 }
 
 func (a *app) persistDecision(ctx context.Context, tenantID, subjectID, decisionType string, score float64, payload gin.H, actorID string) error {
@@ -418,7 +433,13 @@ func (a *app) authenticate() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "insufficient role"})
 			return
 		}
+		tenantID, ok := tenantFromClaims(claims)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "tenant claim required"})
+			return
+		}
 		c.Set("subject", subject)
+		c.Set("tenant", tenantID)
 		c.Next()
 	}
 }
@@ -526,10 +547,26 @@ func bindJSON(c *gin.Context, target interface{}) bool {
 	return true
 }
 
+func tenantFromClaims(claims map[string]interface{}) (string, bool) {
+	for _, claim := range []string{"tenant_id", "tenant"} {
+		if value, ok := claims[claim].(string); ok {
+			if tenantID := strings.TrimSpace(value); tenantID != "" {
+				return tenantID, true
+			}
+		}
+	}
+	return "", false
+}
+
 func tenantFromHeader(c *gin.Context) (string, bool) {
-	tenantID := strings.TrimSpace(c.GetHeader("X-Tenant-ID"))
-	if tenantID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "X-Tenant-ID header required"})
+	value, ok := c.Get("tenant")
+	tenantID, valid := value.(string)
+	if !ok || !valid || strings.TrimSpace(tenantID) == "" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "authenticated tenant claim required"})
+		return "", false
+	}
+	if supplied := strings.TrimSpace(c.GetHeader("X-Tenant-ID")); supplied != "" && supplied != tenantID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "X-Tenant-ID does not match authenticated tenant"})
 		return "", false
 	}
 	return tenantID, true

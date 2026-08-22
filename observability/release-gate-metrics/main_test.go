@@ -24,7 +24,7 @@ func newMemoryReplayStore() *memoryReplayStore {
 	return &memoryReplayStore{claims: make(map[string]struct{})}
 }
 
-func (s *memoryReplayStore) Claim(_ context.Context, eventID string) (claimResult, error) {
+func (s *memoryReplayStore) Claim(_ context.Context, eventID, _ string) (claimResult, error) {
 	if s.err != nil {
 		return claimDuplicate, s.err
 	}
