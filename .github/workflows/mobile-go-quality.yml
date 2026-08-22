@@ -43,8 +43,10 @@ jobs:
       - run: docker compose up --build --wait
       - run: curl --fail --retry 10 --retry-connrefused http://localhost:8088/healthz
       - run: test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8088/api/v1/mobile/dashboard)" = "401"
-      - run: curl --fail -H 'Authorization: Bearer local-contract-token' http://localhost:8088/api/v1/mobile/dashboard
-      - run: curl --fail -X POST -H 'Authorization: Bearer local-contract-token' http://localhost:8088/api/v1/kyc/sessions
+      - run: >-
+          curl --fail -H 'Authorization: Bearer local-contract-token' http://localhost:8088/api/v1/mobile/dashboard
+      - run: >-
+          curl --fail -X POST -H 'Authorization: Bearer local-contract-token' http://localhost:8088/api/v1/kyc/sessions
       - run: docker compose down -v
         if: always()
 
