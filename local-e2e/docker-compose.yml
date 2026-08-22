@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fraudfusion_e2e
+      POSTGRES_USER: fraudfusion
+      POSTGRES_PASSWORD: local_e2e_only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraudfusion -d fraudfusion_e2e"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "54329:5432"
+    volumes:
+      - postgres_e2e_data:/var/lib/postgresql/data
+    networks: [fraudfusion-e2e]
+
+  go-mobile-mock:
+    build:
+      context: ./go-mobile-mock
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://fraudfusion:local_e2e_only@postgres:5432/fraudfusion_e2e?sslmode=disable
+      LOCAL_E2E_TOKEN: local-contract-token
+    ports:
+      - "8088:8080"
+    networks: [fraudfusion-e2e]
+
+networks:
+  fraudfusion-e2e:
+    driver: bridge
+
+volumes:
+  postgres_e2e_data:

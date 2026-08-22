@@ -64,7 +64,7 @@ jobs:
           while IFS= read -r module; do
             echo "Testing $module"
             (cd "$module" && go test -race ./...)
-          done < <(find services/go orchestrator/go -name go.mod -printf '%h\n' 2>/dev/null | sort -u)
+          done < <({ find services/go orchestrator/go -name go.mod -printf '%h\n' 2>/dev/null; printf '%s\n' observability/release-gate-metrics; } | sort -u)
 
   dependency-security:
     runs-on: ubuntu-24.04
@@ -89,7 +89,7 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           while IFS= read -r module; do
             (cd "$module" && govulncheck ./...)
-          done < <(find services/go orchestrator/go -name go.mod -printf '%h\n' 2>/dev/null | sort -u)
+          done < <({ find services/go orchestrator/go -name go.mod -printf '%h\n' 2>/dev/null; printf '%s\n' observability/release-gate-metrics; } | sort -u)
 
 
   release-gate-notification:
@@ -98,10 +98,12 @@ jobs:
     if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.mobile-quality.result == 'failure' || needs.local-contract-smoke.result == 'failure' || needs.go-race.result == 'failure' || needs.dependency-security.result == 'failure') }}
     permissions:
       contents: read
+    env:
+      RELEASE_GATE_ALERT_WEBHOOK: ${{ secrets.RELEASE_GATE_ALERT_WEBHOOK }}
     steps:
       - name: Notify release-gate failure without sensitive logs
+        if: ${{ env.RELEASE_GATE_ALERT_WEBHOOK != '' }}
         env:
-          RELEASE_GATE_ALERT_WEBHOOK: ${{ secrets.RELEASE_GATE_ALERT_WEBHOOK }}
           MOBILE_QUALITY_RESULT: ${{ needs.mobile-quality.result }}
           CONTRACT_RESULT: ${{ needs.local-contract-smoke.result }}
           GO_RACE_RESULT: ${{ needs.go-race.result }}
@@ -112,7 +114,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -n "${RELEASE_GATE_ALERT_WEBHOOK:-}"
           payload="$(jq -cn \
             --arg event "fraudfusion_release_gate_failure" \
             --arg repository "$REPOSITORY" \
@@ -136,19 +137,19 @@ jobs:
     if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
     permissions:
       contents: read
+    env:
+      RELEASE_GATE_METRICS_URL: ${{ secrets.RELEASE_GATE_METRICS_URL }}
+      RELEASE_GATE_INGEST_HMAC_SECRET: ${{ secrets.RELEASE_GATE_INGEST_HMAC_SECRET }}
     steps:
       - uses: actions/checkout@v4
       - name: Emit signed bounded gate outcomes to staging metrics service
+        if: ${{ env.RELEASE_GATE_METRICS_URL != '' && env.RELEASE_GATE_INGEST_HMAC_SECRET != '' }}
         env:
-          RELEASE_GATE_METRICS_URL: ${{ secrets.RELEASE_GATE_METRICS_URL }}
-          RELEASE_GATE_INGEST_HMAC_SECRET: ${{ secrets.RELEASE_GATE_INGEST_HMAC_SECRET }}
           MOBILE_QUALITY_RESULT: ${{ needs.mobile-quality.result }}
           CONTRACT_RESULT: ${{ needs.local-contract-smoke.result }}
           GO_RACE_RESULT: ${{ needs.go-race.result }}
           DEPENDENCY_SECURITY_RESULT: ${{ needs.dependency-security.result }}
         run: |
           set -euo pipefail
-          test -n "${RELEASE_GATE_METRICS_URL:-}"
-          test -n "${RELEASE_GATE_INGEST_HMAC_SECRET:-}"
           chmod 700 observability/release-gate-metrics/report-ci-results.sh
           observability/release-gate-metrics/report-ci-results.sh
