@@ -16,3 +16,6 @@ artifacts/
 .DS_Store
 .vscode/
 .idea/
+
+# Go test binaries
+*.test
