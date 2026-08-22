@@ -153,10 +153,17 @@ jobs:
           LEDGER_STRESS_CONCURRENCY: '12'
         run: database/tests/run_ledger_multitenant_stress.sh
 
+  ledger_container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build immutable ledger control service container
+        run: docker build --pull --tag fraudfusion/ledger-control-service:ci services/go/ledger-command
+
   release-gate-notification:
     runs-on: ubuntu-24.04
-    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres]
-    if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.mobile-quality.result == 'failure' || needs.local-contract-smoke.result == 'failure' || needs.go-race.result == 'failure' || needs.dependency-security.result == 'failure' || needs.ledger_postgres.result == 'failure') }}
+    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres, ledger_container]
+    if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.mobile-quality.result == 'failure' || needs.local-contract-smoke.result == 'failure' || needs.go-race.result == 'failure' || needs.dependency-security.result == 'failure' || needs.ledger_postgres.result == 'failure' || needs.ledger_container.result == 'failure') }}
     permissions:
       contents: read
     env:
@@ -170,6 +177,7 @@ jobs:
           GO_RACE_RESULT: ${{ needs.go-race.result }}
           DEPENDENCY_SECURITY_RESULT: ${{ needs.dependency-security.result }}
           LEDGER_POSTGRES_RESULT: ${{ needs.ledger_postgres.result }}
+          LEDGER_CONTAINER_RESULT: ${{ needs.ledger_container.result }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           SHA: ${{ github.sha }}
@@ -186,7 +194,8 @@ jobs:
             --arg go_race "$GO_RACE_RESULT" \
             --arg dependency_security "$DEPENDENCY_SECURITY_RESULT" \
             --arg ledger_postgres "$LEDGER_POSTGRES_RESULT" \
-            '{event:$event,repository:$repository,run_id:$run_id,sha:$sha,gates:{mobile_quality:$mobile_quality,local_contract_smoke:$local_contract_smoke,go_race:$go_race,dependency_security:$dependency_security,ledger_postgres:$ledger_postgres}}')"
+            --arg ledger_container "$LEDGER_CONTAINER_RESULT" \
+            '{event:$event,repository:$repository,run_id:$run_id,sha:$sha,gates:{mobile_quality:$mobile_quality,local_contract_smoke:$local_contract_smoke,go_race:$go_race,dependency_security:$dependency_security,ledger_postgres:$ledger_postgres,ledger_container:$ledger_container}}')"
           curl --fail --silent --show-error --retry 3 \
             --connect-timeout 5 --max-time 15 \
             -H 'Content-Type: application/json' \
@@ -196,7 +205,7 @@ jobs:
 
   release-gate-metrics:
     runs-on: ubuntu-24.04
-    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres]
+    needs: [mobile-quality, local-contract-smoke, go-race, dependency-security, ledger_postgres, ledger_container]
     if: ${{ always() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
     permissions:
       contents: read
@@ -213,6 +222,7 @@ jobs:
           GO_RACE_RESULT: ${{ needs.go-race.result }}
           DEPENDENCY_SECURITY_RESULT: ${{ needs.dependency-security.result }}
           LEDGER_POSTGRES_RESULT: ${{ needs.ledger_postgres.result }}
+          LEDGER_CONTAINER_RESULT: ${{ needs.ledger_container.result }}
         run: |
           set -euo pipefail
           chmod 700 observability/release-gate-metrics/report-ci-results.sh
