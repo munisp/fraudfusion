@@ -51,7 +51,11 @@ func TestPostJournalPostgresIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	application := &service{db: pool}
-	request := journalRequest{IdempotencyKey: "post-journal-test-001", JournalType: "settlement", DebitAccountID: debit, CreditAccountID: credit, Amount: "12.500000", Currency: "USD", ExternalRef: "integration-test", Settlement: &settlementInstruction{Provider: "simulator", ProviderReference: "provider-test-001", Direction: "outbound"}}
+	testID, err := randomUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := journalRequest{IdempotencyKey: "post-journal-test-" + testID, JournalType: "settlement", DebitAccountID: debit, CreditAccountID: credit, Amount: "12.500000", Currency: "USD", ExternalRef: "integration-test", Settlement: &settlementInstruction{Provider: "simulator", ProviderReference: "provider-test-" + testID, Direction: "outbound"}}
 	principal := principal{TenantID: tenant, ActorID: "service-test", Roles: map[string]struct{}{"ledger:write": {}}}
 	first, err := application.postJournal(ctx, principal, request)
 	if err != nil {
