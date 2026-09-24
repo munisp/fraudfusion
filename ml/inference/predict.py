@@ -37,7 +37,7 @@ def _encode(payload: dict, cat_features, vocab, num_features, mean, std):
     return x_num.astype(np.float32), x_cat
 
 
-def score_fraud(payload: dict, version: str = "v1") -> dict:
+def score_fraud(payload: dict, version: str = "v3") -> dict:
     d = ART / "fraud_net" / version
     vocab = json.loads((d / "vocab.json").read_text())
     mean, std = _load_preprocess(d)
@@ -194,7 +194,7 @@ def main():
     ap.add_argument("--model", required=True, choices=sorted(SCORERS))
     ap.add_argument("--input", help="JSON payload inline")
     ap.add_argument("--input-file", help="path to JSON payload")
-    ap.add_argument("--version", default="v1")
+    ap.add_argument("--version", default=None, help="artifact version; defaults to each model's latest")
     a = ap.parse_args()
     if a.input_file:
         payload = json.loads(Path(a.input_file).read_text())
@@ -202,7 +202,7 @@ def main():
         payload = json.loads(a.input)
     else:
         payload = json.load(sys.stdin)
-    print(json.dumps(SCORERS[a.model](payload, a.version), indent=2))
+    print(json.dumps(SCORERS[a.model](payload, a.version) if a.version else SCORERS[a.model](payload), indent=2))
 
 
 if __name__ == "__main__":

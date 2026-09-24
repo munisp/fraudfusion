@@ -68,7 +68,7 @@ spec:
             - name: TEMPORAL_NAMESPACE
               value: default
             - name: TEMPORAL_TASK_QUEUE
-              value: fraudfusion-journeys
+              value: fraud-fusion-task-queue
             - name: KEYCLOAK_URL
               value: http://keycloak.fraudfusion-identity.svc.cluster.local:8080
             - name: KEYCLOAK_REALM
