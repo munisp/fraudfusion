@@ -95,9 +95,9 @@ spec:
             - name: REDIS_TLS_SERVER_NAME
               value: release-gate-redis.fraudfusion-data.svc.cluster.local
             - name: REDIS_REPLAY_KEY_PREFIX
-              value: fraudfusion:release-gate:replay:v1:
+              value: "fraudfusion:release-gate:replay:v1:"
             - name: REDIS_RATE_KEY_PREFIX
-              value: fraudfusion:release-gate:rate:v1:
+              value: "fraudfusion:release-gate:rate:v1:"
             - name: REDIS_RATE_LIMIT
               value: "600"
             - name: REDIS_RATE_WINDOW_SECONDS

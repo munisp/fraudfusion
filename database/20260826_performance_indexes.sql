@@ -13,50 +13,67 @@
 -- ============================================================================
 
 -- ---------- aml-monitor hot paths (repository.go) ----------
--- aml_transaction_analyses: filtered by flagged, user_id, ordered by created_at
-CREATE INDEX IF NOT EXISTS aml_txn_analyses_flagged_created_idx
-    ON aml_transaction_analyses (flagged, created_at DESC);
-CREATE INDEX IF NOT EXISTS aml_txn_analyses_user_created_idx
-    ON aml_transaction_analyses (user_id, created_at DESC);
--- Partial index for the hottest predicate: flagged rows only.
-CREATE INDEX IF NOT EXISTS aml_txn_analyses_flagged_only_idx
-    ON aml_transaction_analyses (created_at DESC) WHERE flagged;
-CREATE INDEX IF NOT EXISTS aml_patterns_user_detected_idx
-    ON aml_patterns (user_id, detected_at DESC);
-CREATE INDEX IF NOT EXISTS aml_patterns_detected_idx
-    ON aml_patterns (detected_at DESC);
-CREATE INDEX IF NOT EXISTS aml_sars_status_created_idx
-    ON aml_sars (status, created_at DESC);
-CREATE INDEX IF NOT EXISTS aml_sars_created_idx
-    ON aml_sars (created_at DESC);
-CREATE INDEX IF NOT EXISTS aml_sanctions_entity_checked_idx
-    ON aml_sanctions_checks (entity_name, checked_at DESC);
-CREATE INDEX IF NOT EXISTS aml_sanctions_checked_idx
-    ON aml_sanctions_checks (checked_at DESC);
-CREATE INDEX IF NOT EXISTS aml_sof_user_created_idx
-    ON aml_sof_verifications (user_id, created_at DESC);
+-- aml_* tables are created at aml-monitor boot (repository.go), so they may
+-- not exist when this migration runs on a fresh database. Guard every index
+-- with to_regclass so Migrate() never fails with "relation does not exist";
+-- re-running this file after the services have booted applies any indexes
+-- that were skipped (all statements are idempotent).
+DO $$
+BEGIN
+    IF to_regclass('aml_transaction_analyses') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_txn_analyses_flagged_created_idx ON aml_transaction_analyses (flagged, created_at DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_txn_analyses_user_created_idx ON aml_transaction_analyses (user_id, created_at DESC)';
+        -- Partial index for the hottest predicate: flagged rows only.
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_txn_analyses_flagged_only_idx ON aml_transaction_analyses (created_at DESC) WHERE flagged';
+    END IF;
+    IF to_regclass('aml_patterns') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_patterns_user_detected_idx ON aml_patterns (user_id, detected_at DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_patterns_detected_idx ON aml_patterns (detected_at DESC)';
+    END IF;
+    IF to_regclass('aml_sars') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_sars_status_created_idx ON aml_sars (status, created_at DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_sars_created_idx ON aml_sars (created_at DESC)';
+    END IF;
+    IF to_regclass('aml_sanctions_checks') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_sanctions_entity_checked_idx ON aml_sanctions_checks (entity_name, checked_at DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_sanctions_checked_idx ON aml_sanctions_checks (checked_at DESC)';
+    END IF;
+    IF to_regclass('aml_sof_verifications') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS aml_sof_user_created_idx ON aml_sof_verifications (user_id, created_at DESC)';
+    END IF;
+END $$;
 
 -- ---------- account-takeover velocity features ----------
 -- login_patterns is scanned per request over a 24h/30d tenant+user window
--- and receives an INSERT per request (write amplification).
-CREATE INDEX IF NOT EXISTS login_patterns_tenant_user_created_idx
-    ON login_patterns (tenant_id, user_id, created_at DESC);
+-- and receives an INSERT per request (write amplification). The table is
+-- created by the account-takeover service at boot, so guard it.
+DO $$
+BEGIN
+    IF to_regclass('login_patterns') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS login_patterns_tenant_user_created_idx ON login_patterns (tenant_id, user_id, created_at DESC)';
+    END IF;
+END $$;
 
 -- ---------- crypto-fraud detector rule engine ----------
--- COUNT(*) velocity scans + wallet lookups per score call.
-CREATE INDEX IF NOT EXISTS crypto_transactions_user_ts_idx
-    ON crypto_transactions (user_id, "timestamp" DESC);
-CREATE INDEX IF NOT EXISTS crypto_transactions_wallet_idx
-    ON crypto_transactions (wallet_address);
-CREATE INDEX IF NOT EXISTS crypto_transactions_user_platform_ts_idx
-    ON crypto_transactions (user_id, "timestamp" DESC)
-    WHERE platform LIKE '%p2p%';
-CREATE INDEX IF NOT EXISTS crypto_blacklist_wallet_idx
-    ON crypto_blacklist (wallet_address);
-CREATE INDEX IF NOT EXISTS p2p_trades_seller_created_idx
-    ON p2p_trades (seller_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS p2p_trading_alerts_trade_idx
-    ON p2p_trading_alerts (trade_id, detected_at DESC);
+-- COUNT(*) velocity scans + wallet lookups per score call. Tables are
+-- service-created at boot; guard each.
+DO $$
+BEGIN
+    IF to_regclass('crypto_transactions') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS crypto_transactions_user_ts_idx ON crypto_transactions (user_id, "timestamp" DESC)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS crypto_transactions_wallet_idx ON crypto_transactions (wallet_address)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS crypto_transactions_user_platform_ts_idx ON crypto_transactions (user_id, "timestamp" DESC) WHERE platform LIKE ''%p2p%''';
+    END IF;
+    IF to_regclass('crypto_blacklist') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS crypto_blacklist_wallet_idx ON crypto_blacklist (wallet_address)';
+    END IF;
+    IF to_regclass('p2p_trades') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS p2p_trades_seller_created_idx ON p2p_trades (seller_id, created_at DESC)';
+    END IF;
+    IF to_regclass('p2p_trading_alerts') IS NOT NULL THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS p2p_trading_alerts_trade_idx ON p2p_trading_alerts (trade_id, detected_at DESC)';
+    END IF;
+END $$;
 
 -- ---------- investment / sim-swap / advance-fee detector tables ----------
 -- These services create tables at startup; index their hot columns.
