@@ -290,14 +290,16 @@ func (a *app) predictChargeback(c *gin.Context) {
 		return
 	}
 	baseScore, factors := calculateTransactionRisk(req, customerHistory, merchantHistory)
-	probability := math.Min(0.98, math.Max(0.01, float64(baseScore)/100.0))
+	// Honest labeling: this is a deterministic rule-based heuristic score
+	// (0-100), not a calibrated probability. Do not emit it as a probability.
+	ruleScore := math.Min(100, math.Max(0, float64(baseScore)))
 	recommendation := "approve"
-	if probability >= 0.70 {
+	if ruleScore >= 70 {
 		recommendation = "decline_or_manual_review"
-	} else if probability >= 0.35 {
+	} else if ruleScore >= 35 {
 		recommendation = "step_up_verification"
 	}
-	response := gin.H{"transaction_id": req.TransactionID, "chargeback_probability": probability, "risk_level": calculateRiskLevel(baseScore), "risk_factors": factors, "recommendation": recommendation, "evaluated_at": time.Now().UTC().Format(time.RFC3339)}
+	response := gin.H{"transaction_id": req.TransactionID, "rule_score": ruleScore, "score_type": "rule_based_heuristic", "model_calibrated": false, "risk_level": calculateRiskLevel(baseScore), "risk_factors": factors, "recommendation": recommendation, "evaluated_at": time.Now().UTC().Format(time.RFC3339)}
 	if err := a.persistDecision(ctx, req.TenantID, req.TransactionID, "chargeback_prediction", float64(baseScore), response, actor(c)); err != nil {
 		internalError(c, err)
 		return

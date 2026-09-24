@@ -220,16 +220,23 @@ func performAnalysis(message Message) RiskAnalysis {
 		redFlags = append(redFlags, "Urgency and secrecy tactics detected")
 	}
 
-	// Check sender legitimacy
+	// Check sender legitimacy (disposable-looking local part only)
 	if !verifySenderLegitimacy(message.SenderEmail) {
 		riskScore += 20
-		redFlags = append(redFlags, "Suspicious sender email")
+		redFlags = append(redFlags, "Suspicious sender email pattern")
 	}
 
 	// Check for poor grammar (common in 419 scams)
 	if hasGrammarIssues(combinedText) {
 		riskScore += 15
 		redFlags = append(redFlags, "Poor grammar/spelling detected")
+	}
+
+	// Free webmail is never a standalone signal (it is the norm in Nigeria);
+	// it only mildly amplifies risk when the CONTENT already flagged.
+	if len(redFlags) > 0 && isFreeWebmailProvider(message.SenderEmail) {
+		riskScore += 5
+		redFlags = append(redFlags, "Free webmail sender combined with other fraud indicators")
 	}
 
 	// Determine primary scam type
@@ -407,24 +414,34 @@ func detectUrgencyAndSecrecy(text string) int {
 	return min(score, 20)
 }
 
-func verifySenderLegitimacy(email string) bool {
-	// Check for suspicious email patterns
-	suspiciousPatterns := []string{
-		`@gmail\.com$`,
-		`@yahoo\.com$`,
-		`@hotmail\.com$`,
-		`@outlook\.com$`,
-		`\d{5,}`, // Many numbers in email
-	}
+// freeWebmailProviders are the dominant consumer mail providers in Nigeria;
+// using one is normal and must never be a standalone fraud signal.
+var freeWebmailProviders = []string{"gmail.com", "yahoo.com", "hotmail.com", "outlook.com"}
 
-	for _, pattern := range suspiciousPatterns {
-		matched, _ := regexp.MatchString(pattern, email)
-		if matched {
-			return false
+// isFreeWebmailProvider reports whether the email is hosted on a common free
+// webmail provider.
+func isFreeWebmailProvider(email string) bool {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(email)), "@")
+	if len(parts) != 2 {
+		return false
+	}
+	for _, provider := range freeWebmailProviders {
+		if parts[1] == provider {
+			return true
 		}
 	}
+	return false
+}
 
-	return true
+// suspiciousLocalPart matches disposable-looking local parts (5+ digit runs),
+// e.g. "agent78342@...". Checked against the local part only.
+var suspiciousLocalPart = regexp.MustCompile(`^[^@]*\d{5,}[^@]*@`)
+
+func verifySenderLegitimacy(email string) bool {
+	// Only genuinely suspicious sender patterns flag here — free webmail
+	// providers (Gmail/Yahoo/Hotmail/Outlook) are the norm in Nigeria and are
+	// handled as a mild combined signal in performAnalysis instead.
+	return !suspiciousLocalPart.MatchString(strings.ToLower(email))
 }
 
 func hasGrammarIssues(text string) bool {

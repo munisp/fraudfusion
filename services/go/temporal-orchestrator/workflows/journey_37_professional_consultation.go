@@ -143,10 +143,10 @@ func Journey37ProfessionalConsultationWorkflow(ctx workflow.Context, input Journ
 		return output, fmt.Errorf("validation failed: %w", err)
 	}
 
-	if !validationResult["valid"].(bool) {
+	if valid, ok := validationResult["valid"].(bool); !ok || !valid {
 		logger.Error("Invalid booking request", "reason", validationResult["reason"])
 		output.Status = "failed"
-		return output, fmt.Errorf("invalid request: %s", validationResult["reason"])
+		return output, fmt.Errorf("invalid request: %v", validationResult["reason"])
 	}
 	logger.Info("Request validated successfully")
 
@@ -196,10 +196,12 @@ func Journey37ProfessionalConsultationWorkflow(ctx workflow.Context, input Journ
 		availabilityFutures[i] = workflow.ExecuteActivity(ctx, CheckProfessionalAvailabilityActivity, availabilityInput)
 	}
 
+	availabilityErrors := 0
 	for i, pro := range professionals {
 		var availability []AvailabilitySlot
 		if err := availabilityFutures[i].Get(ctx, &availability); err != nil {
 			logger.Warn("Failed to check availability", "professional", pro.Name, "error", err)
+			availabilityErrors++
 			continue
 		}
 
@@ -222,6 +224,13 @@ func Journey37ProfessionalConsultationWorkflow(ctx workflow.Context, input Journ
 	}
 
 	if availableProfessional == nil {
+		if availabilityErrors == len(professionals) {
+			// Every availability lookup failed: this is a service outage, not a
+			// genuine lack of availability. Fail loudly instead of reporting
+			// "no_availability" on fabricated absence of data.
+			output.Status = "failed"
+			return output, fmt.Errorf("availability checks failed for all %d professionals", availabilityErrors)
+		}
 		logger.Warn("No available professionals found")
 		output.Status = "no_availability"
 		output.AlternativePros = professionals[:min(3, len(professionals))] // Return top 3 alternatives
@@ -251,13 +260,18 @@ func Journey37ProfessionalConsultationWorkflow(ctx workflow.Context, input Journ
 		return output, fmt.Errorf("booking creation failed: %w", err)
 	}
 
-	output.BookingID = bookingResult["booking_id"].(string)
+	bookingID, _ := bookingResult["booking_id"].(string)
+	if bookingID == "" {
+		output.Status = "booking_failed"
+		return output, fmt.Errorf("booking service response lacks booking_id")
+	}
+	output.BookingID = bookingID
 	output.Appointment = &AppointmentDetails{
 		Date:             availableSlot.Date,
 		Time:             availableSlot.StartTime,
 		Duration:         60, // Default 60 minutes
 		Type:             input.ConsultationType,
-		Location:         bookingResult["location"].(string),
+		Location:         getStringOrEmpty(bookingResult, "location"),
 		MeetingLink:      getStringOrEmpty(bookingResult, "meeting_link"),
 		Instructions:     getStringOrEmpty(bookingResult, "instructions"),
 		CancellationLink: fmt.Sprintf("https://fraudfusion.io/bookings/%s/cancel", output.BookingID),
@@ -301,7 +315,8 @@ func Journey37ProfessionalConsultationWorkflow(ctx workflow.Context, input Journ
 		// Don't fail the workflow if notifications fail
 		output.ConfirmationSent = false
 	} else {
-		output.ConfirmationSent = notificationResult["sent"].(bool)
+		sent, _ := notificationResult["sent"].(bool)
+		output.ConfirmationSent = sent
 		logger.Info("Notifications sent successfully")
 	}
 
@@ -333,9 +348,12 @@ func Journey37ProfessionalConsultationWorkflow(ctx workflow.Context, input Journ
 
 // ValidateBookingRequestActivity validates the booking request
 func ValidateBookingRequestActivity(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
-	userID := input["user_id"].(string)
-	professionalType := input["professional_type"].(string)
-	state := input["state"].(string)
+	userID, _ := input["user_id"].(string)
+	professionalType, _ := input["professional_type"].(string)
+	state, _ := input["state"].(string)
+	if userID == "" {
+		return map[string]interface{}{"valid": false, "reason": "user_id is required"}, nil
+	}
 
 	// Validate professional type
 	validTypes := []string{"lawyer", "surveyor", "estate_agent"}
@@ -381,212 +399,97 @@ func ValidateBookingRequestActivity(ctx context.Context, input map[string]interf
 }
 
 // SearchProfessionalDirectoryActivity searches the professional directory
+// served by the land-verification-service. It fails loudly when the service
+// is unconfigured or errors — professionals are never fabricated locally.
 func SearchProfessionalDirectoryActivity(ctx context.Context, input map[string]interface{}) ([]ProfessionalDetails, error) {
-	// Call Professional Directory Service
-	// Implementation: http://land-verification-service:8002/api/v1/professionals/search
-
-	professionalType := input["professional_type"].(string)
-	state := input["state"].(string)
-	minRating := input["min_rating"].(float64)
-
-	// Mock data - in production, this calls the actual API
-	professionals := []ProfessionalDetails{
-		{
-			ID:              "PRO-LAW-001",
-			Name:            "Adebayo Okonkwo",
-			Type:            "lawyer",
-			License:         "SCN/123456",
-			LicenseVerified: true,
-			Rating:          4.8,
-			ReviewCount:     156,
-			Specialization:  "Property Law & Land Disputes",
-			YearsExperience: 15,
-			State:           "Lagos",
-			Contact: ContactInfo{
-				Phone:    "+234-803-XXX-1234",
-				Email:    "a.okonkwo@lawfirm.ng",
-				WhatsApp: "+234-803-XXX-1234",
-				Office:   "123 Victoria Island, Lagos",
-				Website:  "https://okonkwo-law.ng",
-			},
-			ConsultationFee: 25000.0,
-			Languages:       []string{"English", "Yoruba", "Igbo"},
-			SuccessRate:     92.5,
-			CasesHandled:    234,
-			Certifications:  []string{"Nigerian Bar Association", "Property Law Specialist"},
-			ProfileURL:      "https://fraudfusion.io/professionals/PRO-LAW-001",
-		},
-		{
-			ID:              "PRO-LAW-002",
-			Name:            "Chioma Nwosu",
-			Type:            "lawyer",
-			License:         "SCN/789012",
-			LicenseVerified: true,
-			Rating:          4.9,
-			ReviewCount:     203,
-			Specialization:  "Real Estate Fraud & Litigation",
-			YearsExperience: 18,
-			State:           "Lagos",
-			Contact: ContactInfo{
-				Phone:    "+234-805-XXX-5678",
-				Email:    "c.nwosu@nwosulaw.ng",
-				WhatsApp: "+234-805-XXX-5678",
-				Office:   "456 Ikoyi, Lagos",
-				Website:  "https://nwosu-law.ng",
-			},
-			ConsultationFee: 30000.0,
-			Languages:       []string{"English", "Igbo"},
-			SuccessRate:     95.2,
-			CasesHandled:    312,
-			Certifications:  []string{"Nigerian Bar Association", "Fraud Investigation Specialist"},
-			ProfileURL:      "https://fraudfusion.io/professionals/PRO-LAW-002",
-		},
-		{
-			ID:              "PRO-SUR-001",
-			Name:            "Ibrahim Yusuf",
-			Type:            "surveyor",
-			License:         "SURCON/12345",
-			LicenseVerified: true,
-			Rating:          4.7,
-			ReviewCount:     89,
-			Specialization:  "Land Surveying & Boundary Disputes",
-			YearsExperience: 12,
-			State:           "Lagos",
-			Contact: ContactInfo{
-				Phone:   "+234-806-XXX-9012",
-				Email:   "i.yusuf@surveying.ng",
-				Office:  "789 Lekki, Lagos",
-				Website: "https://yusuf-surveying.ng",
-			},
-			ConsultationFee: 20000.0,
-			Languages:       []string{"English", "Hausa"},
-			CasesHandled:    178,
-			Certifications:  []string{"Surveyors Council of Nigeria", "GIS Specialist"},
-			ProfileURL:      "https://fraudfusion.io/professionals/PRO-SUR-001",
-		},
+	professionalType, _ := input["professional_type"].(string)
+	state, _ := input["state"].(string)
+	if professionalType == "" || state == "" {
+		return nil, fmt.Errorf("professional_type and state are required")
 	}
 
-	// Filter by type and rating
+	var response struct {
+		Professionals []ProfessionalDetails `json:"professionals"`
+	}
+	if err := callServiceJSON(ctx, LandVerificationURLEnv, "/api/v1/professionals/search", input, &response); err != nil {
+		return nil, fmt.Errorf("professional directory search: %w", err)
+	}
+
+	// Defensive re-filter: enforce the requested type/state/rating even if the
+	// downstream service returns a broader result set.
+	minRating, _ := input["min_rating"].(float64)
 	filtered := []ProfessionalDetails{}
-	for _, pro := range professionals {
+	for _, pro := range response.Professionals {
 		if pro.Type == professionalType && pro.State == state && pro.Rating >= minRating {
 			filtered = append(filtered, pro)
 		}
 	}
-
 	return filtered, nil
 }
 
-// CheckProfessionalAvailabilityActivity checks professional's availability
+// CheckProfessionalAvailabilityActivity checks a professional's availability
+// via the directory service. Fails loudly on any downstream error.
 func CheckProfessionalAvailabilityActivity(ctx context.Context, input map[string]interface{}) ([]AvailabilitySlot, error) {
-	// Call Professional Directory Service - Availability API
-	// Implementation: http://land-verification-service:8002/api/v1/professionals/{id}/availability
-
-	professionalID := input["professional_id"].(string)
-	consultationType := input["consultation_type"].(string)
+	professionalID, _ := input["professional_id"].(string)
+	consultationType, _ := input["consultation_type"].(string)
 	if professionalID == "" || consultationType == "" {
 		return nil, fmt.Errorf("professional_id and consultation_type are required")
 	}
 
-	// Mock availability data
-	today := time.Now()
-	slots := []AvailabilitySlot{}
-
-	for i := 0; i < 7; i++ {
-		date := today.AddDate(0, 0, i)
-		dateStr := date.Format("2006-01-02")
-
-		// Morning slot
-		slots = append(slots, AvailabilitySlot{
-			Date:      dateStr,
-			StartTime: "10:00",
-			EndTime:   "11:00",
-			Type:      consultationType,
-			Available: i%2 == 0, // Available on even days
-		})
-
-		// Afternoon slot
-		slots = append(slots, AvailabilitySlot{
-			Date:      dateStr,
-			StartTime: "14:00",
-			EndTime:   "15:00",
-			Type:      consultationType,
-			Available: i%3 != 0, // Available except every 3rd day
-		})
+	var response struct {
+		Slots []AvailabilitySlot `json:"slots"`
 	}
-
-	return slots, nil
+	if err := callServiceJSON(ctx, LandVerificationURLEnv,
+		"/api/v1/professionals/"+professionalID+"/availability", input, &response); err != nil {
+		return nil, fmt.Errorf("professional availability lookup: %w", err)
+	}
+	return response.Slots, nil
 }
 
-// CreateBookingActivity creates a booking in the system
+// CreateBookingActivity creates a booking via the booking service. The
+// booking ID always comes from that service; nothing is synthesized locally.
 func CreateBookingActivity(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
-	// Call Booking Service
-	// Implementation: http://booking-service:8015/api/v1/bookings
-
-	userID := input["user_id"].(string)
-	professionalID := input["professional_id"].(string)
-	date := input["date"].(string)
-	startTime := input["start_time"].(string)
-	consultationType := input["consultation_type"].(string)
-
-	bookingID := fmt.Sprintf("BK-%s-%d", date, time.Now().Unix())
-
-	location := "Virtual Meeting"
-	meetingLink := ""
-
-	if consultationType == "virtual" {
-		meetingLink = fmt.Sprintf("https://meet.fraudfusion.io/%s", bookingID)
-	} else if consultationType == "in_person" {
-		location = "Professional's Office"
-	} else if consultationType == "phone" {
-		location = "Phone Call"
+	userID, _ := input["user_id"].(string)
+	professionalID, _ := input["professional_id"].(string)
+	date, _ := input["date"].(string)
+	startTime, _ := input["start_time"].(string)
+	consultationType, _ := input["consultation_type"].(string)
+	if userID == "" || professionalID == "" || date == "" || startTime == "" || consultationType == "" {
+		return nil, fmt.Errorf("user_id, professional_id, date, start_time, and consultation_type are required")
 	}
 
-	return map[string]interface{}{
-		"booking_id":      bookingID,
-		"user_id":         userID,
-		"professional_id": professionalID,
-		"date":            date,
-		"start_time":      startTime,
-		"location":        location,
-		"meeting_link":    meetingLink,
-		"instructions":    "Please join the meeting 5 minutes early. Bring all relevant documents.",
-		"status":          "confirmed",
-	}, nil
+	var booking map[string]interface{}
+	if err := callServiceJSON(ctx, BookingServiceURLEnv, "/api/v1/bookings", input, &booking); err != nil {
+		return nil, fmt.Errorf("booking creation: %w", err)
+	}
+	if bookingID, _ := booking["booking_id"].(string); bookingID == "" {
+		return nil, fmt.Errorf("booking service response lacks booking_id")
+	}
+	return booking, nil
 }
 
-// SendBookingNotificationsActivity sends notifications to user and professional
+// SendBookingNotificationsActivity sends notifications via the notification
+// service. Fails loudly when the service is unconfigured or errors.
 func SendBookingNotificationsActivity(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
-	// Call Notification Service
-	// Implementation: http://notification-service:8012/api/v1/notifications/send
-
-	bookingID := input["booking_id"].(string)
-	userID := input["user_id"].(string)
-	professionalID := input["professional_id"].(string)
+	bookingID, _ := input["booking_id"].(string)
+	userID, _ := input["user_id"].(string)
+	professionalID, _ := input["professional_id"].(string)
 	if bookingID == "" || userID == "" || professionalID == "" {
 		return nil, fmt.Errorf("booking_id, user_id, and professional_id are required")
 	}
 
-	// Send email, SMS, WhatsApp notifications
-	// Send calendar invites
-
-	return map[string]interface{}{
-		"sent":          true,
-		"booking_id":    bookingID,
-		"user_notified": true,
-		"pro_notified":  true,
-		"channels":      []string{"email", "sms", "whatsapp"},
-	}, nil
+	var result map[string]interface{}
+	if err := callServiceJSON(ctx, NotificationServiceURLEnv, "/api/v1/notifications/send", input, &result); err != nil {
+		return nil, fmt.Errorf("booking notification: %w", err)
+	}
+	if _, ok := result["sent"].(bool); !ok {
+		return nil, fmt.Errorf("notification service response lacks sent flag")
+	}
+	return result, nil
 }
+
 
 // Helper functions
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 func getStringOrEmpty(m map[string]interface{}, key string) string {
 	if val, ok := m[key]; ok {

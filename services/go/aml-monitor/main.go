@@ -62,8 +62,17 @@ func main() {
 	r.Use(authMiddleware())
 	r.Use(rateLimitMiddleware())
 
+	// Local sanctions watchlist is the primary screening source — fail fast
+	// at boot if it cannot be loaded rather than screening against nothing.
+	watchlistPath := getEnv("SANCTIONS_WATCHLIST_PATH", "config/sanctions_watchlist.json")
+	watchlist, err := handlers.LoadWatchlist(watchlistPath)
+	if err != nil {
+		log.Fatal("Failed to load sanctions watchlist:", err)
+	}
+	log.Printf("Sanctions watchlist loaded: %s (%d entries)", watchlistPath, len(watchlist.Entries))
+
 	// Initialize handlers
-	amlHandler := handlers.NewAMLHandler(repo, mlClient)
+	amlHandler := handlers.NewAMLHandler(repo, mlClient, watchlist)
 
 	// Routes
 	api := r.Group("/api/v1/aml")
@@ -95,6 +104,9 @@ func main() {
 		// Reporting
 		api.GET("/reports/daily", requireRole("compliance_officer", "auditor", "admin"), amlHandler.GetDailyReport)
 		api.GET("/reports/flagged-transactions", amlHandler.GetFlaggedTransactions)
+
+		// Compliance metrics (STR SLA breaches, CTR threshold)
+		api.GET("/compliance/metrics", requireRole("compliance_officer", "auditor", "admin"), amlHandler.ComplianceMetrics)
 
 		// Health check
 		api.GET("/health", healthCheck)

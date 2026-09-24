@@ -1,9 +1,17 @@
 /**
  * Journey Management Dashboard
- * Admin interface for managing and monitoring all 30 user journeys
+ *
+ * Aligned to the orchestrator's real routes (orchestrator/go):
+ *   POST /api/v1/journey/execute            — start ExecuteJourneyWorkflow
+ *   GET  /api/v1/journey/executions/{id}    — poll execution status/result
+ *
+ * The orchestrator exposes no journey catalog or analytics endpoints, so this
+ * dashboard ships a static catalog of known journeys and tracks only the
+ * executions started from (or looked up in) this session. No metrics are
+ * fabricated: anything the API does not return is simply not shown.
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -11,410 +19,410 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
 import {
   Play,
-  Pause,
-  BarChart3,
   Clock,
   CheckCircle2,
   XCircle,
   AlertCircle,
-  TrendingUp,
-  Users,
+  RefreshCw,
   Activity
 } from 'lucide-react';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
-async function fetchApi<T>(path: string, signal?: AbortSignal): Promise<T> {
+async function fetchApi<T>(path: string, init?: RequestInit, signal?: AbortSignal): Promise<T> {
   const token = localStorage.getItem('auth_token');
   const response = await fetch(`${API_BASE_URL}${path}`, {
-    headers: token ? { Authorization: `Bearer ${token}`, Accept: 'application/json' } : { Accept: 'application/json' },
+    ...init,
+    headers: {
+      Accept: 'application/json',
+      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers || {}),
+    },
     credentials: 'same-origin',
     // 10s client-side timeout; also aborts when the caller (unmounted view) cancels.
     signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
   });
   if (!response.ok) {
-    throw new Error(`Journey API request failed with status ${response.status}.`);
+    let detail = '';
+    try {
+      const body = await response.json();
+      detail = body?.error ? `: ${body.error}` : '';
+    } catch {
+      // Non-JSON error body; keep the status-only message.
+    }
+    throw new Error(`Journey API request failed with status ${response.status}${detail}.`);
   }
   return response.json() as Promise<T>;
 }
 
-// Types
-interface Journey {
-  id: string;
+// --- Contract types (mirror orchestrator/go/cmd/orchestrator/main.go) ---
+
+interface StepExecution {
+  step_id: string;
   name: string;
-  description: string;
-  sector: string;
-  steps: number;
-  avg_duration_seconds: number;
-  enabled: boolean;
-  pricing_tier: string;
-  required_parameters: string[];
+  status: string;
+  duration?: number;
+  error?: string;
+  output?: unknown;
 }
 
+// JourneyExecution as returned by GET /api/v1/journey/executions/{id}.
 interface JourneyExecution {
   execution_id: string;
   journey_id: string;
-  status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'cancelled';
-  progress_percent: number;
-  started_at: string;
   user_id: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  steps: StepExecution[] | null;
+  result?: unknown;
+  error?: string;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string;
 }
 
-interface JourneyAnalytics {
+// Response of POST /api/v1/journey/execute (202 Accepted).
+interface ExecuteJourneyResponse {
+  execution_id: string;
+  workflow_id: string;
+  run_id: string;
   journey_id: string;
-  total_executions: number;
-  successful_executions: number;
-  failed_executions: number;
-  success_rate: number;
-  avg_duration_seconds: number;
+  status: string;
+  started_at: string;
+  poll_url: string;
+}
+
+// Static catalog of the journeys the Temporal worker actually registers.
+// (The orchestrator has no catalog endpoint; journey metadata lives with the
+// worker — services/go/temporal-orchestrator/workflows.)
+interface CatalogEntry {
+  id: string;
+  name: string;
+  description: string;
+}
+
+const JOURNEY_CATALOG: CatalogEntry[] = [
+  {
+    id: 'journey-34',
+    name: 'Land Double Allocation Detection',
+    description: 'Detects multiple claimants, court disputes and unauthorized sellers for a property.',
+  },
+  {
+    id: 'journey-37',
+    name: 'Professional Consultation Booking',
+    description: 'Searches the professional directory, checks availability and books a consultation.',
+  },
+];
+
+const TERMINAL_STATUSES = new Set(['completed', 'failed']);
+
+function statusBadgeVariant(status: string): 'default' | 'destructive' | 'secondary' | 'outline' {
+  switch (status) {
+    case 'completed':
+      return 'default';
+    case 'failed':
+      return 'destructive';
+    case 'running':
+      return 'secondary';
+    default:
+      return 'outline';
+  }
 }
 
 const JourneyDashboard: React.FC = () => {
-  const [journeys, setJourneys] = useState<Journey[]>([]);
-  const [executions, setExecutions] = useState<JourneyExecution[]>([]);
-  const [analytics, setAnalytics] = useState<Record<string, JourneyAnalytics>>({});
-  const [selectedSector, setSelectedSector] = useState<string>('all');
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  const [loading, setLoading] = useState<boolean>(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [executions, setExecutions] = useState<Record<string, JourneyExecution>>({});
+  const [executeJourneyId, setExecuteJourneyId] = useState<string>(JOURNEY_CATALOG[0].id);
+  const [executeUserId, setExecuteUserId] = useState<string>('');
+  const [executeData, setExecuteData] = useState<string>('{}');
+  const [executeError, setExecuteError] = useState<string | null>(null);
+  const [executing, setExecuting] = useState<boolean>(false);
+  const [lookupId, setLookupId] = useState<string>('');
+  const [lookupError, setLookupError] = useState<string | null>(null);
+  const mountedRef = useRef<boolean>(true);
+  const pollersRef = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
 
   useEffect(() => {
-    const controller = new AbortController();
-    void loadDashboard(controller.signal);
-    // Cancel in-flight requests when the dashboard unmounts.
-    return () => controller.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    mountedRef.current = true;
+    const pollers = pollersRef.current;
+    return () => {
+      mountedRef.current = false;
+      pollers.forEach((handle) => clearInterval(handle));
+      pollers.clear();
+    };
   }, []);
 
-  const loadDashboard = async (signal?: AbortSignal) => {
-    setLoading(true);
-    setLoadError(null);
+  const stopPolling = useCallback((executionId: string) => {
+    const handle = pollersRef.current.get(executionId);
+    if (handle) {
+      clearInterval(handle);
+      pollersRef.current.delete(executionId);
+    }
+  }, []);
+
+  // pollExecution follows GET /api/v1/journey/executions/{id} until the
+  // execution reaches a terminal state.
+  const pollExecution = useCallback(async (executionId: string) => {
     try {
-      const [journeyData, executionData, analyticsData] = await Promise.all([
-        fetchApi<{ journeys: Journey[] }>('/api/v1/journeys', signal),
-        fetchApi<{ executions: JourneyExecution[] }>('/api/v1/journeys/executions?status=active', signal),
-        fetchApi<{ analytics: JourneyAnalytics[] }>('/api/v1/journeys/analytics', signal),
-      ]);
-      setJourneys(journeyData.journeys);
-      setExecutions(executionData.executions);
-      setAnalytics(Object.fromEntries(analyticsData.analytics.map((item) => [item.journey_id, item])));
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        return; // Unmounted or superseded load; leave state untouched.
+      const execution = await fetchApi<JourneyExecution>(`/api/v1/journey/executions/${executionId}`);
+      if (!mountedRef.current) return;
+      setExecutions((prev) => ({ ...prev, [executionId]: execution }));
+      if (TERMINAL_STATUSES.has(execution.status)) {
+        stopPolling(executionId);
       }
-      setJourneys([]);
-      setExecutions([]);
-      setAnalytics({});
-      setLoadError(error instanceof Error ? error.message : 'Unable to load journey data.');
+    } catch {
+      // Transient poll failure: keep polling; the last known state stays on screen.
+    }
+  }, [stopPolling]);
+
+  const startPolling = useCallback((executionId: string) => {
+    stopPolling(executionId);
+    pollersRef.current.set(executionId, setInterval(() => void pollExecution(executionId), 2_000));
+    void pollExecution(executionId);
+  }, [pollExecution, stopPolling]);
+
+  const executeJourney = async () => {
+    setExecuteError(null);
+    let data: Record<string, unknown>;
+    try {
+      data = executeData.trim() === '' ? {} : JSON.parse(executeData);
+      if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+        throw new Error('not an object');
+      }
+    } catch {
+      setExecuteError('Journey data must be a valid JSON object.');
+      return;
+    }
+    setExecuting(true);
+    try {
+      const response = await fetchApi<ExecuteJourneyResponse>('/api/v1/journey/execute', {
+        method: 'POST',
+        body: JSON.stringify({
+          journey_id: executeJourneyId,
+          user_id: executeUserId,
+          data,
+        }),
+      });
+      startPolling(response.execution_id);
+    } catch (error) {
+      setExecuteError(error instanceof Error ? error.message : 'Failed to start journey.');
     } finally {
-      if (!signal?.aborted) {
-        setLoading(false);
+      if (mountedRef.current) {
+        setExecuting(false);
       }
     }
   };
 
-  if (loading) {
-    return <div className="min-h-screen bg-background p-6 text-muted-foreground">Loading authenticated journey data…</div>;
-  }
+  const lookupExecution = async () => {
+    setLookupError(null);
+    const id = lookupId.trim();
+    if (!id) return;
+    try {
+      const execution = await fetchApi<JourneyExecution>(`/api/v1/journey/executions/${id}`);
+      setExecutions((prev) => ({ ...prev, [id]: execution }));
+      if (!TERMINAL_STATUSES.has(execution.status)) {
+        startPolling(id);
+      }
+    } catch (error) {
+      setLookupError(error instanceof Error ? error.message : 'Execution not found.');
+    }
+  };
 
-  if (loadError) {
-    return <div className="min-h-screen bg-background p-6 text-destructive">{loadError}</div>;
-  }
-
-  // Filter journeys
-  const filteredJourneys = journeys.filter(journey => {
-    const matchesSector = selectedSector === 'all' || journey.sector === selectedSector;
-    const matchesSearch = journey.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-                         journey.description.toLowerCase().includes(searchQuery.toLowerCase());
-    return matchesSector && matchesSearch;
-  });
-
-  // Get sector counts
-  const sectorCounts = journeys.reduce((acc, journey) => {
-    acc[journey.sector] = (acc[journey.sector] || 0) + 1;
-    return acc;
-  }, {} as Record<string, number>);
-
-  // Calculate overall stats
-  const totalExecutions = Object.values(analytics).reduce((sum, a) => sum + a.total_executions, 0);
-  const totalSuccess = Object.values(analytics).reduce((sum, a) => sum + a.successful_executions, 0);
-  const overallSuccessRate = totalExecutions > 0 ? (totalSuccess / totalExecutions * 100).toFixed(1) : '0';
+  const trackedExecutions = Object.values(executions).sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const activeCount = trackedExecutions.filter((e) => !TERMINAL_STATUSES.has(e.status)).length;
 
   return (
     <div className="min-h-screen bg-background p-6">
       <div className="max-w-7xl mx-auto space-y-6">
-        {/* Header */}
         <div>
           <h1 className="text-3xl font-bold">Journey Management Dashboard</h1>
           <p className="text-muted-foreground mt-2">
-            Monitor and manage all 30 user journeys across the platform
+            Execute and monitor journeys via the orchestrator (Temporal-backed).
           </p>
         </div>
 
-        {/* Overview Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        {/* Overview Cards — only session-real numbers, nothing fabricated */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <Card>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
-              <CardTitle className="text-sm font-medium">Total Journeys</CardTitle>
+              <CardTitle className="text-sm font-medium">Available Journeys</CardTitle>
               <Activity className="h-4 w-4 text-muted-foreground" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{journeys.length}</div>
-              <p className="text-xs text-muted-foreground mt-1">
-                Across 7 sectors
-              </p>
+              <div className="text-2xl font-bold">{JOURNEY_CATALOG.length}</div>
+              <p className="text-xs text-muted-foreground mt-1">Registered with the Temporal worker</p>
             </CardContent>
           </Card>
-
           <Card>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
-              <CardTitle className="text-sm font-medium">Total Executions</CardTitle>
-              <Users className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-sm font-medium">Tracked Executions</CardTitle>
+              <Clock className="h-4 w-4 text-muted-foreground" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{totalExecutions.toLocaleString()}</div>
-              <p className="text-xs text-muted-foreground mt-1">
-                +12% from last week
-              </p>
+              <div className="text-2xl font-bold">{trackedExecutions.length}</div>
+              <p className="text-xs text-muted-foreground mt-1">This session</p>
             </CardContent>
           </Card>
-
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between pb-2">
-              <CardTitle className="text-sm font-medium">Success Rate</CardTitle>
-              <TrendingUp className="h-4 w-4 text-muted-foreground" />
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold">{overallSuccessRate}%</div>
-              <p className="text-xs text-muted-foreground mt-1">
-                {totalSuccess.toLocaleString()} successful
-              </p>
-            </CardContent>
-          </Card>
-
           <Card>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
               <CardTitle className="text-sm font-medium">Active Now</CardTitle>
               <Activity className="h-4 w-4 text-green-500" />
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{executions.length}</div>
-              <p className="text-xs text-muted-foreground mt-1">
-                In progress
-              </p>
+              <div className="text-2xl font-bold">{activeCount}</div>
+              <p className="text-xs text-muted-foreground mt-1">Polling every 2s</p>
             </CardContent>
           </Card>
         </div>
 
-        {/* Main Content */}
-        <Tabs defaultValue="journeys" className="space-y-4">
+        <Tabs defaultValue="execute" className="space-y-4">
           <TabsList>
-            <TabsTrigger value="journeys">Journey Catalog</TabsTrigger>
-            <TabsTrigger value="executions">Active Executions</TabsTrigger>
-            <TabsTrigger value="analytics">Analytics</TabsTrigger>
+            <TabsTrigger value="execute">Execute Journey</TabsTrigger>
+            <TabsTrigger value="executions">Executions ({trackedExecutions.length})</TabsTrigger>
           </TabsList>
 
-          {/* Journey Catalog Tab */}
-          <TabsContent value="journeys" className="space-y-4">
-            {/* Filters */}
-            <div className="flex gap-4">
-              <Input
-                placeholder="Search journeys..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="max-w-sm"
-              />
-              <div className="flex gap-2">
-                <Button
-                  variant={selectedSector === 'all' ? 'default' : 'outline'}
-                  onClick={() => setSelectedSector('all')}
-                  size="sm"
-                >
-                  All ({journeys.length})
-                </Button>
-                {Object.entries(sectorCounts).map(([sector, count]) => (
-                  <Button
-                    key={sector}
-                    variant={selectedSector === sector ? 'default' : 'outline'}
-                    onClick={() => setSelectedSector(sector)}
-                    size="sm"
-                  >
-                    {sector.replace('_', ' ')} ({count})
-                  </Button>
-                ))}
-              </div>
-            </div>
-
-            {/* Journey Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-              {filteredJourneys.map((journey) => (
-                <Card key={journey.id} className="hover:shadow-lg transition-shadow">
+          {/* Execute Tab */}
+          <TabsContent value="execute" className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {JOURNEY_CATALOG.map((journey) => (
+                <Card key={journey.id} className={executeJourneyId === journey.id ? 'border-primary' : ''}>
                   <CardHeader>
                     <div className="flex items-start justify-between">
-                      <div className="flex-1">
+                      <div>
                         <CardTitle className="text-lg">{journey.name}</CardTitle>
-                        <CardDescription className="mt-1">
-                          {journey.description}
-                        </CardDescription>
+                        <CardDescription className="mt-1">{journey.description}</CardDescription>
                       </div>
-                      <Badge variant={journey.enabled ? 'default' : 'secondary'}>
-                        {journey.enabled ? 'Enabled' : 'Disabled'}
-                      </Badge>
+                      <Badge variant="outline">{journey.id}</Badge>
                     </div>
                   </CardHeader>
-                  <CardContent className="space-y-4">
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-muted-foreground">Sector</span>
-                      <Badge variant="outline">
-                        {journey.sector.replace('_', ' ')}
-                      </Badge>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-muted-foreground">Steps</span>
-                      <span className="font-medium">{journey.steps}</span>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-muted-foreground">Avg Duration</span>
-                      <span className="font-medium">{journey.avg_duration_seconds}s</span>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-muted-foreground">Pricing</span>
-                      <Badge variant="secondary">{journey.pricing_tier}</Badge>
-                    </div>
-
-                    {analytics[journey.id] && (
-                      <div className="pt-4 border-t">
-                        <div className="flex items-center justify-between text-sm">
-                          <span className="text-muted-foreground">Success Rate</span>
-                          <span className="font-medium text-green-600">
-                            {(analytics[journey.id].success_rate * 100).toFixed(1)}%
-                          </span>
-                        </div>
-                        <div className="flex items-center justify-between text-sm mt-2">
-                          <span className="text-muted-foreground">Executions</span>
-                          <span className="font-medium">
-                            {analytics[journey.id]?.total_executions.toLocaleString() ?? '0'}
-                          </span>
-                        </div>
-                      </div>
-                    )}
-
-                    <div className="flex gap-2 pt-2">
-                      <Button size="sm" className="flex-1">
-                        <Play className="h-4 w-4 mr-1" />
-                        Execute
-                      </Button>
-                      <Button size="sm" variant="outline" className="flex-1">
-                        <BarChart3 className="h-4 w-4 mr-1" />
-                        Analytics
-                      </Button>
-                    </div>
+                  <CardContent>
+                    <Button size="sm" variant={executeJourneyId === journey.id ? 'default' : 'outline'}
+                      onClick={() => setExecuteJourneyId(journey.id)}>
+                      <Play className="h-4 w-4 mr-1" />
+                      {executeJourneyId === journey.id ? 'Selected' : 'Select'}
+                    </Button>
                   </CardContent>
                 </Card>
               ))}
             </div>
-          </TabsContent>
 
-          {/* Active Executions Tab */}
-          <TabsContent value="executions" className="space-y-4">
             <Card>
               <CardHeader>
-                <CardTitle>Active Journey Executions</CardTitle>
+                <CardTitle>Start Execution</CardTitle>
                 <CardDescription>
-                  Real-time monitoring of in-progress journeys
+                  POST /api/v1/journey/execute — starts ExecuteJourneyWorkflow on the Temporal worker.
                 </CardDescription>
               </CardHeader>
-              <CardContent>
-                {executions.length === 0 ? (
-                  <div className="text-center py-8 text-muted-foreground">
-                    No active executions at the moment
-                  </div>
-                ) : (
-                  <div className="space-y-4">
-                    {executions.map((execution) => (
-                      <div
-                        key={execution.execution_id}
-                        className="border rounded-lg p-4 space-y-3"
-                      >
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <div className="font-medium">{execution.journey_id}</div>
-                            <div className="text-sm text-muted-foreground">
-                              User: {execution.user_id}
-                            </div>
-                          </div>
-                          <Badge
-                            variant={
-                              execution.status === 'completed' ? 'default' :
-                              execution.status === 'failed' ? 'destructive' :
-                              'secondary'
-                            }
-                          >
-                            {execution.status}
-                          </Badge>
-                        </div>
-                        <div>
-                          <div className="flex items-center justify-between text-sm mb-2">
-                            <span>Progress</span>
-                            <span className="font-medium">{execution.progress_percent}%</span>
-                          </div>
-                          <div className="w-full bg-secondary rounded-full h-2">
-                            <div
-                              className="bg-primary h-2 rounded-full transition-all"
-                              style={{ width: `${execution.progress_percent}%` }}
-                            />
-                          </div>
-                        </div>
-                        <div className="flex items-center justify-between text-sm text-muted-foreground">
-                          <span>Started: {new Date(execution.started_at).toLocaleTimeString()}</span>
-                          <Button size="sm" variant="outline">View Details</Button>
-                        </div>
-                      </div>
-                    ))}
+              <CardContent className="space-y-4">
+                <div className="space-y-2">
+                  <label htmlFor="journey-user" className="text-sm font-medium">User ID</label>
+                  <Input id="journey-user" placeholder="user-123" value={executeUserId}
+                    onChange={(e) => setExecuteUserId(e.target.value)} />
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="journey-data" className="text-sm font-medium">Journey Data (JSON)</label>
+                  <textarea id="journey-data" rows={6} value={executeData}
+                    onChange={(e) => setExecuteData(e.target.value)}
+                    className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono"
+                    placeholder='{"steps": [...], "document_file": "..."}' />
+                </div>
+                {executeError && (
+                  <div className="flex items-center gap-2 text-destructive text-sm">
+                    <AlertCircle className="h-4 w-4" />
+                    {executeError}
                   </div>
                 )}
+                <Button onClick={() => void executeJourney()} disabled={executing}>
+                  {executing ? <RefreshCw className="h-4 w-4 mr-1 animate-spin" /> : <Play className="h-4 w-4 mr-1" />}
+                  Execute {executeJourneyId}
+                </Button>
               </CardContent>
             </Card>
           </TabsContent>
 
-          {/* Analytics Tab */}
-          <TabsContent value="analytics" className="space-y-4">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {Object.values(analytics).map((analytic) => {
-                const journey = journeys.find(j => j.id === analytic.journey_id);
-                if (!journey) return null;
+          {/* Executions Tab */}
+          <TabsContent value="executions" className="space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle>Track an Execution</CardTitle>
+                <CardDescription>
+                  Look up any execution by ID (GET /api/v1/journey/executions/{'{id}'}).
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="flex gap-2">
+                  <Input placeholder="exec-..." value={lookupId} onChange={(e) => setLookupId(e.target.value)}
+                    className="max-w-sm" />
+                  <Button variant="outline" onClick={() => void lookupExecution()}>Track</Button>
+                </div>
+                {lookupError && (
+                  <div className="flex items-center gap-2 text-destructive text-sm">
+                    <AlertCircle className="h-4 w-4" />
+                    {lookupError}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
 
-                return (
-                  <Card key={analytic.journey_id}>
-                    <CardHeader>
-                      <CardTitle className="text-lg">{journey.name}</CardTitle>
-                    </CardHeader>
-                    <CardContent className="space-y-3">
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-muted-foreground">Total Executions</span>
-                        <span className="font-bold">{analytic.total_executions.toLocaleString()}</span>
+            {trackedExecutions.length === 0 ? (
+              <Card>
+                <CardContent className="py-8 text-center text-muted-foreground">
+                  No executions tracked yet — start one from the Execute tab or track by ID.
+                </CardContent>
+              </Card>
+            ) : (
+              trackedExecutions.map((execution) => (
+                <Card key={execution.execution_id}>
+                  <CardHeader>
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <CardTitle className="text-lg">{execution.journey_id}</CardTitle>
+                        <CardDescription>
+                          {execution.execution_id} · user {execution.user_id || '—'}
+                        </CardDescription>
                       </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-muted-foreground">Success Rate</span>
-                        <span className="font-bold text-green-600">
-                          {(analytic.success_rate * 100).toFixed(1)}%
-                        </span>
+                      <Badge variant={statusBadgeVariant(execution.status)}>
+                        {execution.status === 'completed' && <CheckCircle2 className="h-3 w-3 mr-1" />}
+                        {execution.status === 'failed' && <XCircle className="h-3 w-3 mr-1" />}
+                        {!TERMINAL_STATUSES.has(execution.status) && <RefreshCw className="h-3 w-3 mr-1 animate-spin" />}
+                        {execution.status}
+                      </Badge>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    {execution.error && (
+                      <div className="flex items-center gap-2 text-destructive text-sm">
+                        <AlertCircle className="h-4 w-4" />
+                        {execution.error}
                       </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-muted-foreground">Avg Duration</span>
-                        <span className="font-bold">{analytic.avg_duration_seconds}s</span>
+                    )}
+                    {execution.steps && execution.steps.length > 0 && (
+                      <div className="space-y-2">
+                        {execution.steps.map((step) => (
+                          <div key={step.step_id} className="flex items-center justify-between text-sm border rounded px-3 py-2">
+                            <span>{step.name || step.step_id}</span>
+                            <span className="flex items-center gap-2">
+                              {step.duration !== undefined && (
+                                <span className="text-muted-foreground">{step.duration}ms</span>
+                              )}
+                              <Badge variant={statusBadgeVariant(step.status)}>{step.status}</Badge>
+                            </span>
+                          </div>
+                        ))}
                       </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-muted-foreground">Failed</span>
-                        <span className="font-bold text-red-600">
-                          {analytic.failed_executions}
-                        </span>
-                      </div>
-                    </CardContent>
-                  </Card>
-                );
-              })}
-            </div>
+                    )}
+                    {execution.result != null && (
+                      <pre className="text-xs bg-muted rounded p-3 overflow-auto max-h-64">
+                        {JSON.stringify(execution.result, null, 2)}
+                      </pre>
+                    )}
+                    <div className="text-xs text-muted-foreground">
+                      Started {new Date(execution.created_at).toLocaleString()}
+                      {execution.completed_at ? ` · Completed ${new Date(execution.completed_at).toLocaleString()}` : ''}
+                    </div>
+                  </CardContent>
+                </Card>
+              ))
+            )}
           </TabsContent>
         </Tabs>
       </div>

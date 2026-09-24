@@ -1,0 +1,41 @@
+{
+  "version": "2026-08-sample",
+  "comment": "Sample local sanctions watchlist for AML screening. Entries reference real designated parties so the matching pipeline is exercised end-to-end; operators MUST sync the full UN SC Consolidated List, OFAC SDN, and the Nigerian domestic sanctions list (Nigeria Sanctions Committee / NFIU) for production.",
+  "entries": [
+    {
+      "name": "Boko Haram",
+      "list_name": "UN Security Council Consolidated List",
+      "program": "CT/ISIL-AQ",
+      "reference": "QDe.138",
+      "aliases": ["Jama'atu Ahlis Sunna Lidda'Awati Wal-Jihad", "Jama'atu Ahlus-Sunnah Lidda'Awati Wal Jihad"]
+    },
+    {
+      "name": "Abubakar Shekau",
+      "list_name": "UN Security Council Consolidated List",
+      "program": "CT/ISIL-AQ",
+      "reference": "QDi.322",
+      "aliases": ["Abubakar Muhammad Shekau", "Imam Darul Tauhid"]
+    },
+    {
+      "name": "Islamic State West Africa Province",
+      "list_name": "UN Security Council Consolidated List",
+      "program": "CT/ISIL-AQ",
+      "reference": "QDe.169",
+      "aliases": ["ISWAP", "Islamic State in West Africa"]
+    },
+    {
+      "name": "Ansaru",
+      "list_name": "Nigeria Domestic Sanctions List (Nigeria Sanctions Committee)",
+      "program": "NG-CT",
+      "reference": "NSC/001",
+      "aliases": ["Ansarul Muslimina Fi Biladis Sudan", "Vanguards for the Protection of Muslims in Black Africa"]
+    },
+    {
+      "name": "Movement for the Emancipation of the Niger Delta",
+      "list_name": "Nigeria Domestic Sanctions List (Nigeria Sanctions Committee)",
+      "program": "NG-CT",
+      "reference": "NSC/002",
+      "aliases": ["MEND"]
+    }
+  ]
+}

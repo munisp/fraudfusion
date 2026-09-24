@@ -42,6 +42,7 @@ type telcoVerificationResponse struct {
 // SIMSwapEvent represents a SIM card change event.
 type SIMSwapEvent struct {
 	EventID       string    `json:"event_id"`
+	TenantID      string    `json:"tenant_id"`
 	UserID        string    `json:"user_id"`
 	PhoneNumber   string    `json:"phone_number"`
 	OldSIMID      string    `json:"old_sim_id"`
@@ -54,6 +55,7 @@ type SIMSwapEvent struct {
 // DeviceInfo represents device fingerprint information
 type DeviceInfo struct {
 	DeviceID    string    `json:"device_id"`
+	TenantID    string    `json:"tenant_id"`
 	UserID      string    `json:"user_id"`
 	DeviceModel string    `json:"device_model"`
 	OS          string    `json:"os"`
@@ -67,6 +69,7 @@ type DeviceInfo struct {
 // AccountAccessLog represents account access attempt
 type AccountAccessLog struct {
 	AccessID   string    `json:"access_id"`
+	TenantID   string    `json:"tenant_id"`
 	UserID     string    `json:"user_id"`
 	DeviceID   string    `json:"device_id"`
 	AccessType string    `json:"access_type"` // login, otp_request, settings_change, transfer
@@ -198,12 +201,17 @@ func detectSIMSwap(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	event.TenantID = requestTenant(c, event.TenantID)
 
-	// Perform comprehensive analysis. Telco verification failures are not treated as verified swaps.
+	// Perform comprehensive analysis. Helper/database failures are fail-closed:
+	// the event routes to manual review instead of getting a silently-zero score.
 	analysis, err := performSIMSwapAnalysis(c.Request.Context(), event)
 	if err != nil {
-		log.Printf("SIM swap analysis unavailable: %v", err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "telco verification unavailable"})
+		log.Printf("SIM swap analysis failed for user %s: %v", event.UserID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":       "SIM swap analysis unavailable",
+			"disposition": "manual_review",
+		})
 		return
 	}
 
@@ -214,10 +222,10 @@ func detectSIMSwap(c *gin.Context) {
 
 	// If high risk, create alert and potentially block account
 	if analysis.RiskScore >= 70 {
-		createAlert(event.UserID, analysis)
+		createAlert(event, analysis)
 
 		if analysis.ShouldBlock {
-			blockUserAccount(event.UserID, "Suspected SIM swap fraud")
+			blockUserAccount(event.TenantID, event.UserID, "Suspected SIM swap fraud")
 		}
 	}
 
@@ -231,46 +239,44 @@ func performSIMSwapAnalysis(requestContext context.Context, event SIMSwapEvent) 
 	// Base risk for any SIM swap
 	riskScore += 20
 
-	// Check for immediate login after SIM swap
-	if hasImmediateLoginAfterSwap(event.UserID, event.SwapTimestamp) {
-		riskScore += 40
-		redFlags = append(redFlags, "Login attempt within 5 minutes of SIM swap")
+	// Each helper is fail-closed: a database error aborts the analysis and the
+	// caller routes the event to manual review instead of silently scoring 0.
+	signals := []struct {
+		flag    string
+		points  int
+		evaluate func() (bool, error)
+	}{
+		{"Login attempt within 5 minutes of SIM swap", 40, func() (bool, error) {
+			return hasImmediateLoginAfterSwap(event.TenantID, event.UserID, event.SwapTimestamp)
+		}},
+		{"New device detected after SIM swap", 35, func() (bool, error) {
+			return hasNewDeviceAfterSwap(event.TenantID, event.UserID, event.SwapTimestamp)
+		}},
+		{"SIM swap in different location than usual", 30, func() (bool, error) {
+			return hasLocationAnomaly(event.TenantID, event.UserID, event.Location)
+		}},
+		{"Multiple failed OTP attempts before SIM swap", 25, func() (bool, error) {
+			return hasMultipleFailedOTP(event.TenantID, event.UserID, event.SwapTimestamp)
+		}},
+		{"Account settings changed after SIM swap", 30, func() (bool, error) {
+			return hasSettingsChangesAfterSwap(event.TenantID, event.UserID, event.SwapTimestamp)
+		}},
+		{"Money transfer attempted after SIM swap", 45, func() (bool, error) {
+			return hasTransferAttemptsAfterSwap(event.TenantID, event.UserID, event.SwapTimestamp)
+		}},
+		{"Multiple SIM swaps in short period", 20, func() (bool, error) {
+			return hasFrequentSIMSwaps(event.TenantID, event.UserID)
+		}},
 	}
-
-	// Check for new device
-	if hasNewDeviceAfterSwap(event.UserID, event.SwapTimestamp) {
-		riskScore += 35
-		redFlags = append(redFlags, "New device detected after SIM swap")
-	}
-
-	// Check for location anomaly
-	if hasLocationAnomaly(event.UserID, event.Location) {
-		riskScore += 30
-		redFlags = append(redFlags, "SIM swap in different location than usual")
-	}
-
-	// Check for multiple failed OTP attempts before swap
-	if hasMultipleFailedOTP(event.UserID, event.SwapTimestamp) {
-		riskScore += 25
-		redFlags = append(redFlags, "Multiple failed OTP attempts before SIM swap")
-	}
-
-	// Check for account settings changes after swap
-	if hasSettingsChangesAfterSwap(event.UserID, event.SwapTimestamp) {
-		riskScore += 30
-		redFlags = append(redFlags, "Account settings changed after SIM swap")
-	}
-
-	// Check for money transfer attempts after swap
-	if hasTransferAttemptsAfterSwap(event.UserID, event.SwapTimestamp) {
-		riskScore += 45
-		redFlags = append(redFlags, "Money transfer attempted after SIM swap")
-	}
-
-	// Check user's SIM swap history
-	if hasFrequentSIMSwaps(event.UserID) {
-		riskScore += 20
-		redFlags = append(redFlags, "Multiple SIM swaps in short period")
+	for _, signal := range signals {
+		hit, err := signal.evaluate()
+		if err != nil {
+			return RiskAnalysis{}, err
+		}
+		if hit {
+			riskScore += signal.points
+			redFlags = append(redFlags, signal.flag)
+		}
 	}
 
 	// Check if telco verification failed
@@ -283,77 +289,111 @@ func performSIMSwapAnalysis(requestContext context.Context, event SIMSwapEvent) 
 		redFlags = append(redFlags, "telco_verification_rejected")
 	}
 
+	// Cap the score first so the stored/displayed score and the blocking
+	// decision are computed from the same number (previously shouldBlock and
+	// risk level used the uncapped score while the API returned min(,100)).
+	finalScore := min(riskScore, 100)
+
 	// Determine risk level
-	riskLevel := getRiskLevel(riskScore)
+	riskLevel := getRiskLevel(finalScore)
 
 	// Determine if should block
-	shouldBlock := riskScore >= 80
+	shouldBlock := finalScore >= 80
 
 	// Generate recommendation
-	recommendation := generateRecommendation(riskScore, shouldBlock)
+	recommendation := generateRecommendation(finalScore, shouldBlock)
 
 	return RiskAnalysis{
 		EventID:        event.EventID,
 		UserID:         event.UserID,
-		RiskScore:      min(riskScore, 100),
+		RiskScore:      finalScore,
 		RiskLevel:      riskLevel,
-		IsSIMSwapFraud: riskScore >= 60,
+		IsSIMSwapFraud: finalScore >= 60,
 		RedFlags:       redFlags,
 		Recommendation: recommendation,
 		ShouldBlock:    shouldBlock,
 	}, nil
 }
 
-func hasImmediateLoginAfterSwap(userID string, swapTime time.Time) bool {
+// requestTenant resolves the tenant for a request: the authenticated
+// principal's tenant wins; a body-supplied tenant is only honored when the
+// token carries no tenant claim (internal callers). Defaults to "default".
+func requestTenant(c *gin.Context, payloadTenant string) string {
+	if value, ok := c.Get("principal"); ok {
+		if principal, ok := value.(*authPrincipal); ok && principal.TenantID != "" {
+			return principal.TenantID
+		}
+	}
+	if payloadTenant != "" {
+		return payloadTenant
+	}
+	return "default"
+}
+
+// The signal helpers below are fail-closed: database errors propagate to the
+// caller (which routes to manual review) instead of silently returning false,
+// and every query is scoped to the requesting tenant.
+
+func hasImmediateLoginAfterSwap(tenantID, userID string, swapTime time.Time) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("database not initialized")
+	}
 	query := `
 		SELECT COUNT(*) FROM account_access_logs
-		WHERE user_id = $1
+		WHERE tenant_id = $1 AND user_id = $2
 		AND access_type = 'login'
-		AND timestamp BETWEEN $2 AND $3
+		AND timestamp BETWEEN $3 AND $4
 	`
 
 	fiveMinutesAfter := swapTime.Add(5 * time.Minute)
 
 	var count int
-	err := db.QueryRow(query, userID, swapTime, fiveMinutesAfter).Scan(&count)
-	if err != nil {
-		return false
+	if err := db.QueryRow(query, tenantID, userID, swapTime, fiveMinutesAfter).Scan(&count); err != nil {
+		return false, fmt.Errorf("query login-after-swap signal: %w", err)
 	}
 
-	return count > 0
+	return count > 0, nil
 }
 
-func hasNewDeviceAfterSwap(userID string, swapTime time.Time) bool {
+// hasNewDeviceAfterSwap queries device_fingerprints.first_seen_at (the column
+// created by database/20260827_service_base_tables.sql).
+func hasNewDeviceAfterSwap(tenantID, userID string, swapTime time.Time) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("database not initialized")
+	}
 	query := `
 		SELECT COUNT(*) FROM device_fingerprints
-		WHERE user_id = $1
-		AND first_seen_at > $2
+		WHERE tenant_id = $1 AND user_id = $2
+		AND first_seen_at > $3
 	`
 
 	var count int
-	err := db.QueryRow(query, userID, swapTime).Scan(&count)
-	if err != nil {
-		return false
+	if err := db.QueryRow(query, tenantID, userID, swapTime).Scan(&count); err != nil {
+		return false, fmt.Errorf("query new-device signal: %w", err)
 	}
 
-	return count > 0
+	return count > 0, nil
 }
 
-func hasLocationAnomaly(userID string, newLocation string) bool {
+func hasLocationAnomaly(tenantID, userID string, newLocation string) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("database not initialized")
+	}
+
 	// Get user's usual locations
 	query := `
 		SELECT location, COUNT(*) as count
 		FROM account_access_logs
-		WHERE user_id = $1
+		WHERE tenant_id = $1 AND user_id = $2
 		AND timestamp > NOW() - INTERVAL '30 days'
 		GROUP BY location
 		ORDER BY count DESC
 		LIMIT 3
 	`
 
-	rows, err := db.Query(query, userID)
+	rows, err := db.Query(query, tenantID, userID)
 	if err != nil {
-		return false
+		return false, fmt.Errorf("query location history: %w", err)
 	}
 	defer rows.Close()
 
@@ -361,94 +401,107 @@ func hasLocationAnomaly(userID string, newLocation string) bool {
 	for rows.Next() {
 		var location string
 		var count int
-		rows.Scan(&location, &count)
+		if err := rows.Scan(&location, &count); err != nil {
+			return false, fmt.Errorf("scan location history: %w", err)
+		}
 		usualLocations = append(usualLocations, location)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate location history: %w", err)
 	}
 
 	// Check if new location is in usual locations
 	for _, loc := range usualLocations {
 		if loc == newLocation {
-			return false
+			return false, nil
 		}
 	}
 
-	return len(usualLocations) > 0
+	return len(usualLocations) > 0, nil
 }
 
-func hasMultipleFailedOTP(userID string, swapTime time.Time) bool {
+func hasMultipleFailedOTP(tenantID, userID string, swapTime time.Time) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("database not initialized")
+	}
 	query := `
 		SELECT COUNT(*) FROM account_access_logs
-		WHERE user_id = $1
+		WHERE tenant_id = $1 AND user_id = $2
 		AND access_type = 'otp_request'
 		AND success = false
-		AND timestamp BETWEEN $2 AND $3
+		AND timestamp BETWEEN $3 AND $4
 	`
 
 	oneHourBefore := swapTime.Add(-1 * time.Hour)
 
 	var count int
-	err := db.QueryRow(query, userID, oneHourBefore, swapTime).Scan(&count)
-	if err != nil {
-		return false
+	if err := db.QueryRow(query, tenantID, userID, oneHourBefore, swapTime).Scan(&count); err != nil {
+		return false, fmt.Errorf("query failed-OTP signal: %w", err)
 	}
 
-	return count >= 3
+	return count >= 3, nil
 }
 
-func hasSettingsChangesAfterSwap(userID string, swapTime time.Time) bool {
+func hasSettingsChangesAfterSwap(tenantID, userID string, swapTime time.Time) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("database not initialized")
+	}
 	query := `
 		SELECT COUNT(*) FROM account_access_logs
-		WHERE user_id = $1
+		WHERE tenant_id = $1 AND user_id = $2
 		AND access_type = 'settings_change'
-		AND timestamp > $2
-		AND timestamp < $3
+		AND timestamp > $3
+		AND timestamp < $4
 	`
 
 	thirtyMinutesAfter := swapTime.Add(30 * time.Minute)
 
 	var count int
-	err := db.QueryRow(query, userID, swapTime, thirtyMinutesAfter).Scan(&count)
-	if err != nil {
-		return false
+	if err := db.QueryRow(query, tenantID, userID, swapTime, thirtyMinutesAfter).Scan(&count); err != nil {
+		return false, fmt.Errorf("query settings-change signal: %w", err)
 	}
 
-	return count > 0
+	return count > 0, nil
 }
 
-func hasTransferAttemptsAfterSwap(userID string, swapTime time.Time) bool {
+func hasTransferAttemptsAfterSwap(tenantID, userID string, swapTime time.Time) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("database not initialized")
+	}
 	query := `
 		SELECT COUNT(*) FROM account_access_logs
-		WHERE user_id = $1
+		WHERE tenant_id = $1 AND user_id = $2
 		AND access_type = 'transfer'
-		AND timestamp > $2
-		AND timestamp < $3
+		AND timestamp > $3
+		AND timestamp < $4
 	`
 
 	oneHourAfter := swapTime.Add(1 * time.Hour)
 
 	var count int
-	err := db.QueryRow(query, userID, swapTime, oneHourAfter).Scan(&count)
-	if err != nil {
-		return false
+	if err := db.QueryRow(query, tenantID, userID, swapTime, oneHourAfter).Scan(&count); err != nil {
+		return false, fmt.Errorf("query transfer-attempt signal: %w", err)
 	}
 
-	return count > 0
+	return count > 0, nil
 }
 
-func hasFrequentSIMSwaps(userID string) bool {
+func hasFrequentSIMSwaps(tenantID, userID string) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("database not initialized")
+	}
 	query := `
 		SELECT COUNT(*) FROM sim_swap_events
-		WHERE user_id = $1
+		WHERE tenant_id = $1 AND user_id = $2
 		AND swap_timestamp > NOW() - INTERVAL '90 days'
 	`
 
 	var count int
-	err := db.QueryRow(query, userID).Scan(&count)
-	if err != nil {
-		return false
+	if err := db.QueryRow(query, tenantID, userID).Scan(&count); err != nil {
+		return false, fmt.Errorf("query SIM swap history: %w", err)
 	}
 
-	return count >= 3
+	return count >= 3, nil
 }
 
 func initTelcoVerifier() {
@@ -500,14 +553,15 @@ func verifyWithTelco(requestContext context.Context, telco, phoneNumber, userID 
 func storeSIMSwapEvent(event SIMSwapEvent, analysis RiskAnalysis) error {
 	query := `
 		INSERT INTO sim_swap_events
-		(event_id, user_id, phone_number, old_sim_id, new_sim_id, telco,
+		(tenant_id, event_id, user_id, phone_number, old_sim_id, new_sim_id, telco,
 		 swap_timestamp, location, risk_score, risk_level, is_fraud, red_flags)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`
 
 	redFlagsJSON, _ := json.Marshal(analysis.RedFlags)
 
 	_, err := db.Exec(query,
+		event.TenantID,
 		event.EventID,
 		event.UserID,
 		event.PhoneNumber,
@@ -525,17 +579,18 @@ func storeSIMSwapEvent(event SIMSwapEvent, analysis RiskAnalysis) error {
 	return err
 }
 
-func createAlert(userID string, analysis RiskAnalysis) {
+func createAlert(event SIMSwapEvent, analysis RiskAnalysis) {
 	query := `
 		INSERT INTO sim_swap_alerts
-		(user_id, event_id, risk_score, risk_level, red_flags, recommendation, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, NOW())
+		(tenant_id, user_id, event_id, risk_score, risk_level, red_flags, recommendation, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
 	`
 
 	redFlagsJSON, _ := json.Marshal(analysis.RedFlags)
 
 	_, err := db.Exec(query,
-		userID,
+		event.TenantID,
+		event.UserID,
 		analysis.EventID,
 		analysis.RiskScore,
 		analysis.RiskLevel,
@@ -548,7 +603,7 @@ func createAlert(userID string, analysis RiskAnalysis) {
 	}
 
 	// Send notification (SMS/Email)
-	sendNotification(userID, analysis)
+	sendNotification(event.UserID, analysis)
 }
 
 func sendNotification(userID string, analysis RiskAnalysis) {
@@ -556,13 +611,13 @@ func sendNotification(userID string, analysis RiskAnalysis) {
 	log.Printf("ALERT: SIM swap fraud detected for user %s (risk: %d)", userID, analysis.RiskScore)
 }
 
-func blockUserAccount(userID string, reason string) {
+func blockUserAccount(tenantID, userID string, reason string) {
 	query := `
-		INSERT INTO blocked_accounts (user_id, reason, blocked_at)
-		VALUES ($1, $2, NOW())
+		INSERT INTO blocked_accounts (tenant_id, user_id, reason, blocked_at)
+		VALUES ($1, $2, $3, NOW())
 	`
 
-	_, err := db.Exec(query, userID, reason)
+	_, err := db.Exec(query, tenantID, userID, reason)
 	if err != nil {
 		log.Printf("Error blocking account: %v", err)
 	}
@@ -604,8 +659,10 @@ func analyzeDevice(c *gin.Context) {
 		return
 	}
 
+	device.TenantID = requestTenant(c, device.TenantID)
+
 	// Check if device is known
-	isKnown := isKnownDevice(device.UserID, device.DeviceID)
+	isKnown := isKnownDevice(device.TenantID, device.UserID, device.DeviceID)
 
 	// Check if device is suspicious
 	isSuspicious := isSuspiciousDevice(device)
@@ -625,14 +682,14 @@ func analyzeDevice(c *gin.Context) {
 	})
 }
 
-func isKnownDevice(userID, deviceID string) bool {
+func isKnownDevice(tenantID, userID, deviceID string) bool {
 	query := `
 		SELECT COUNT(*) FROM device_fingerprints
-		WHERE user_id = $1 AND device_id = $2
+		WHERE tenant_id = $1 AND user_id = $2 AND device_id = $3
 	`
 
 	var count int
-	err := db.QueryRow(query, userID, deviceID).Scan(&count)
+	err := db.QueryRow(query, tenantID, userID, deviceID).Scan(&count)
 	if err != nil {
 		return false
 	}
@@ -660,7 +717,16 @@ func checkLocationAnomaly(c *gin.Context) {
 		return
 	}
 
-	hasAnomaly := hasLocationAnomaly(req.UserID, req.Location)
+	hasAnomaly, err := hasLocationAnomaly(requestTenant(c, ""), req.UserID, req.Location)
+	if err != nil {
+		// Fail-closed: cannot evaluate location history → manual verification.
+		log.Printf("Location anomaly check failed for user %s: %v", req.UserID, err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":       "Location check unavailable",
+			"disposition": "manual_review",
+		})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":    req.UserID,
@@ -681,6 +747,7 @@ func monitorAccountAccess(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	accessLog.TenantID = requestTenant(c, accessLog.TenantID)
 
 	// Store access log
 	storeAccessLog(accessLog)
@@ -703,11 +770,12 @@ func monitorAccountAccess(c *gin.Context) {
 func storeAccessLog(accessLog AccountAccessLog) {
 	query := `
 		INSERT INTO account_access_logs
-		(access_id, user_id, device_id, access_type, success, ip_address, location, timestamp)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		(tenant_id, access_id, user_id, device_id, access_type, success, ip_address, location, timestamp)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`
 
 	_, err := db.Exec(query,
+		accessLog.TenantID,
 		accessLog.AccessID,
 		accessLog.UserID,
 		accessLog.DeviceID,
@@ -734,11 +802,12 @@ func isAccessSuspicious(accessLog AccountAccessLog) bool {
 
 func getUserRisk(c *gin.Context) {
 	userID := c.Param("user_id")
+	tenantID := requestTenant(c, "")
 
 	query := `
 		SELECT event_id, risk_score, risk_level, is_fraud, red_flags
 		FROM sim_swap_events
-		WHERE user_id = $1
+		WHERE tenant_id = $1 AND user_id = $2
 		ORDER BY swap_timestamp DESC
 		LIMIT 1
 	`
@@ -748,7 +817,7 @@ func getUserRisk(c *gin.Context) {
 	var isFraud bool
 	var redFlagsJSON []byte
 
-	err := db.QueryRow(query, userID).Scan(&eventID, &riskScore, &riskLevel, &isFraud, &redFlagsJSON)
+	err := db.QueryRow(query, tenantID, userID).Scan(&eventID, &riskScore, &riskLevel, &isFraud, &redFlagsJSON)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "No SIM swap events found for user"})
 		return
@@ -771,15 +840,17 @@ func getUserRisk(c *gin.Context) {
 }
 
 func getAlerts(c *gin.Context) {
+	tenantID := requestTenant(c, "")
 	query := `
 		SELECT user_id, event_id, risk_score, risk_level, created_at
 		FROM sim_swap_alerts
-		WHERE created_at > NOW() - INTERVAL '24 hours'
+		WHERE tenant_id = $1
+		AND created_at > NOW() - INTERVAL '24 hours'
 		ORDER BY created_at DESC
 		LIMIT 50
 	`
 
-	rows, err := db.Query(query)
+	rows, err := db.Query(query, tenantID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -816,13 +887,13 @@ func getDailyReport(c *gin.Context) {
 			SUM(CASE WHEN is_fraud THEN 1 ELSE 0 END) as fraud_detected,
 			AVG(risk_score) as avg_risk_score
 		FROM sim_swap_events
-		WHERE DATE(swap_timestamp) = CURRENT_DATE
+		WHERE tenant_id = $1 AND DATE(swap_timestamp) = CURRENT_DATE
 	`
 
 	var totalEvents, fraudDetected int
 	var avgRiskScore float64
 
-	err := db.QueryRow(query).Scan(&totalEvents, &fraudDetected, &avgRiskScore)
+	err := db.QueryRow(query, requestTenant(c, "")).Scan(&totalEvents, &fraudDetected, &avgRiskScore)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -847,7 +918,7 @@ func blockAccount(c *gin.Context) {
 		return
 	}
 
-	blockUserAccount(req.UserID, req.Reason)
+	blockUserAccount(requestTenant(c, ""), req.UserID, req.Reason)
 
 	c.JSON(http.StatusOK, gin.H{
 		"user_id": req.UserID,

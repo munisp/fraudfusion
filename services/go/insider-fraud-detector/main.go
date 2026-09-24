@@ -260,6 +260,33 @@ func (a *app) detectAuthorizationAbuse(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"employee_id": event.EmployeeID, "abuse_detected": score >= 60, "risk_score": score, "risk_level": riskLevel(score), "factors": factors, "privileged_actions_last_24h": privilegedActions, "evaluated_at": time.Now().UTC().Format(time.RFC3339)})
 }
 
+// collusionMinSharedResources is the number of distinct privileged resources
+// that must be shared by 2+ employees before collusion is flagged.
+// Configurable via COLLUSION_MIN_SHARED_RESOURCES (default 2).
+func collusionMinSharedResources() int {
+	if raw := strings.TrimSpace(os.Getenv("COLLUSION_MIN_SHARED_RESOURCES")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 1 {
+			return n
+		}
+	}
+	return 2
+}
+
+// collusionOutcome is the pure decision: collusion requires at least
+// minShared distinct privileged resources shared by 2+ employees; a single
+// shared resource is normal teamwork and scores 0 with no alert.
+func collusionOutcome(sharedResourceCount, minShared int) (detected bool, score int, factors []string) {
+	factors = []string{}
+	if sharedResourceCount >= minShared {
+		return true, min(100, sharedResourceCount*35),
+			[]string{fmt.Sprintf("shared_privileged_resource_access: %d distinct resources (threshold %d)", sharedResourceCount, minShared)}
+	}
+	if sharedResourceCount > 0 {
+		factors = append(factors, fmt.Sprintf("shared privileged resources below collusion threshold (%d < %d) - no alert", sharedResourceCount, minShared))
+	}
+	return false, 0, factors
+}
+
 func (a *app) detectCollusion(c *gin.Context) {
 	var req collusionRequest
 	if !bindJSON(c, &req) || !tenantMatches(c, req.TenantID) {
@@ -272,18 +299,20 @@ func (a *app) detectCollusion(c *gin.Context) {
 		internalError(c, err)
 		return
 	}
-	score := min(100, sharedResourceCount*35)
-	factors := []string{}
-	if sharedResourceCount > 0 {
-		factors = append(factors, "shared_privileged_resource_access")
-	}
-	for _, employeeID := range req.EmployeeIDs {
-		if err := a.persistEventAndAlert(ctx, req.TenantID, employeeID, "collusion_analysis", score, factors, actor(c)); err != nil {
-			internalError(c, err)
-			return
+	// Collusion requires at least COLLUSION_MIN_SHARED_RESOURCES distinct
+	// privileged resources shared by 2+ employees (default 2): a single shared
+	// resource is normal teamwork, not a collusion signal.
+	minShared := collusionMinSharedResources()
+	collusionDetected, score, factors := collusionOutcome(sharedResourceCount, minShared)
+	if collusionDetected {
+		for _, employeeID := range req.EmployeeIDs {
+			if err := a.persistEventAndAlert(ctx, req.TenantID, employeeID, "collusion_analysis", score, factors, actor(c)); err != nil {
+				internalError(c, err)
+				return
+			}
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{"employees": req.EmployeeIDs, "collusion_detected": score >= 35, "risk_score": score, "risk_level": riskLevel(score), "shared_resource_count": sharedResourceCount, "factors": factors, "evaluated_at": time.Now().UTC().Format(time.RFC3339)})
+	c.JSON(http.StatusOK, gin.H{"employees": req.EmployeeIDs, "collusion_detected": collusionDetected, "risk_score": score, "risk_level": riskLevel(score), "shared_resource_count": sharedResourceCount, "collusion_min_shared_resources": minShared, "factors": factors, "evaluated_at": time.Now().UTC().Format(time.RFC3339)})
 }
 
 func (a *app) getAlerts(c *gin.Context) {

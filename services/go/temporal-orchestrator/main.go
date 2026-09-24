@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
@@ -21,31 +22,43 @@ import (
 	"github.com/munisp/fraudfusion/services/go/temporal-orchestrator/workflows"
 )
 
+// Contract with the orchestrator (orchestrator/go/internal/temporal): the
+// workflow name, task queue, and JSON field names below are the cross-service
+// contract and are pinned by contract tests on both sides.
+const (
+	// ExecuteJourneyWorkflowName is the registered workflow type the
+	// orchestrator must start.
+	ExecuteJourneyWorkflowName = "ExecuteJourneyWorkflow"
+	// TaskQueue is the task queue the worker polls and the orchestrator must
+	// target (orchestrator default TEMPORAL_TASK_QUEUE matches this).
+	TaskQueue = "fraud-fusion-task-queue"
+)
+
 // JourneyWorkflow orchestrates user journeys with Temporal
 type JourneyWorkflow struct {
-	JourneyID string
-	UserID    string
-	Steps     []JourneyStep
-	Context   map[string]interface{}
+	JourneyID string                 `json:"journey_id"`
+	UserID    string                 `json:"user_id"`
+	Steps     []JourneyStep          `json:"steps"`
+	Context   map[string]interface{} `json:"context"`
 }
 
 // JourneyStep represents a single step in a journey
 type JourneyStep struct {
-	ID          string
-	Name        string
-	Service     string
-	Method      string
-	StepType    string
-	Parameters  map[string]interface{}
-	Required    bool
-	Condition   string
-	RetryPolicy *RetryPolicy
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	Service     string                 `json:"service"`
+	Method      string                 `json:"method"`
+	StepType    string                 `json:"step_type"`
+	Parameters  map[string]interface{} `json:"parameters"`
+	Required    bool                   `json:"required"`
+	Condition   string                 `json:"condition"`
+	RetryPolicy *RetryPolicy           `json:"retry_policy"`
 }
 
 // RetryPolicy defines retry behavior
 type RetryPolicy struct {
-	MaxAttempts     int
-	BackoffInterval time.Duration
+	MaxAttempts     int           `json:"max_attempts"`
+	BackoffInterval time.Duration `json:"backoff_interval"`
 }
 
 // ExecuteJourneyWorkflow is the main Temporal workflow
@@ -176,11 +189,61 @@ func resolveVariable(value string, context map[string]interface{}) interface{} {
 	return value
 }
 
-// evaluateCondition evaluates a simple condition
+// evaluateCondition evaluates a simple step-gating condition against the
+// journey context. Supported forms:
+//
+//	"${step_id}"                  truthy check on a context value
+//	"${step_id.field} == literal" equality (literal may be quoted)
+//	"${step_id.field} != literal" inequality
+//
+// Anything unrecognized evaluates to false: an unevaluable condition must
+// never silently execute the step.
 func evaluateCondition(condition string, context map[string]interface{}) bool {
-	// Simple implementation - in production, use proper expression evaluator
-	// For now, just return true
+	condition = strings.TrimSpace(condition)
+	if condition == "" {
+		return true
+	}
+	for _, op := range []string{"!=", "=="} {
+		if idx := strings.Index(condition, op); idx > 0 {
+			left := resolveConditionValue(strings.TrimSpace(condition[:idx]), context)
+			right := strings.Trim(strings.TrimSpace(condition[idx+len(op):]), `"'`)
+			result := fmt.Sprintf("%v", left) == right
+			if op == "!=" {
+				return !result
+			}
+			return result
+		}
+	}
+	value := resolveConditionValue(condition, context)
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return v != "" && v != "false"
+	case nil:
+		return false
+	}
 	return true
+}
+
+// resolveConditionValue unwraps ${...} references and resolves them from the
+// journey context (supporting a single .field projection into map values).
+func resolveConditionValue(expr string, context map[string]interface{}) interface{} {
+	if !strings.HasPrefix(expr, "${") || !strings.HasSuffix(expr, "}") {
+		return expr
+	}
+	path := strings.SplitN(expr[2:len(expr)-1], ".", 2)
+	value, ok := context[path[0]]
+	if !ok {
+		return nil
+	}
+	if len(path) == 2 {
+		if m, ok := value.(map[string]interface{}); ok {
+			return m[path[1]]
+		}
+		return nil
+	}
+	return value
 }
 
 // Activities for each service
@@ -324,7 +387,7 @@ func main() {
 	defer c.Close()
 
 	// Create worker
-	w := worker.New(c, "fraud-fusion-task-queue", worker.Options{})
+	w := worker.New(c, TaskQueue, worker.Options{})
 
 	// Register workflows
 	w.RegisterWorkflow(ExecuteJourneyWorkflow)
@@ -333,24 +396,17 @@ func main() {
 	workflows.RegisterJourney34Workflow(w)
 	workflows.RegisterJourney37Workflow(w)
 
-	// Register activities
-	landVerificationActivities := &LandVerificationActivities{}
-	w.RegisterActivity(landVerificationActivities)
-
-	documentStorageActivities := &DocumentStorageActivities{}
-	w.RegisterActivity(documentStorageActivities)
-
-	integrationActivities := &IntegrationActivities{}
-	w.RegisterActivity(integrationActivities)
-
-	notificationActivities := &NotificationActivities{}
-	w.RegisterActivity(notificationActivities)
-
-	fraudDetectionActivities := &FraudDetectionActivities{}
-	w.RegisterActivity(fraudDetectionActivities)
+	// Register activities. Struct registration prefixes every method with the
+	// service name so journey steps resolve "service.Method" (e.g.
+	// "land_verification_service.ProcessDocumentsDeepseek") to a real activity.
+	w.RegisterActivityWithOptions(&LandVerificationActivities{}, activity.RegisterOptions{Name: "land_verification_service."})
+	w.RegisterActivityWithOptions(&DocumentStorageActivities{}, activity.RegisterOptions{Name: "document_storage_service."})
+	w.RegisterActivityWithOptions(&IntegrationActivities{}, activity.RegisterOptions{Name: "integration_service."})
+	w.RegisterActivityWithOptions(&NotificationActivities{}, activity.RegisterOptions{Name: "notification_service."})
+	w.RegisterActivityWithOptions(&FraudDetectionActivities{}, activity.RegisterOptions{Name: "fraud_detection_service."})
 
 	// Start worker
-	log.Println("Starting Temporal worker on task queue: fraud-fusion-task-queue")
+	log.Printf("Starting Temporal worker on task queue: %s", TaskQueue)
 	err = w.Run(worker.InterruptCh())
 	if err != nil {
 		log.Fatalln("Unable to start worker", err)

@@ -96,8 +96,24 @@ type SAR struct {
 	FilingDate        time.Time `json:"filing_date"`
 	Status            string    `json:"status"`
 	ReferenceNumber   string    `json:"reference_number"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	// FiledWithinSLA records whether the STR reached the regulator within the
+	// 72h NFIU deadline from detection (CreatedAt). Nil until filed.
+	FiledWithinSLA *bool     `json:"filed_within_sla,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// CTRReport is a Currency Transaction Report obligation record (₦10M NGN
+// threshold, reportable to the NFIU).
+type CTRReport struct {
+	ID            int64     `json:"id"`
+	TransactionID string    `json:"transaction_id"`
+	UserID        string    `json:"user_id"`
+	Amount        float64   `json:"amount"`
+	Currency      string    `json:"currency"`
+	Threshold     float64   `json:"threshold"`
+	Status        string    `json:"status"` // pending_report, reported
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // SARFilingRequest represents a request to file a SAR

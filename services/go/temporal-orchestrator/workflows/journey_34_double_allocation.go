@@ -153,28 +153,30 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 	claimantsFuture := workflow.ExecuteActivity(ctx, DetectMultipleClaimantsActivity, claimantsInput)
 	ownerFuture := workflow.ExecuteActivity(ctx, VerifyCurrentOwnerActivity, ownerInput)
 
-	// Step 2: Query Land Registry for ownership history
+	// Step 2: Query Land Registry for ownership history.
+	// Fail loudly: a double-allocation verdict built on silently empty
+	// registry data is worse than no verdict at all.
 	var ownershipHistory []OwnershipRecord
 	err = registryFuture.Get(ctx, &ownershipHistory)
 	if err != nil {
 		logger.Error("Failed to query Land Registry", "error", err)
-		// Continue with partial data
-		ownershipHistory = []OwnershipRecord{}
-	} else {
-		output.OwnershipHistory = ownershipHistory
-		logger.Info("Ownership history retrieved", "recordCount", len(ownershipHistory))
+		output.Status = "failed"
+		return output, fmt.Errorf("land registry history lookup failed: %w", err)
 	}
+	output.OwnershipHistory = ownershipHistory
+	logger.Info("Ownership history retrieved", "recordCount", len(ownershipHistory))
 
-	// Step 3: Detect multiple claimants
+	// Step 3: Detect multiple claimants. Failure is fatal — continuing with
+	// zero claimants would fabricate a clean bill of health.
 	var claimants []Claimant
 	err = claimantsFuture.Get(ctx, &claimants)
 	if err != nil {
 		logger.Error("Failed to detect claimants", "error", err)
-		claimants = []Claimant{}
-	} else {
-		output.Claimants = claimants
-		logger.Info("Claimants detected", "count", len(claimants))
+		output.Status = "failed"
+		return output, fmt.Errorf("claimant detection failed: %w", err)
 	}
+	output.Claimants = claimants
+	logger.Info("Claimants detected", "count", len(claimants))
 
 	// Analyze claimants for fraud
 	if len(claimants) > 1 {
@@ -204,11 +206,11 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 	err = workflow.ExecuteActivity(ctx, SearchCourtDisputesActivity, disputeInput).Get(ctx, &courtDisputes)
 	if err != nil {
 		logger.Error("Failed to search court disputes", "error", err)
-		courtDisputes = []CourtDispute{}
-	} else {
-		output.CourtDisputes = courtDisputes
-		logger.Info("Court disputes found", "count", len(courtDisputes))
+		output.Status = "failed"
+		return output, fmt.Errorf("court dispute search failed: %w", err)
 	}
+	output.CourtDisputes = courtDisputes
+	logger.Info("Court disputes found", "count", len(courtDisputes))
 
 	// Analyze court disputes for fraud
 	if len(courtDisputes) > 0 {
@@ -261,7 +263,7 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 	err = workflow.ExecuteActivity(ctx, CheckUnauthorizedSellerActivity, sellerInput).Get(ctx, &sellerVerification)
 	if err != nil {
 		logger.Error("Failed to check seller authorization", "error", err)
-	} else if !sellerVerification["authorized"].(bool) {
+	} else if authorized, ok := sellerVerification["authorized"].(bool); ok && !authorized {
 		output.FraudDetected = true
 		output.Indicators = append(output.Indicators, FraudIndicator{
 			Type:        "UNAUTHORIZED_SELLER",
@@ -290,9 +292,11 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 	if err != nil {
 		logger.Error("Failed to calculate risk score", "error", err)
 		output.RiskScore = 0.0
-	} else {
-		output.RiskScore = riskAnalysis["risk_score"].(float64)
+	} else if score, ok := riskAnalysis["risk_score"].(float64); ok {
+		output.RiskScore = score
 		logger.Info("Risk score calculated", "score", output.RiskScore)
+	} else {
+		logger.Error("Risk score activity returned no numeric risk_score")
 	}
 
 	// Generate final recommendation
@@ -306,28 +310,25 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 			output.Recommendation = "CAUTION - Potential fraud indicators detected. Seek professional verification."
 		}
 
-		// Recommend professional help
-		output.ProfessionalHelp = &ProfessionalRecommendation{
-			Type:    "lawyer",
-			Urgency: "immediate",
-			Professionals: []Professional{
-				{
-					Name:           "Adebayo Okonkwo",
-					Type:           "lawyer",
-					License:        "SCN/123456",
-					Rating:         4.8,
-					Specialization: "Property Law & Land Disputes",
-					Contact:        "+234-803-XXX-XXXX",
-				},
-				{
-					Name:           "Chioma Nwosu",
-					Type:           "lawyer",
-					License:        "SCN/789012",
-					Rating:         4.9,
-					Specialization: "Real Estate Fraud",
-					Contact:        "+234-805-XXX-XXXX",
-				},
-			},
+		// Recommend professional help from the real professional directory
+		// (best-effort: the fraud verdict must not depend on it, but no
+		// professional is ever fabricated).
+		var professionals []ProfessionalDetails
+		professionalInput := map[string]interface{}{
+			"professional_type": "lawyer",
+			"state":             input.State,
+			"specialization":    "Property Law",
+			"min_rating":        4.0,
+			"max_results":       3,
+		}
+		if profErr := workflow.ExecuteActivity(ctx, SearchProfessionalDirectoryActivity, professionalInput).Get(ctx, &professionals); profErr != nil {
+			logger.Warn("Professional directory unavailable; no recommendation attached", "error", profErr)
+		} else if len(professionals) > 0 {
+			output.ProfessionalHelp = &ProfessionalRecommendation{
+				Type:          "lawyer",
+				Urgency:       "immediate",
+				Professionals: toGenericProfessionals(professionals),
+			}
 		}
 	} else {
 		output.Status = "completed"
@@ -349,99 +350,90 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 
 // Activity implementations
 
-// ExtractLandDetailsActivity extracts land details from document using DeepSeek OCR
+// ExtractLandDetailsActivity extracts land details from a document via the
+// land-verification-service document-processing endpoint. The activity fails
+// when the service is unconfigured, unreachable, or returns an error — no
+// land details are ever fabricated locally.
 func ExtractLandDetailsActivity(ctx context.Context, documentFile string) (map[string]interface{}, error) {
-	// Call Land Verification Service - DeepSeek OCR
-	// Implementation calls: http://land-verification-service:8002/api/v1/process-document
-	return map[string]interface{}{
-		"certificate_number": "LA/123456/2023",
-		"property_address":   "123 Victoria Island, Lagos",
-		"seller_name":        "John Doe",
-		"owner_name":         "Jane Smith",
-		"plot_number":        "Plot 123",
-		"size":               "1000 sqm",
-	}, nil
+	if documentFile == "" {
+		return nil, fmt.Errorf("document_file is required")
+	}
+	var extracted map[string]interface{}
+	if err := callServiceJSON(ctx, LandVerificationURLEnv, "/api/v1/process-document",
+		map[string]interface{}{"document_file": documentFile}, &extracted); err != nil {
+		return nil, fmt.Errorf("land document extraction: %w", err)
+	}
+	if len(extracted) == 0 {
+		return nil, fmt.Errorf("land document extraction returned no data")
+	}
+	return extracted, nil
 }
 
-// QueryLandRegistryActivity queries Land Registry for ownership history
+// QueryLandRegistryActivity queries the land registry for ownership history.
+// Fails loudly when the registry cannot be reached.
 func QueryLandRegistryActivity(ctx context.Context, input map[string]interface{}) ([]OwnershipRecord, error) {
-	// Call Land Registry API
-	// Implementation calls: http://land-verification-service:8002/api/v1/registry/history
-	return []OwnershipRecord{
-		{
-			Owner:        "Jane Smith",
-			StartDate:    time.Now().AddDate(-2, 0, 0),
-			TransferType: "Purchase",
-			DocumentRef:  "LA/123456/2023",
-			Verified:     true,
-		},
-	}, nil
+	var response struct {
+		OwnershipHistory []OwnershipRecord `json:"ownership_history"`
+		Records          []OwnershipRecord `json:"records"`
+	}
+	if err := callServiceJSON(ctx, LandVerificationURLEnv, "/api/v1/registry/history", input, &response); err != nil {
+		return nil, fmt.Errorf("land registry history: %w", err)
+	}
+	if response.OwnershipHistory != nil {
+		return response.OwnershipHistory, nil
+	}
+	return response.Records, nil
 }
 
-// DetectMultipleClaimantsActivity detects multiple people claiming ownership
+// DetectMultipleClaimantsActivity detects people claiming ownership of a
+// property via the land-verification-service. Any failure propagates so the
+// workflow never reports "no claimants" on the back of an outage.
 func DetectMultipleClaimantsActivity(ctx context.Context, input map[string]interface{}) ([]Claimant, error) {
-	// Call Land Verification Service - Multiple Claimants Detection
-	// Implementation calls: http://land-verification-service:8002/api/v1/detect-claimants
-	return []Claimant{
-		{
-			Name:         "Jane Smith",
-			ClaimDate:    time.Now().AddDate(-2, 0, 0),
-			DocumentType: "C of O",
-			DocumentRef:  "LA/123456/2023",
-			Verified:     true,
-			Conflicting:  false,
-		},
-		{
-			Name:         "John Doe",
-			ClaimDate:    time.Now().AddDate(0, -1, 0),
-			DocumentType: "Deed of Assignment",
-			DocumentRef:  "LA/789012/2024",
-			Verified:     false,
-			Conflicting:  true,
-		},
-		{
-			Name:         "Mary Johnson",
-			ClaimDate:    time.Now().AddDate(0, -2, 0),
-			DocumentType: "Power of Attorney",
-			DocumentRef:  "LA/345678/2024",
-			Verified:     false,
-			Conflicting:  true,
-		},
-	}, nil
+	var response struct {
+		Claimants []Claimant `json:"claimants"`
+	}
+	if err := callServiceJSON(ctx, LandVerificationURLEnv, "/api/v1/detect-claimants", input, &response); err != nil {
+		return nil, fmt.Errorf("claimant detection: %w", err)
+	}
+	return response.Claimants, nil
 }
 
-// SearchCourtDisputesActivity searches for court cases related to the property
+// SearchCourtDisputesActivity searches court records for disputes related to
+// the property. Fails loudly on any downstream error.
 func SearchCourtDisputesActivity(ctx context.Context, input map[string]interface{}) ([]CourtDispute, error) {
-	// Call Court Records API
-	// Implementation calls: http://land-verification-service:8002/api/v1/court-disputes
-	return []CourtDispute{
-		{
-			CaseNumber:    "LD/123/2024",
-			FiledDate:     time.Now().AddDate(0, -3, 0),
-			Status:        "pending",
-			Parties:       []string{"Jane Smith", "John Doe"},
-			Description:   "Dispute over property ownership",
-			CourtLocation: "Lagos High Court",
-		},
-	}, nil
+	var response struct {
+		Disputes      []CourtDispute `json:"disputes"`
+		CourtDisputes []CourtDispute `json:"court_disputes"`
+	}
+	if err := callServiceJSON(ctx, LandVerificationURLEnv, "/api/v1/court-disputes", input, &response); err != nil {
+		return nil, fmt.Errorf("court dispute search: %w", err)
+	}
+	if response.Disputes != nil {
+		return response.Disputes, nil
+	}
+	return response.CourtDisputes, nil
 }
 
-// VerifyCurrentOwnerActivity verifies the current registered owner
+// VerifyCurrentOwnerActivity verifies the current registered owner via the
+// land registry. Fails loudly when the registry cannot answer.
 func VerifyCurrentOwnerActivity(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
-	// Call Land Registry API
-	// Implementation calls: http://land-verification-service:8002/api/v1/registry/owner
-	return map[string]interface{}{
-		"name":               "Jane Smith",
-		"certificate_number": "LA/123456/2023",
-		"verified":           true,
-		"registration_date":  time.Now().AddDate(-2, 0, 0),
-	}, nil
+	var owner map[string]interface{}
+	if err := callServiceJSON(ctx, LandVerificationURLEnv, "/api/v1/registry/owner", input, &owner); err != nil {
+		return nil, fmt.Errorf("registry owner verification: %w", err)
+	}
+	if len(owner) == 0 {
+		return nil, fmt.Errorf("registry owner verification returned no owner record")
+	}
+	return owner, nil
 }
 
 // CheckUnauthorizedSellerActivity checks if seller is authorized
 func CheckUnauthorizedSellerActivity(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
-	sellerName := input["seller_name"].(string)
-	registeredOwner := input["registered_owner"].(string)
+	sellerName, _ := input["seller_name"].(string)
+	registeredOwner, _ := input["registered_owner"].(string)
+	if sellerName == "" || registeredOwner == "" {
+		return nil, fmt.Errorf("seller_name and registered_owner are required")
+	}
 
 	authorized := sellerName == registeredOwner
 
@@ -454,9 +446,9 @@ func CheckUnauthorizedSellerActivity(ctx context.Context, input map[string]inter
 
 // CalculateRiskScoreActivity calculates overall fraud risk score
 func CalculateRiskScoreActivity(ctx context.Context, input map[string]interface{}) (map[string]interface{}, error) {
-	indicators := input["indicators"].([]FraudIndicator)
-	claimantCount := input["claimant_count"].(int)
-	disputeCount := input["dispute_count"].(int)
+	indicators, _ := input["indicators"].([]FraudIndicator)
+	claimantCount := asInt(input["claimant_count"])
+	disputeCount := asInt(input["dispute_count"])
 
 	// Calculate risk score (0.0 - 1.0)
 	riskScore := 0.0
@@ -508,6 +500,37 @@ func filterActiveDisputes(disputes []CourtDispute) []CourtDispute {
 		}
 	}
 	return active
+}
+
+// asInt tolerantly converts decoded JSON numbers (float64) and ints.
+func asInt(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int32:
+		return int(n)
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return 0
+}
+
+// toGenericProfessionals maps directory results to the journey-34 output type.
+func toGenericProfessionals(details []ProfessionalDetails) []Professional {
+	professionals := make([]Professional, 0, len(details))
+	for _, d := range details {
+		professionals = append(professionals, Professional{
+			Name:           d.Name,
+			Type:           d.Type,
+			License:        d.License,
+			Rating:         d.Rating,
+			Specialization: d.Specialization,
+			Contact:        d.Contact.Phone,
+		})
+	}
+	return professionals
 }
 
 func getRiskLevel(score float64) string {

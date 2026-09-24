@@ -200,9 +200,16 @@ func performSchemeAnalysis(scheme *InvestmentScheme) *InvestmentAnalysis {
 		redFlags = append(redFlags, "Extremely unrealistic returns - likely Ponzi")
 	}
 
-	// Check SEC registration
-	secRegistered := checkSECRegistration(scheme.Name, scheme.PromoterId)
-	if !secRegistered {
+	// Check SEC registration against the real registered-entities table.
+	secRegistered, secErr := checkSECRegistration(scheme.Name, scheme.PromoterId)
+	if secErr != nil {
+		// Registry unavailable: do NOT apply the full "not registered"
+		// penalty (that was the fail-closed +35 defect). Apply a small caution
+		// score and force manual verification instead.
+		log.Printf("SEC registry lookup failed for scheme %s: %v", scheme.ID, secErr)
+		riskScore += 10
+		redFlags = append(redFlags, "SEC registration could not be verified - registry unavailable, manual verification required")
+	} else if !secRegistered {
 		riskScore += 35
 		redFlags = append(redFlags, "Not registered with SEC Nigeria")
 	}
@@ -274,21 +281,25 @@ func performSchemeAnalysis(scheme *InvestmentScheme) *InvestmentAnalysis {
 	}
 }
 
-func checkSECRegistration(schemeName, promoterId string) bool {
-	// Check database for SEC registration
+// checkSECRegistration queries the SEC Nigeria registered-entities table
+// (seeded by database/20260827_service_base_tables.sql) with a
+// case-insensitive name match. The error is returned so callers can
+// distinguish "definitively not registered" from "registry unavailable".
+func checkSECRegistration(schemeName, promoterId string) (bool, error) {
+	if db == nil {
+		return false, fmt.Errorf("database not initialized")
+	}
 	var registered bool
 	err := db.QueryRow(`
 		SELECT EXISTS(
 			SELECT 1 FROM sec_registered_entities
-			WHERE name = $1 OR promoter_id = $2
+			WHERE LOWER(name) = LOWER($1) OR ($2 <> '' AND promoter_id = $2)
 		)
 	`, schemeName, promoterId).Scan(&registered)
-
 	if err != nil {
-		return false
+		return false, fmt.Errorf("SEC registry lookup: %w", err)
 	}
-
-	return registered
+	return registered, nil
 }
 
 func checkPromoterHistory(promoterId string) int {
@@ -387,8 +398,14 @@ func calculatePonziIndicators(schemeID string) *PonziIndicators {
 	// Check recruitment pressure
 	indicators.PressureToRecruit = checkRecruitmentPressure(&scheme)
 
-	// Check SEC registration
-	indicators.NoSECRegistration = !checkSECRegistration(scheme.Name, scheme.PromoterId)
+	// Check SEC registration (registry unavailable → unknown, not "unregistered")
+	secRegistered, secErr := checkSECRegistration(scheme.Name, scheme.PromoterId)
+	if secErr != nil {
+		log.Printf("SEC registry lookup failed for scheme %s: %v", schemeID, secErr)
+		indicators.NoSECRegistration = false
+	} else {
+		indicators.NoSECRegistration = !secRegistered
+	}
 
 	// Check payment patterns
 	indicators.SuspiciousPayments = checkPaymentPatterns(schemeID)
@@ -542,7 +559,15 @@ func verifySECRegistration(c *gin.Context) {
 		return
 	}
 
-	registered := checkSECRegistration(req.EntityName, "")
+	registered, err := checkSECRegistration(req.EntityName, "")
+	if err != nil {
+		log.Printf("SEC registry lookup failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":       "SEC registry unavailable",
+			"disposition": "manual_review",
+		})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"entity_name":    req.EntityName,
@@ -758,15 +783,89 @@ func getInvestorPortfolio(c *gin.Context) {
 }
 
 func getDailyReport(c *gin.Context) {
+	if db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not initialized"})
+		return
+	}
+	date := c.DefaultQuery("date", time.Now().Format("2006-01-02"))
+
+	var schemesAnalyzed, ponziDetected, secRegistered int
+	var avgRisk sql.NullFloat64
+	err := db.QueryRow(`
+		SELECT COUNT(*),
+			SUM(CASE WHEN is_ponzi THEN 1 ELSE 0 END),
+			SUM(CASE WHEN sec_registered THEN 1 ELSE 0 END),
+			AVG(risk_score)
+		FROM investment_schemes
+		WHERE DATE(created_at) = $1
+	`, date).Scan(&schemesAnalyzed, &ponziDetected, &secRegistered, &avgRisk)
+	if err != nil {
+		log.Printf("daily report query failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to compute daily report"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"date":             time.Now().Format("2006-01-02"),
-		"schemes_analyzed": 0,
-		"ponzi_detected":   0,
+		"date":             date,
+		"schemes_analyzed": schemesAnalyzed,
+		"ponzi_detected":   ponziDetected,
+		"sec_registered":   secRegistered,
+		"avg_risk_score":   avgRisk.Float64,
 	})
 }
 
 func getFlaggedSchemes(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"flagged_schemes": []gin.H{}})
+	if db == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not initialized"})
+		return
+	}
+	rows, err := db.Query(`
+		SELECT id, name, promoter_id, promised_returns, risk_score, risk_level, is_ponzi, sec_registered, created_at
+		FROM investment_schemes
+		WHERE is_ponzi = true OR risk_score >= 60
+		ORDER BY risk_score DESC
+		LIMIT 100
+	`)
+	if err != nil {
+		log.Printf("flagged schemes query failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to list flagged schemes"})
+		return
+	}
+	defer rows.Close()
+
+	schemes := []gin.H{}
+	for rows.Next() {
+		var id, name, promoterId, riskLevel string
+		var promisedReturns float64
+		var riskScore int
+		var isPonzi, secRegistered bool
+		var createdAt time.Time
+		if err := rows.Scan(&id, &name, &promoterId, &promisedReturns, &riskScore, &riskLevel, &isPonzi, &secRegistered, &createdAt); err != nil {
+			log.Printf("flagged schemes scan failed: %v", err)
+			continue
+		}
+		schemes = append(schemes, gin.H{
+			"id":               id,
+			"name":             name,
+			"promoter_id":      promoterId,
+			"promised_returns": promisedReturns,
+			"risk_score":       riskScore,
+			"risk_level":       riskLevel,
+			"is_ponzi":         isPonzi,
+			"sec_registered":   secRegistered,
+			"created_at":       createdAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("flagged schemes iteration failed: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unable to list flagged schemes"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"flagged_schemes": schemes,
+		"count":           len(schemes),
+	})
 }
 
 func storeSchemeAnalysis(scheme *InvestmentScheme, analysis *InvestmentAnalysis) {

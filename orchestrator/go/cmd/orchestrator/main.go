@@ -53,6 +53,10 @@ type JourneyRequest struct {
 	UserID    string                 `json:"user_id"`
 	TenantID  string                 `json:"tenant_id"`
 	Data      map[string]interface{} `json:"data"`
+	// Steps is the optional explicit workflow step list handed to the
+	// ExecuteJourneyWorkflow contract; when empty the workflow runs with no
+	// steps (callers that need step execution must supply them).
+	Steps []temporal.WorkflowStep `json:"steps"`
 }
 
 // JourneyResponse represents a journey execution response
@@ -314,9 +318,10 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 	workflowInput := temporal.WorkflowInput{
 		JourneyID: req.JourneyID,
 		UserID:    req.UserID,
-		Data:      req.Data,
+		Steps:     req.Steps,
+		Context:   req.Data,
 	}
-	runID, err := o.temporal.StartWorkflow(ctx, workflowID, "JourneyWorkflow", workflowInput)
+	runID, err := o.temporal.StartWorkflow(ctx, workflowID, temporal.ExecuteJourneyWorkflowName, workflowInput)
 	if err != nil {
 		response.Status = "failed"
 		response.Error = fmt.Sprintf("Workflow start failed: %v", err)

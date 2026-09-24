@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	temporalsdk "go.temporal.io/sdk/client"
 )
@@ -15,11 +16,43 @@ type Client struct {
 	taskQueue string
 }
 
+// Cross-service contract with the Temporal worker
+// (services/go/temporal-orchestrator): the workflow name, default task queue,
+// and the JSON field names below must match the worker's registered workflow
+// and input struct. Pinned by contract tests on both sides.
+const (
+	// ExecuteJourneyWorkflowName is the workflow type registered by the worker.
+	ExecuteJourneyWorkflowName = "ExecuteJourneyWorkflow"
+	// DefaultTaskQueue matches the worker's polling queue.
+	DefaultTaskQueue = "fraud-fusion-task-queue"
+)
+
+// WorkflowStep is one step of the journey executed by ExecuteJourneyWorkflow.
+type WorkflowStep struct {
+	ID          string                 `json:"id"`
+	Name        string                 `json:"name"`
+	Service     string                 `json:"service"`
+	Method      string                 `json:"method"`
+	StepType    string                 `json:"step_type"`
+	Parameters  map[string]interface{} `json:"parameters"`
+	Required    bool                   `json:"required"`
+	Condition   string                 `json:"condition"`
+	RetryPolicy *WorkflowRetryPolicy   `json:"retry_policy,omitempty"`
+}
+
+// WorkflowRetryPolicy mirrors the worker's per-step retry policy. Durations
+// are encoded as nanoseconds (time.Duration JSON contract).
+type WorkflowRetryPolicy struct {
+	MaxAttempts     int           `json:"max_attempts"`
+	BackoffInterval time.Duration `json:"backoff_interval"`
+}
+
 // WorkflowInput is the serializable payload delivered to a registered journey workflow.
 type WorkflowInput struct {
 	JourneyID string                 `json:"journey_id"`
 	UserID    string                 `json:"user_id"`
-	Data      map[string]interface{} `json:"data"`
+	Steps     []WorkflowStep         `json:"steps"`
+	Context   map[string]interface{} `json:"context"`
 }
 
 // WorkflowResult is the required result contract emitted by a completed journey workflow.
@@ -50,7 +83,7 @@ func NewClient(hostPort, namespace string) (*Client, error) {
 
 	taskQueue := os.Getenv("TEMPORAL_TASK_QUEUE")
 	if taskQueue == "" {
-		taskQueue = "fraudfusion-journeys"
+		taskQueue = DefaultTaskQueue
 	}
 
 	return &Client{client: sdkClient, namespace: namespace, taskQueue: taskQueue}, nil

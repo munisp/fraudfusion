@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -21,17 +22,19 @@ import (
 )
 
 type AMLHandler struct {
-	repo *repository.AMLRepository
-	ml   *mlclient.Client
+	repo      *repository.AMLRepository
+	ml        *mlclient.Client
+	watchlist *Watchlist
 }
 
 // batchWorkers bounds concurrent ML+DB work inside one batch request.
 const batchWorkers = 10
 
-func NewAMLHandler(repo *repository.AMLRepository, ml *mlclient.Client) *AMLHandler {
+func NewAMLHandler(repo *repository.AMLRepository, ml *mlclient.Client, watchlist *Watchlist) *AMLHandler {
 	return &AMLHandler{
-		repo: repo,
-		ml:   ml,
+		repo:      repo,
+		ml:        ml,
+		watchlist: watchlist,
 	}
 }
 
@@ -98,15 +101,39 @@ func (h *AMLHandler) AnalyzeTransaction(c *gin.Context) {
 		return
 	}
 
+	// Nigerian CTR rule: NGN transactions at or above the ₦10M threshold are
+	// auto-flagged and a CTR obligation is recorded, regardless of ML score.
+	ctrRequired := requiresCTR(req.Currency, req.Amount)
+	riskScore := resp.RiskScore
+	riskFactors := resp.RiskFactors
+	flagged := resp.Flagged
+	if ctrRequired {
+		flagged = true
+		if riskScore < 80 {
+			riskScore = 80
+		}
+		riskFactors = append(riskFactors, fmt.Sprintf("ctr_threshold_exceeded: NGN %.0f >= %.0f (NFIU CTR)", req.Amount, ctrThresholdNGN()))
+		if err := h.repo.StoreCTRReport(&models.CTRReport{
+			TransactionID: req.TransactionID,
+			UserID:        req.UserID,
+			Amount:        req.Amount,
+			Currency:      req.Currency,
+			Threshold:     ctrThresholdNGN(),
+			Status:        "pending_report",
+		}); err != nil {
+			log.Printf("Failed to record CTR obligation for %s: %v", req.TransactionID, err)
+		}
+	}
+
 	// Store result in database
 	analysis := &models.TransactionAnalysis{
 		TransactionID:  req.TransactionID,
 		UserID:         req.UserID,
-		RiskScore:      int(resp.RiskScore),
+		RiskScore:      int(riskScore),
 		RiskLevel:      resp.RiskLevel,
-		Flagged:        resp.Flagged,
+		Flagged:        flagged,
 		SARRequired:    resp.SarRequired,
-		RiskFactors:    resp.RiskFactors,
+		RiskFactors:    riskFactors,
 		Recommendation: resp.Recommendation,
 		CreatedAt:      time.Now(),
 	}
@@ -114,15 +141,16 @@ func (h *AMLHandler) AnalyzeTransaction(c *gin.Context) {
 	if err := h.repo.StoreTransactionAnalysis(analysis); err != nil {
 		log.Printf("Failed to store analysis: %v", err)
 	}
-	h.repo.CacheRiskScore(req.TransactionID, int(resp.RiskScore))
+	h.repo.CacheRiskScore(req.TransactionID, int(riskScore))
 
 	c.JSON(http.StatusOK, gin.H{
 		"transaction_id":  resp.TransactionID,
-		"risk_score":      resp.RiskScore,
+		"risk_score":      riskScore,
 		"risk_level":      resp.RiskLevel,
-		"risk_factors":    resp.RiskFactors,
-		"flagged":         resp.Flagged,
+		"risk_factors":    riskFactors,
+		"flagged":         flagged,
 		"sar_required":    resp.SarRequired,
+		"ctr_required":    ctrRequired,
 		"recommendation":  resp.Recommendation,
 		"detailed_scores": resp.DetailedScores,
 		"analyzed_at":     time.Now().Unix(),
@@ -186,7 +214,11 @@ func (h *AMLHandler) BatchAnalyzeTransactions(c *gin.Context) {
 				return
 			}
 
-			if resp.Flagged {
+			// Nigerian CTR rule applies per transaction in batch too.
+			ctrRequired := requiresCTR(txn.Currency, txn.Amount)
+			flagged := resp.Flagged || ctrRequired
+
+			if flagged {
 				atomic.AddInt64(&flaggedCount, 1)
 			}
 			if resp.SarRequired {
@@ -197,8 +229,20 @@ func (h *AMLHandler) BatchAnalyzeTransactions(c *gin.Context) {
 				"transaction_id": resp.TransactionID,
 				"risk_score":     resp.RiskScore,
 				"risk_level":     resp.RiskLevel,
-				"flagged":        resp.Flagged,
+				"flagged":        flagged,
 				"sar_required":   resp.SarRequired,
+				"ctr_required":   ctrRequired,
+			}
+
+			if ctrRequired {
+				h.repo.StoreCTRReport(&models.CTRReport{
+					TransactionID: txn.TransactionID,
+					UserID:        txn.UserID,
+					Amount:        txn.Amount,
+					Currency:      txn.Currency,
+					Threshold:     ctrThresholdNGN(),
+					Status:        "pending_report",
+				})
 			}
 
 			// Store in database
@@ -207,7 +251,7 @@ func (h *AMLHandler) BatchAnalyzeTransactions(c *gin.Context) {
 				UserID:        txn.UserID,
 				RiskScore:     int(resp.RiskScore),
 				RiskLevel:     resp.RiskLevel,
-				Flagged:       resp.Flagged,
+				Flagged:       flagged,
 				SARRequired:   resp.SarRequired,
 				RiskFactors:   resp.RiskFactors,
 				CreatedAt:     time.Now(),
@@ -476,21 +520,64 @@ func (h *AMLHandler) FileSAR(c *gin.Context) {
 		return
 	}
 
-	// File with regulatory authority (CBN/EFCC)
+	// File with regulatory authority (CBN/EFCC). Only a successful regulator
+	// response may mark the SAR "filed"; failures keep it in filing_failed
+	// and raise an alert so compliance can retry.
 	filingResult := h.fileWithRegulator(sar, req.RegulatoryAuthority)
+	newStatus := sarFilingOutcome(filingResult.Success)
 
-	// Update SAR status
-	if err := h.repo.UpdateSARStatus(sarID, "filed", filingResult.ReferenceNumber); err != nil {
+	if !filingResult.Success {
+		log.Printf("ALERT: SAR %s filing with %s FAILED: %s", sarID, req.RegulatoryAuthority, filingResult.Error)
+		if err := h.repo.UpdateSARFiling(sarID, newStatus, "", false); err != nil {
+			log.Printf("Failed to record SAR filing failure for %s: %v", sarID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update SAR status"})
+			return
+		}
+		c.JSON(http.StatusBadGateway, gin.H{
+			"sar_id":     sarID,
+			"status":     newStatus,
+			"filed_with": req.RegulatoryAuthority,
+			"error":      filingResult.Error,
+		})
+		return
+	}
+
+	// STR deadline tracking: filing is measured against the 72h NFIU window
+	// from detection (SAR creation); breaches raise the alert metric.
+	filedWithinSLA := recordSTRSLAOutcome(sar.CreatedAt, time.Now())
+	if !filedWithinSLA {
+		log.Printf("ALERT: SAR %s filed AFTER the %s STR deadline (detected %s)", sarID, strSLA(), sar.CreatedAt.Format(time.RFC3339))
+	}
+
+	if err := h.repo.UpdateSARFiling(sarID, newStatus, filingResult.ReferenceNumber, filedWithinSLA); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update SAR status"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"sar_id":           sarID,
-		"status":           "filed",
+		"status":           newStatus,
 		"filed_with":       req.RegulatoryAuthority,
 		"reference_number": filingResult.ReferenceNumber,
+		"filed_within_sla": filedWithinSLA,
 		"filed_at":         time.Now().Unix(),
+	})
+}
+
+// ComplianceMetrics exposes STR SLA breach metrics for compliance monitoring.
+func (h *AMLHandler) ComplianceMetrics(c *gin.Context) {
+	sla := strSLA()
+	overdue, err := h.repo.CountOverdueUnfiledSARs(sla)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to compute compliance metrics"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"str_sla_hours":                    int(sla.Hours()),
+		"str_sla_late_filings_this_process": STRSLABreaches(),
+		"str_overdue_unfiled":              overdue,
+		"ctr_threshold_ngn":                ctrThresholdNGN(),
+		"evaluated_at":                     time.Now().Unix(),
 	})
 }
 
@@ -518,50 +605,68 @@ func (h *AMLHandler) CheckSanctions(c *gin.Context) {
 		return
 	}
 
-	// Call the ML inference service over HTTP
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
-	defer cancel()
+	// Primary screening: the local watchlist (UN SC Consolidated List, OFAC
+	// SDN, Nigerian domestic list sample). Matches carry real list names.
+	localMatches := h.watchlist.Match(req.EntityName)
+	matches := make([]*models.SanctionsMatch, 0, len(localMatches))
+	for _, m := range localMatches {
+		matches = append(matches, &models.SanctionsMatch{
+			ListName:   m.ListName,
+			EntityName: m.EntryName,
+			Details:    fmt.Sprintf("%s match on %s (ref %s)", m.MatchType, m.EntryName, m.Reference),
+			MatchScore: m.MatchScore * 100,
+		})
+	}
 
-	mlReq := &mlclient.SanctionsRequest{
+	// Augmentation: the ML service adds fuzzy/semantic signals on top of the
+	// list-based screening. An ML outage never suppresses a real list hit.
+	mlAugmentation := "unavailable"
+	mlConfidence := 0.0
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	resp, err := h.ml.CheckSanctions(ctx, &mlclient.SanctionsRequest{
 		EntityName: req.EntityName,
 		EntityType: req.EntityType,
-	}
-
-	resp, err := h.ml.CheckSanctions(ctx, mlReq)
+	})
+	cancel()
 	if err != nil {
-		// Fail closed for sanctions: an unscreenable entity is escalated.
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error":       "Sanctions screening unavailable",
-			"disposition": "manual_review",
-			"details":     err.Error(),
-		})
-		return
+		log.Printf("ML sanctions augmentation unavailable for %s (local list result stands): %v", req.EntityName, err)
+	} else {
+		mlAugmentation = "applied"
+		mlConfidence = resp.Confidence
+		for _, match := range resp.Matches {
+			matches = append(matches, &models.SanctionsMatch{
+				ListName:   "aml_ml_service_augmentation",
+				EntityName: req.EntityName,
+				Details:    match,
+				MatchScore: resp.Confidence,
+			})
+		}
 	}
 
-	matches := make([]*models.SanctionsMatch, 0, len(resp.Matches))
-	for _, match := range resp.Matches {
-		matches = append(matches, &models.SanctionsMatch{ListName: "aml_ml_service", EntityName: req.EntityName, Details: match, MatchScore: resp.Confidence})
-	}
+	isSanctioned := len(localMatches) > 0 || (err == nil && resp.IsSanctioned)
+
 	// Cache result
-	h.repo.CacheSanctionsCheck(req.EntityName, resp.IsSanctioned, matches)
+	h.repo.CacheSanctionsCheck(req.EntityName, isSanctioned, matches)
 
 	// Store in database
 	sanctionsCheck := &models.SanctionsCheck{
 		EntityName:   req.EntityName,
 		EntityType:   req.EntityType,
-		IsSanctioned: resp.IsSanctioned,
-		MatchCount:   len(resp.Matches),
-		Confidence:   int(resp.Confidence),
+		IsSanctioned: isSanctioned,
+		MatchCount:   len(matches),
+		Confidence:   int(mlConfidence),
 		CheckedAt:    time.Now(),
 	}
 	h.repo.StoreSanctionsCheck(sanctionsCheck)
 
 	c.JSON(http.StatusOK, gin.H{
-		"entity_name":   req.EntityName,
-		"is_sanctioned": resp.IsSanctioned,
-		"matches":       matches,
-		"confidence":    resp.Confidence,
-		"checked_at":    time.Now().Unix(),
+		"entity_name":      req.EntityName,
+		"is_sanctioned":    isSanctioned,
+		"matches":          matches,
+		"confidence":       mlConfidence,
+		"screening_source": "local_watchlist",
+		"ml_augmentation":  mlAugmentation,
+		"checked_at":       time.Now().Unix(),
 	})
 }
 

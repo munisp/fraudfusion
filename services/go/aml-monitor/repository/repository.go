@@ -105,6 +105,19 @@ func (r *AMLRepository) EnsureSchema(ctx context.Context) error {
 			discrepancies JSONB NOT NULL DEFAULT '[]',
 			verified_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
+		// STR filing SLA tracking (NFIU 72h deadline from detection).
+		`ALTER TABLE aml_sars ADD COLUMN IF NOT EXISTS filed_within_sla BOOLEAN`,
+		// CTR obligations (₦10M NGN currency transaction reports to the NFIU).
+		`CREATE TABLE IF NOT EXISTS aml_ctr_reports (
+			id BIGSERIAL PRIMARY KEY,
+			transaction_id TEXT NOT NULL UNIQUE,
+			user_id TEXT NOT NULL,
+			amount NUMERIC NOT NULL,
+			currency TEXT NOT NULL DEFAULT 'NGN',
+			threshold NUMERIC NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending_report',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`,
 	}
 	for _, stmt := range statements {
 		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
@@ -276,9 +289,9 @@ func (r *AMLRepository) GetSAR(sarID string) (*models.SAR, error) {
 	s := &models.SAR{}
 	var txnIDs []byte
 	err := r.db.QueryRowContext(ctx, `SELECT id, sar_id, user_id, filing_institution, activity_type, narrative,
-		transaction_ids, COALESCE(filing_date, created_at), status, reference_number, created_at, updated_at
+		transaction_ids, COALESCE(filing_date, created_at), status, reference_number, filed_within_sla, created_at, updated_at
 		FROM aml_sars WHERE sar_id=$1`, sarID).
-		Scan(&s.ID, &s.SARID, &s.UserID, &s.FilingInstitution, &s.ActivityType, &s.Narrative, &txnIDs, &s.FilingDate, &s.Status, &s.ReferenceNumber, &s.CreatedAt, &s.UpdatedAt)
+		Scan(&s.ID, &s.SARID, &s.UserID, &s.FilingInstitution, &s.ActivityType, &s.Narrative, &txnIDs, &s.FilingDate, &s.Status, &s.ReferenceNumber, &s.FiledWithinSLA, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +320,7 @@ func (r *AMLRepository) ListSARs(status string, limit, offset int) ([]*models.SA
 		}
 	}
 	query := `SELECT id, sar_id, user_id, filing_institution, activity_type, narrative,
-		transaction_ids, COALESCE(filing_date, created_at), status, reference_number, created_at, updated_at
+		transaction_ids, COALESCE(filing_date, created_at), status, reference_number, filed_within_sla, created_at, updated_at
 		FROM aml_sars`
 	args := []interface{}{}
 	if status != "" {
@@ -324,7 +337,7 @@ func (r *AMLRepository) ListSARs(status string, limit, offset int) ([]*models.SA
 	for rows.Next() {
 		s := &models.SAR{}
 		var txnIDs []byte
-		if err := rows.Scan(&s.ID, &s.SARID, &s.UserID, &s.FilingInstitution, &s.ActivityType, &s.Narrative, &txnIDs, &s.FilingDate, &s.Status, &s.ReferenceNumber, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.SARID, &s.UserID, &s.FilingInstitution, &s.ActivityType, &s.Narrative, &txnIDs, &s.FilingDate, &s.Status, &s.ReferenceNumber, &s.FiledWithinSLA, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		_ = json.Unmarshal(txnIDs, &s.TransactionIDs)
@@ -351,6 +364,62 @@ func (r *AMLRepository) UpdateSARStatus(sarID, status, referenceNumber string) e
 		if err == nil && affected == 0 {
 			return sql.ErrNoRows
 		}
+		return err
+	})
+}
+
+// UpdateSARFiling records the outcome of a regulator filing attempt,
+// including whether the filing met the 72h NFIU STR deadline from detection.
+func (r *AMLRepository) UpdateSARFiling(sarID, status, referenceNumber string, filedWithinSLA bool) error {
+	if err := r.requireDB(); err != nil {
+		return err
+	}
+	return withRetry(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		res, err := r.db.ExecContext(ctx, `UPDATE aml_sars SET status=$2, reference_number=$3,
+			filed_within_sla=$4,
+			filing_date=CASE WHEN $2='filed' THEN now() ELSE filing_date END, updated_at=now()
+			WHERE sar_id=$1`, sarID, status, referenceNumber, filedWithinSLA)
+		if err != nil {
+			return err
+		}
+		affected, err := res.RowsAffected()
+		if err == nil && affected == 0 {
+			return sql.ErrNoRows
+		}
+		return err
+	})
+}
+
+// CountOverdueUnfiledSARs counts SARs that are still unfiled past the STR
+// deadline — the breach alert metric for the compliance endpoint.
+func (r *AMLRepository) CountOverdueUnfiledSARs(sla time.Duration) (int, error) {
+	if err := r.requireDB(); err != nil {
+		return 0, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var count int
+	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM aml_sars
+		WHERE status NOT IN ('filed') AND created_at < now() - $1::interval`,
+		fmt.Sprintf("%d seconds", int(sla.Seconds()))).Scan(&count)
+	return count, err
+}
+
+// StoreCTRReport records a CTR obligation (idempotent per transaction).
+func (r *AMLRepository) StoreCTRReport(report *models.CTRReport) error {
+	if err := r.requireDB(); err != nil {
+		return err
+	}
+	return withRetry(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := r.db.ExecContext(ctx, `INSERT INTO aml_ctr_reports
+			(transaction_id, user_id, amount, currency, threshold, status)
+			VALUES ($1,$2,$3,$4,$5,$6)
+			ON CONFLICT (transaction_id) DO NOTHING`,
+			report.TransactionID, report.UserID, report.Amount, report.Currency, report.Threshold, report.Status)
 		return err
 	})
 }

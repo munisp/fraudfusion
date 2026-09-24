@@ -384,6 +384,16 @@ async def verify_device(payload: DeviceVerificationRequest, request: Request, _:
                 "INSERT INTO device_fingerprints (tenant_id,user_id,device_id,fingerprint,is_trusted,created_at) VALUES ($1,$2,$3,$4,FALSE,NOW())",
                 payload.tenant_id, payload.user_id, payload.device_id, payload.device_fingerprint,
             )
+        elif fingerprint_match and not existing["is_trusted"]:
+            # Successful re-verification of a known fingerprint proves continuity of
+            # possession: promote the device to trusted (previously is_trusted could
+            # never become TRUE, leaving every device permanently untrusted).
+            await connection.execute(
+                "UPDATE device_fingerprints SET is_trusted=TRUE WHERE tenant_id=$1 AND user_id=$2 AND device_id=$3",
+                payload.tenant_id, payload.user_id, payload.device_id,
+            )
+            trusted = True
+            await record_event(connection, payload.tenant_id, payload.user_id, "device_trusted", 0, ["device_promoted_to_trusted"])
         await record_event(connection, payload.tenant_id, payload.user_id, "device_verification", 0 if trusted else 30, ["trusted_device" if trusted else "unrecognized_device"])
     return {"user_id": payload.user_id, "device_verified": fingerprint_match, "is_trusted": trusted, "timestamp": datetime.now(timezone.utc).isoformat()}
 

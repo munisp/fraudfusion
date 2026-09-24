@@ -26,6 +26,40 @@ func TestMigrationFilesEmbeddedAndOrdered(t *testing.T) {
 	}
 }
 
+// TestServiceBaseTablesMigration covers the detector base tables that the
+// ALTER-only hardening migrations (20260820_*) depend on: the 20260827
+// migration must create every table the services query, idempotently.
+func TestServiceBaseTablesMigration(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("20260827_service_base_tables.sql")
+	if err != nil {
+		t.Fatalf("read base tables migration: %v", err)
+	}
+	contents := string(raw)
+	requiredTables := []string{
+		"ato_events", "ato_alerts", "login_patterns", "device_fingerprints",
+		"credential_stuffing_attempts", "sim_swap_events", "account_access_logs",
+		"sim_swap_alerts", "insider_fraud_events", "privileged_access_logs",
+		"unusual_activities", "data_exfiltration_attempts", "insider_fraud_alerts",
+		"crypto_transactions", "crypto_blacklist", "p2p_trades", "p2p_trading_alerts",
+		"advance_fee_messages", "investment_schemes", "sec_registered_entities",
+		"identity_theft_alerts",
+	}
+	for _, table := range requiredTables {
+		if !strings.Contains(contents, "CREATE TABLE IF NOT EXISTS "+table+" ") {
+			t.Fatalf("base tables migration missing idempotent CREATE TABLE for %s", table)
+		}
+	}
+	// sim-swap queries device_fingerprints.first_seen_at; the column must exist.
+	if !strings.Contains(contents, "first_seen_at TIMESTAMPTZ") {
+		t.Fatalf("device_fingerprints must include first_seen_at (queried by sim-swap detector)")
+	}
+	// sec_registered_entities must be seeded so the SEC check has real data.
+	if !strings.Contains(contents, "INSERT INTO sec_registered_entities") ||
+		!strings.Contains(contents, "ON CONFLICT (name) DO NOTHING") {
+		t.Fatalf("sec_registered_entities must be seeded idempotently")
+	}
+}
+
 // TestMigrationsParseSanity performs structural checks we can do without a
 // live Postgres: non-empty content, balanced dollar-quoting, and balanced
 // BEGIN/COMMIT when explicit transactions are used.
