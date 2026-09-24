@@ -14,6 +14,22 @@ Models real-world distributions rather than toy randoms:
     credit behaviour, chargeback bursts, PEP / sanctioned-entity contamination.
   * ~2% label noise.
 
+v2 additions (dataset_version=2):
+  * Agent float ledger: ~1.5% of accounts are agent-banking operators; agent
+    txns carry cash-in/cash-out direction, per-agent float balance cycles
+    (depletion -> rebalance reset), and agent fees.
+  * POS fee/charge patterns: 0.5% merchant charge capped at N2,000, N50
+    electronic-money-transfer levy on transfers >= N10,000, terminal/merchant
+    IDs.
+  * USSD session semantics: session IDs shared by rapid multi-step bursts,
+    session durations, step counts, failed-PIN sequences (elevated on fraud).
+  * Per-account salary-day crediting: salaried accounts receive a monthly
+    salary credit on their own salary_day + a 3-day post-salary spend uplift.
+  * Label lag: fraud labels are confirmed 7-30 days after the transaction
+    (label_available_at column); legit labels are immediate.
+  * Typology-weighted label noise (~2% overall, concentrated in pos/agent
+    channels where disputes are common).
+
 Deterministic seed. Outputs parquet + temporal train/val/test split.
 """
 from __future__ import annotations
@@ -27,6 +43,7 @@ import numpy as np
 import pandas as pd
 
 SEED = 20240517
+DATASET_VERSION = 2
 
 BANKS = [
     ("Access Bank", "044"), ("GTBank", "058"), ("Zenith Bank", "057"),
@@ -116,11 +133,15 @@ def generate_accounts(n: int, rng: np.random.Generator) -> pd.DataFrame:
             state=states[geo_idx[i]], city=cities[geo_idx[i]],
             age=age, employment=emp, monthly_income=round(income, 2),
             bureau_score=bureau,
-            salary_day=int(rng.integers(25, 31)) if emp == "salaried" else 0,
+            salary_day=int(rng.integers(25, 29)) if emp == "salaried" else 0,
             device_os=str(rng.choice(DEVICE_OS, p=[0.55, 0.18, 0.07, 0.10, 0.10])),
             is_pep=False, is_mule=False, is_sanctioned_front=False,
+            is_agent=False,
         ))
     df = pd.DataFrame(rows)
+    # Agent-banking operators (~1.5%), skewed to agent-heavy institutions
+    agent_idx = rng.choice(n, size=max(4, int(0.015 * n)), replace=False)
+    df.loc[agent_idx, "is_agent"] = True
     # PEP / sanctioned-entity contamination (~0.4%)
     pep_idx = rng.choice(n, size=max(2, n // 250), replace=False)
     df.loc[pep_idx, "is_pep"] = True
@@ -359,13 +380,209 @@ def inject_fraud(txns: pd.DataFrame, accts: pd.DataFrame,
     farm_pick = rng.choice(farm, size=int(0.004 * len(txns)), replace=False)
     txns.loc[farm_pick, "device_emulator"] = 1  # anomalous but unlabelled noise
 
-    # --- label noise ~2% ------------------------------------------------------
+    # --- label noise ~2% (typology/channel-weighted, still ~2% overall) ------
+    # Dispute-heavy channels (pos/agent) flip more often; confirmed mule
+    # fan-in rows are rarely un-labelled (they survive investigation).
+    w = np.ones(len(txns))
+    w *= np.where(txns["channel"].isin(["pos", "agent"]), 2.0, 1.0)
+    w *= np.where(txns["fraud_typology"] == "mule_fanin", 0.3, 1.0)
+    w = w / w.sum()
     n_flip = int(0.02 * len(txns))
-    flip = rng.choice(len(txns), size=n_flip, replace=False)
+    flip = rng.choice(len(txns), size=n_flip, replace=False, p=w)
     txns.loc[flip, "is_fraud"] = 1 - txns.loc[flip, "is_fraud"]
     txns.loc[flip[txns.loc[flip, "is_fraud"].values == 1], "fraud_typology"] = "noise"
 
     return txns.sort_values("ts").reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------
+# v2 channel semantics: agent float ledger, POS fees, USSD sessions,
+# salary-day crediting, label lag
+# --------------------------------------------------------------------------
+
+# ₦50 electronic money transfer levy applies to inflows >= ₦10,000
+EMT_LEVY_THRESHOLD = 10_000.0
+EMT_LEVY_NGN = 50.0
+# POS merchant service charge: 0.5% capped at ₦2,000
+POS_CHARGE_PCT = 0.005
+POS_CHARGE_CAP = 2_000.0
+
+
+def _agent_fee(amount: float) -> float:
+    """Typical agent-banking customer fee schedule."""
+    if amount <= 5_000:
+        return 50.0
+    if amount <= 50_000:
+        return 100.0
+    return float(min(round(amount * 0.002, 2), 500.0))
+
+
+def add_salary_credits(txns: pd.DataFrame, accts: pd.DataFrame,
+                       rng: np.random.Generator) -> pd.DataFrame:
+    """Per-account salary-day crediting + 3-day post-salary spend uplift.
+
+    Salaried accounts receive one salary credit per month on their own
+    salary_day (amount ~= monthly_income) from a small pool of employer
+    accounts, and their spending in the 0-3 days after salary day is uplifted.
+    """
+    txns = txns.sort_values("ts").reset_index(drop=True)
+    sal = accts[accts["salary_day"] > 0]
+    if len(sal) == 0:
+        txns["is_salary_credit"] = 0
+        return txns
+    employers = accts[accts["employment"] == "self_employed"]["customer_id"] \
+        .head(20).to_numpy()
+    if len(employers) == 0:
+        employers = accts["customer_id"].head(20).to_numpy()
+    t0, t1 = txns["ts"].min(), txns["ts"].max()
+    months = pd.period_range(t0.to_period("M"), t1.to_period("M"), freq="M")
+    cust = accts.set_index("customer_id")
+    new_rows = []
+    for cid, day, income in zip(sal["customer_id"], sal["salary_day"],
+                                sal["monthly_income"]):
+        for m in months:
+            ts = m.start_time + pd.Timedelta(days=int(day) - 1,
+                                             hours=int(rng.integers(8, 12)))
+            if ts < t0 or ts > t1:
+                continue
+            emp = str(rng.choice(employers))
+            new_rows.append(dict(
+                txn_id=f"SAL{rng.integers(1e8):08d}", ts=ts,
+                sender_id=emp, receiver_id=cid,
+                amount_ngn=float(_kobo_round(income * rng.uniform(0.97, 1.03))),
+                channel="nip", sender_bank=cust.loc[emp, "bank"],
+                receiver_bank=cust.loc[cid, "bank"],
+                sender_state=cust.loc[emp, "state"],
+                receiver_state=cust.loc[cid, "state"],
+                device_os="web_browser", hour=int(ts.hour), dow=int(ts.dayofweek),
+                is_month_end=int(25 <= ts.day <= 31),
+                is_market_day=int(ts.dayofweek in MARKET_DAYS),
+                is_fraud=0, fraud_typology="legit", device_emulator=0,
+                sim_swap_7d=0, new_device=0, is_salary_credit=1,
+            ))
+    txns["is_salary_credit"] = 0
+    if new_rows:
+        txns = pd.concat([txns, pd.DataFrame(new_rows)], ignore_index=True)
+    # post-salary spend uplift: senders transacting 0-3 days after their
+    # salary day spend more (per-account, replacing the global month-end proxy)
+    sal_day = accts.set_index("customer_id")["salary_day"]
+    sd = txns["sender_id"].map(sal_day).fillna(0).to_numpy()
+    dom = txns["ts"].dt.day.to_numpy()
+    since = (dom - sd) % 31
+    uplift = (sd > 0) & (since <= 3)
+    amt = txns["amount_ngn"].to_numpy(copy=True)
+    amt[uplift] = _kobo_round(amt[uplift] * rng.uniform(1.2, 1.8, uplift.sum()))
+    txns["amount_ngn"] = amt
+    return txns.sort_values("ts").reset_index(drop=True)
+
+
+def add_channel_semantics(txns: pd.DataFrame, accts: pd.DataFrame,
+                          rng: np.random.Generator) -> pd.DataFrame:
+    """POS fees + terminal/merchant IDs, agent float ledger, USSD sessions."""
+    txns = txns.sort_values("ts").reset_index(drop=True)
+    n = len(txns)
+    ch = txns["channel"].to_numpy()
+
+    # --- fees/charges ---------------------------------------------------------
+    fee = np.zeros(n)
+    amt = txns["amount_ngn"].to_numpy(dtype=float)
+    pos = ch == "pos"
+    fee[pos] = np.minimum(amt[pos] * POS_CHARGE_PCT, POS_CHARGE_CAP)
+    fee[amt >= EMT_LEVY_THRESHOLD] += EMT_LEVY_NGN
+    txns["fee_ngn"] = np.round(fee, 2)
+
+    # POS terminal / merchant identifiers (shared pools -> repeats are normal)
+    terminals = np.array([f"{rng.integers(1e7, 1e8):08d}" for _ in range(500)])
+    merchants = np.array([f"M{rng.integers(1e5, 1e6):06d}" for _ in range(800)])
+    txns["pos_terminal_id"] = ""
+    txns["merchant_id"] = ""
+    pidx = np.where(pos)[0]
+    txns.loc[pidx, "pos_terminal_id"] = terminals[rng.integers(0, len(terminals), len(pidx))]
+    txns.loc[pidx, "merchant_id"] = merchants[rng.integers(0, len(merchants), len(pidx))]
+
+    # --- agent float ledger ----------------------------------------------------
+    txns["agent_id"] = ""
+    txns["cash_direction"] = ""
+    txns["agent_float_after"] = np.nan
+    agents = accts.loc[accts["is_agent"], "customer_id"].to_numpy()
+    aidx = np.where(ch == "agent")[0]
+    if len(agents) and len(aidx):
+        assigned = agents[rng.integers(0, len(agents), len(aidx))]
+        direction = rng.choice(["cash_in", "cash_out"], size=len(aidx), p=[0.52, 0.48])
+        txns.loc[aidx, "agent_id"] = assigned
+        txns.loc[aidx, "cash_direction"] = direction
+        # agent fee replaces the POS charge schedule for agent txns
+        txns.loc[aidx, "fee_ngn"] = [
+            _agent_fee(a) + (EMT_LEVY_NGN if a >= EMT_LEVY_THRESHOLD else 0.0)
+            for a in amt[aidx]]
+        # per-agent float walk, in time order: cash-out fills the float,
+        # cash-in drains it; depleted float triggers a rebalance reset.
+        ledger = pd.DataFrame(dict(idx=aidx, agent=assigned,
+                                   direction=direction, amt=amt[aidx],
+                                   ts=txns["ts"].to_numpy()[aidx]))
+        ledger = ledger.sort_values("ts")
+        float_after = {}
+        target = {}
+        for row in ledger.itertuples():
+            if row.agent not in float_after:
+                target[row.agent] = float(_kobo_round(rng.uniform(500_000, 3_000_000)))
+                float_after[row.agent] = target[row.agent]
+            f = float_after[row.agent]
+            f = f + row.amt if row.direction == "cash_out" else f - row.amt
+            if f < 0.1 * target[row.agent]:  # rebalance: agent buys float
+                f = target[row.agent] * rng.uniform(0.7, 1.0)
+            float_after[row.agent] = f
+            txns.loc[row.idx, "agent_float_after"] = round(f, 2)
+
+    # --- USSD session semantics -------------------------------------------------
+    txns["ussd_session_id"] = ""
+    txns["session_duration_s"] = np.nan
+    txns["ussd_step_count"] = np.nan
+    txns["failed_pin_attempts"] = 0
+    uidx = np.where(ch == "ussd")[0]
+    if len(uidx):
+        sub = txns.loc[uidx, ["ts", "sender_id", "is_fraud"]].sort_values("ts")
+        sid, last = {}, {}
+        sess_ids, durations, steps, pins = [], [], [], []
+        for row in sub.itertuples():
+            key = row.sender_id
+            prev = last.get(key)
+            if prev is not None and (row.ts - prev[0]).total_seconds() <= 180:
+                # same short-TTL session burst: reuse session id, add steps
+                s_id = prev[1]
+                step = prev[2] + int(rng.integers(1, 3))
+                last[key] = (row.ts, s_id, step)
+            else:
+                s_id = f"{rng.integers(1e11, 1e12):012d}"
+                step = int(rng.integers(2, 6))
+                last[key] = (row.ts, s_id, step)
+            dur = float(np.clip(rng.lognormal(np.log(75), 0.5), 20, 600))
+            pin = 0
+            if rng.random() < (0.55 if row.is_fraud else 0.03):
+                pin = int(rng.integers(1, 4))  # failed-PIN sequence before success
+                dur *= 1 + 0.4 * pin  # retries extend the session
+            sess_ids.append(s_id)
+            durations.append(round(dur, 1))
+            steps.append(step)
+            pins.append(pin)
+        txns.loc[sub.index, "ussd_session_id"] = sess_ids
+        txns.loc[sub.index, "session_duration_s"] = durations
+        txns.loc[sub.index, "ussd_step_count"] = steps
+        txns.loc[sub.index, "failed_pin_attempts"] = pins
+    return txns.sort_values("ts").reset_index(drop=True)
+
+
+def add_label_lag(txns: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
+    """Label lag: fraud labels confirmed 7-30 days after the transaction.
+
+    Mirrors real investigation pipelines (chargeback windows, customer
+    disputes, analyst review). `label_available_at` is when the label became
+    usable for training; legit labels are available immediately.
+    """
+    lag = pd.to_timedelta(rng.integers(7, 31, len(txns)), unit="D")
+    txns["label_available_at"] = txns["ts"] + lag.where(
+        txns["is_fraud"] == 1, pd.Timedelta(0))
+    return txns
 
 
 # --------------------------------------------------------------------------
@@ -473,23 +690,31 @@ def generate_credit(accts: pd.DataFrame, rng: np.random.Generator) -> pd.DataFra
 # Graph for GNN (mule detection)
 # --------------------------------------------------------------------------
 
-def build_graph(txns: pd.DataFrame, accts: pd.DataFrame):
-    """Account->account directed multigraph collapsed to edges + node features."""
+def build_graph(txns: pd.DataFrame, accts: pd.DataFrame,
+                cutoff: pd.Timestamp | None = None):
+    """Account->account directed graph + node features.
+
+    `cutoff` restricts BOTH edges and node-feature aggregation to transactions
+    at or before that timestamp. Training/validation graphs must be built with
+    their split cutoff so node features never see future transactions
+    (temporal leakage); the test graph uses the full window.
+    """
     cid = accts["customer_id"].to_numpy()
     id2i = {c: i for i, c in enumerate(cid)}
-    src = txns["sender_id"].map(id2i).to_numpy()
-    dst = txns["receiver_id"].map(id2i).to_numpy()
+    t = txns if cutoff is None else txns[txns["ts"] <= cutoff]
+    src = t["sender_id"].map(id2i).to_numpy()
+    dst = t["receiver_id"].map(id2i).to_numpy()
     edge_index = np.stack([src, dst])
-    # node features from transaction behaviour
-    g = txns.groupby("sender_id")["amount_ngn"]
+    # node features from transaction behaviour (cutoff-masked)
+    g = t.groupby("sender_id")["amount_ngn"]
     out_amt = g.sum().reindex(cid, fill_value=0).to_numpy()
     out_cnt = g.count().reindex(cid, fill_value=0).to_numpy()
-    g2 = txns.groupby("receiver_id")["amount_ngn"]
+    g2 = t.groupby("receiver_id")["amount_ngn"]
     in_amt = g2.sum().reindex(cid, fill_value=0).to_numpy()
     in_cnt = g2.count().reindex(cid, fill_value=0).to_numpy()
-    uniq_in = txns.groupby("receiver_id")["sender_id"].nunique().reindex(
+    uniq_in = t.groupby("receiver_id")["sender_id"].nunique().reindex(
         cid, fill_value=0).to_numpy()
-    uniq_out = txns.groupby("sender_id")["receiver_id"].nunique().reindex(
+    uniq_out = t.groupby("sender_id")["receiver_id"].nunique().reindex(
         cid, fill_value=0).to_numpy()
     X = np.stack([
         np.log1p(in_amt), np.log1p(out_amt), np.log1p(in_cnt),
@@ -500,8 +725,14 @@ def build_graph(txns: pd.DataFrame, accts: pd.DataFrame):
         np.log1p(accts["monthly_income"].to_numpy()),
     ], axis=1).astype(np.float32)
     y = accts["is_mule"].astype(int).to_numpy()
-    # 2% label noise on node labels
     return X, edge_index.astype(np.int64), y
+
+
+NODE_FEATURE_NAMES = [
+    "log_in_amount", "log_out_amount", "log_in_count", "log_out_count",
+    "log_unique_senders", "log_unique_receivers", "bureau_score_scaled",
+    "age_scaled", "bank_code_scaled", "log_monthly_income",
+]
 
 
 # --------------------------------------------------------------------------
@@ -527,28 +758,53 @@ def main(out_dir: str = "ml/data/generated", n_customers: int = 4000,
     networks = _build_mule_networks(accts, rng, n_networks=10)
     txns = generate_transactions(accts, rng, n_txns=n_txns)
     txns = inject_fraud(txns, accts, networks, rng)
+    txns = add_salary_credits(txns, accts, rng)
+    txns = add_channel_semantics(txns, accts, rng)
+    txns = add_label_lag(txns, rng)
     txns = add_behavioral_features(txns)
     credit = generate_credit(accts, rng)
-    X, edge_index, y = build_graph(txns, accts)
 
     split = temporal_split(txns)
     txns["split"] = split
 
+    # Split-aware graphs (leakage fix): train/val graphs aggregate only
+    # transactions within their temporal window; test graph uses the full
+    # window (evaluation-time information).
+    t0, t1 = txns["ts"].min(), txns["ts"].max()
+    cut_train = t0 + (t1 - t0) * 0.7
+    cut_val = t0 + (t1 - t0) * 0.85
+    X_tr, ei_tr, y = build_graph(txns, accts, cutoff=cut_train)
+    X_va, ei_va, _ = build_graph(txns, accts, cutoff=cut_val)
+    X_te, ei_te, _ = build_graph(txns, accts)
+
     accts.to_parquet(out / "accounts.parquet", index=False)
     txns.to_parquet(out / "transactions.parquet", index=False)
     credit.to_parquet(out / "credit.parquet", index=False)
-    np.savez(out / "graph.npz", X=X, edge_index=edge_index, y=y,
+    np.savez(out / "graph.npz",
+             # backward-compatible keys point at the full-window (test) graph
+             X=X_te, edge_index=ei_te, y=y,
+             X_train=X_tr, edge_index_train=ei_tr,
+             X_val=X_va, edge_index_val=ei_va,
+             X_test=X_te, edge_index_test=ei_te,
+             cut_train_ts=str(cut_train), cut_val_ts=str(cut_val),
              train_mask=_node_mask(accts, txns, "train"),
              val_mask=_node_mask(accts, txns, "val"),
              test_mask=_node_mask(accts, txns, "test"))
     meta = dict(
-        seed=seed, n_customers=len(accts), n_txns=len(txns),
+        seed=seed, dataset_version=DATASET_VERSION,
+        n_customers=len(accts), n_txns=len(txns),
         fraud_rate=float(txns["is_fraud"].mean()),
         fraud_typologies=txns[txns["is_fraud"] == 1]["fraud_typology"]
         .value_counts().to_dict(),
         mule_accounts=int(accts["is_mule"].sum()),
         credit_default_rate=float(credit["default"].mean()),
         split_counts=pd.Series(split).value_counts().to_dict(),
+        n_agents=int(accts["is_agent"].sum()),
+        salary_credits=int(txns["is_salary_credit"].sum()),
+        agent_txns=int((txns["channel"] == "agent").sum()),
+        pos_txns=int((txns["channel"] == "pos").sum()),
+        ussd_txns=int((txns["channel"] == "ussd").sum()),
+        label_lag_days=[7, 30],
         provenance="synthetic",
     )
     (out / "meta.json").write_text(json.dumps(meta, indent=2))

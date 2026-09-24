@@ -120,8 +120,73 @@ def score_anomaly(payload: dict, version: str = "v1") -> dict:
             "anomaly_score": s}
 
 
+def score_gnn(payload: dict, version: str = "v2") -> dict:
+    """Score mule-account probability with MuleGNN.
+
+    Self-contained: the feature scaler ships in the artifact dir
+    (preprocess.npz) and is applied here — no manual normalisation step.
+    weights.pt loads without torch_geometric via load_state_dict_portable.
+
+    Payload options:
+      {"customer_index": int}  score that node of the generated graph
+                               (FRAUDFUSION_DATA/graph.npz, full-window/test
+                               snapshot, split-aware features)
+      {"features": [float]*10} score an isolated node from raw (unscaled)
+                               node features (NODE_FEATURE_NAMES order)
+    """
+    import os
+    import torch
+    from ml.models.gnn_mule import MuleGNN, load_state_dict_portable
+
+    d = ART / "gnn_mule" / version
+    p = np.load(d / "preprocess.npz")
+    mean, std = p["scaler_mean"], p["scaler_std"]
+    model = MuleGNN(int(mean.shape[0]), use_pyg=False)
+    load_state_dict_portable(model, d / "weights.pt")
+    model.eval()
+
+    if "features" in payload:
+        x = np.asarray(payload["features"], dtype=np.float32)
+        if x.shape != mean.shape:
+            raise ValueError(
+                f"expected {mean.shape[0]} raw node features "
+                "(NODE_FEATURE_NAMES order), got " + str(x.shape))
+        X = torch.from_numpy(((x - mean) / std).astype(np.float32)[None])
+        ei = torch.zeros((2, 0), dtype=torch.long)  # isolated node
+        with torch.no_grad():
+            prob = float(model.prob(X, ei)[0])
+        return {"model": "gnn_mule", "version": version,
+                "engine": "torch-pure-sage", "node": "payload",
+                "mule_probability": prob}
+
+    data_dir = Path(os.environ.get(
+        "FRAUDFUSION_DATA",
+        Path(__file__).resolve().parents[1] / "data" / "generated"))
+    g = np.load(data_dir / "graph.npz")
+    key = "X_test" if "X_test" in g else "X"
+    ei_key = "edge_index_test" if "edge_index_test" in g else "edge_index"
+    X = torch.from_numpy(((g[key] - mean) / std).astype(np.float32))
+    ei = torch.from_numpy(g[ei_key])
+    with torch.no_grad():
+        probs = model.prob(X, ei)
+    idx = int(payload.get("customer_index", -1))
+    if idx >= 0:
+        prob = float(probs[idx])
+        return {"model": "gnn_mule", "version": version,
+                "engine": "torch-pure-sage", "customer_index": idx,
+                "mule_probability": prob,
+                "is_mule_label": int(g["y"][idx]) if "y" in g else None}
+    te = torch.from_numpy(g["test_mask"]) if "test_mask" in g \
+        else torch.ones(len(probs), dtype=torch.bool)
+    top = torch.topk(probs[te], min(10, int(te.sum()))).indices
+    return {"model": "gnn_mule", "version": version,
+            "engine": "torch-pure-sage", "scored_nodes": int(te.sum()),
+            "top_mule_indices": top.tolist(),
+            "top_mule_probabilities": [round(float(probs[te][i]), 4) for i in top]}
+
+
 SCORERS = {"fraud_net": score_fraud, "credit_net": score_credit,
-           "autoencoder": score_anomaly}
+           "autoencoder": score_anomaly, "gnn_mule": score_gnn}
 
 
 def main():

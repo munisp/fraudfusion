@@ -1,0 +1,21 @@
+{
+  "eer": 0.06684999999999999,
+  "eer_threshold": 0.236,
+  "genuine_mean_sim": 0.5001980662345886,
+  "impostor_mean_sim": 0.010410294868052006,
+  "sim_gap": 0.489787757396698,
+  "tar_at_far_0.1": 0.9533,
+  "tar_at_far_0.01": 0.793,
+  "tar_at_far_0.001": 0.5886,
+  "epochs_trained": 21,
+  "seed": 42,
+  "objective": "normalized_softmax",
+  "proxy_scale": 16.0,
+  "margin": 1.2,
+  "in_dim": 128,
+  "embed_dim": 128,
+  "n_train_identities": 15000,
+  "n_eval_identities": 5000,
+  "eval_pairs": 20000,
+  "provenance": "synthetic"
+}

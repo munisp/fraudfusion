@@ -8,6 +8,20 @@ route:
   group_interval: 5m
   repeat_interval: 4h
   routes:
+    # Model/drift alerts (fraudfusion-model.rules.yml) route to the ML team.
+    - matchers:
+        - team="ml"
+        - severity="critical"
+      receiver: ml-oncall-critical
+      group_by: [alertname, category]
+      repeat_interval: 2h
+      continue: false
+    - matchers:
+        - team="ml"
+      receiver: ml-team
+      group_by: [alertname, category]
+      repeat_interval: 12h
+      continue: false
     - matchers:
         - severity="critical"
       receiver: platform-security-oncall
@@ -26,6 +40,16 @@ receivers:
   - name: platform-engineering-oncall
     webhook_configs:
       - url_file: /etc/alertmanager/secrets/engineering-oncall-webhook-url
+        send_resolved: true
+        max_alerts: 0
+  - name: ml-oncall-critical
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/ml-oncall-webhook-url
+        send_resolved: true
+        max_alerts: 0
+  - name: ml-team
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/ml-team-webhook-url
         send_resolved: true
         max_alerts: 0
 

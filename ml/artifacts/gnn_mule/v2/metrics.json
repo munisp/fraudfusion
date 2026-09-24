@@ -1,0 +1,17 @@
+{
+  "auc_pr": 1.0,
+  "auc_roc": 1.0,
+  "f1": 0.17582417582417584,
+  "base_rate": 0.013333333656191826,
+  "recall_at_fpr_0.01": 1.0,
+  "backend": "pure-torch SAGELayer",
+  "epochs_trained": 40,
+  "seed": 42,
+  "n_nodes": 4000,
+  "n_edges_train": 47543,
+  "n_edges_test": 68166,
+  "mule_prevalence": 0.013333333656191826,
+  "n_train_nodes": 2800,
+  "n_test_nodes": 600,
+  "leakage_fix": "split-aware graph snapshots (edges+features masked by split cutoff) + node-level label holdout 70/15/15 + scaler fit on train-window train nodes only"
+}

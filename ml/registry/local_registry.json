@@ -95,6 +95,136 @@
       "run_id": "local-1790225632386",
       "registered_at": "2026-09-24T04:53:52.386195+00:00",
       "backend": "local_file"
+    },
+    {
+      "model_name": "fraud_net",
+      "artifact_dir": "ml/artifacts/fraud_net/v3",
+      "params": {
+        "version": "v3",
+        "dataset_version": 2
+      },
+      "metrics": {
+        "auc_pr": 0.40061281593955456,
+        "auc_roc": 0.7741577408734223,
+        "f1": 0.477326968973747,
+        "base_rate": 0.029790114611387253,
+        "recall_at_fpr_0.01": 0.37337662337662336,
+        "val_auc_pr": 0.48477242840873636,
+        "temperature": 0.4338607329436905,
+        "epochs_trained": 19,
+        "seed": 42,
+        "backend": "torch",
+        "n_train": 47543,
+        "n_test": 10339
+      },
+      "tags": {},
+      "run_id": "local-1790252940624",
+      "registered_at": "2026-09-24T12:29:00.624511+00:00",
+      "backend": "local_file",
+      "stage": "Staging",
+      "promoted_at": "2026-09-24T12:29:00.690859+00:00"
+    },
+    {
+      "model_name": "identity_embedder",
+      "artifact_dir": "ml/artifacts/identity_embedder/v1",
+      "params": {
+        "version": "v1"
+      },
+      "metrics": {
+        "eer": 0.06684999999999999,
+        "eer_threshold": 0.236,
+        "genuine_mean_sim": 0.5001980662345886,
+        "impostor_mean_sim": 0.010410294868052006,
+        "sim_gap": 0.489787757396698,
+        "tar_at_far_0.1": 0.9533,
+        "tar_at_far_0.01": 0.793,
+        "tar_at_far_0.001": 0.5886,
+        "epochs_trained": 21,
+        "seed": 42,
+        "objective": "normalized_softmax",
+        "proxy_scale": 16.0,
+        "margin": 1.2,
+        "in_dim": 128,
+        "embed_dim": 128,
+        "n_train_identities": 15000,
+        "n_eval_identities": 5000,
+        "eval_pairs": 20000,
+        "provenance": "synthetic"
+      },
+      "tags": {},
+      "run_id": "local-1790252940809",
+      "registered_at": "2026-09-24T12:29:00.809088+00:00",
+      "backend": "local_file",
+      "stage": "Staging",
+      "promoted_at": "2026-09-24T12:29:00.858938+00:00"
+    },
+    {
+      "model_name": "gnn_mule",
+      "artifact_dir": "ml/artifacts/gnn_mule/v2",
+      "params": {
+        "version": "v2"
+      },
+      "metrics": {
+        "auc_pr": 1.0,
+        "auc_roc": 1.0,
+        "f1": 0.17582417582417584,
+        "base_rate": 0.013333333656191826,
+        "recall_at_fpr_0.01": 1.0,
+        "backend": "pure-torch SAGELayer",
+        "epochs_trained": 40,
+        "seed": 42,
+        "n_nodes": 4000,
+        "n_edges_train": 47543,
+        "n_edges_test": 68166,
+        "mule_prevalence": 0.013333333656191826,
+        "n_train_nodes": 2800,
+        "n_test_nodes": 600,
+        "leakage_fix": "split-aware graph snapshots (edges+features masked by split cutoff) + node-level label holdout 70/15/15 + scaler fit on train-window train nodes only"
+      },
+      "tags": {},
+      "run_id": "local-1790252940927",
+      "registered_at": "2026-09-24T12:29:00.927628+00:00",
+      "backend": "local_file",
+      "stage": "Production",
+      "promoted_at": "2026-09-24T12:29:00.975776+00:00"
+    }
+  ],
+  "aliases": {
+    "challenger": {
+      "model_name": "identity_embedder",
+      "version": "v1",
+      "set_at": "2026-09-24T12:29:00.858938+00:00"
+    },
+    "champion": {
+      "model_name": "gnn_mule",
+      "version": "v2",
+      "set_at": "2026-09-24T12:29:00.975776+00:00"
+    }
+  },
+  "promotions": [
+    {
+      "model_name": "fraud_net",
+      "version": "v3",
+      "stage": "Staging",
+      "alias": "challenger",
+      "at": "2026-09-24T12:29:00.690859+00:00",
+      "backend": "local_file"
+    },
+    {
+      "model_name": "identity_embedder",
+      "version": "v1",
+      "stage": "Staging",
+      "alias": "challenger",
+      "at": "2026-09-24T12:29:00.858938+00:00",
+      "backend": "local_file"
+    },
+    {
+      "model_name": "gnn_mule",
+      "version": "v2",
+      "stage": "Production",
+      "alias": "champion",
+      "at": "2026-09-24T12:29:00.975776+00:00",
+      "backend": "local_file"
     }
   ]
 }

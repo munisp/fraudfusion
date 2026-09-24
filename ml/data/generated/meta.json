@@ -1,23 +1,33 @@
 {
   "seed": 20240517,
+  "dataset_version": 2,
   "n_customers": 4000,
-  "n_txns": 61220,
-  "fraud_rate": 0.03992159425024502,
+  "n_txns": 68166,
+  "fraud_rate": 0.03399055247484083,
   "fraud_typologies": {
-    "noise": 1194,
-    "mule_fanin": 642,
-    "mule_layering": 200,
-    "sim_swap_ato": 137,
-    "chargeback_burst": 127,
-    "advance_fee_419": 84,
-    "pep_sanction_exposure": 60
+    "noise": 1211,
+    "mule_fanin": 527,
+    "sim_swap_ato": 160,
+    "mule_layering": 156,
+    "chargeback_burst": 118,
+    "advance_fee_419": 86,
+    "pep_sanction_exposure": 59
   },
-  "mule_accounts": 52,
-  "credit_default_rate": 0.3,
+  "mule_accounts": 54,
+  "credit_default_rate": 0.30275,
   "split_counts": {
-    "train": 42891,
-    "test": 9205,
-    "val": 9124
+    "train": 47543,
+    "test": 10339,
+    "val": 10284
   },
+  "n_agents": 60,
+  "salary_credits": 7110,
+  "agent_txns": 4843,
+  "pos_txns": 14643,
+  "ussd_txns": 9670,
+  "label_lag_days": [
+    7,
+    30
+  ],
   "provenance": "synthetic"
 }

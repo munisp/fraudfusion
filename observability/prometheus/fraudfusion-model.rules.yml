@@ -1,0 +1,82 @@
+# FraudFusion model-monitoring alert rules.
+#
+# Consumes the textfile-collector gauges emitted by:
+#   mlops/monitoring/drift.py        -> fraudfusion_drift_psi / fraudfusion_drift_ks /
+#                                       fraudfusion_drift_status (0=ok 1=warn 2=alert) /
+#                                       fraudfusion_drift_alerts_total
+#   mlops/monitoring/performance.py  -> fraudfusion_model_precision / fraudfusion_model_recall /
+#                                       fraudfusion_model_f1 / fraudfusion_model_degraded
+#   ml/train/continuous.py           -> fraudfusion_model_promotion /
+#                                       fraudfusion_model_challenger_auc_pr /
+#                                       fraudfusion_model_champion_auc_pr
+# Scrape path: node-exporter textfile collector (TEXTFILE_COLLECTOR_DIR) or an
+# equivalent pushgateway/exporter job must be configured for these series.
+groups:
+  - name: fraudfusion.model_monitoring
+    interval: 60s
+    rules:
+      - alert: FraudFusionModelDriftAlert
+        # drift.py exits alert when any feature breaches PSI/KS thresholds
+        expr: fraudfusion_drift_status > 1
+        for: 0m
+        labels:
+          severity: warning
+          service: fraudfusion-ml
+          team: ml
+          category: model-drift
+        annotations:
+          summary: "FraudFusion input drift threshold breached"
+          description: "One or more scored-transaction features breached the PSI/KS drift threshold vs the reference window (see fraudfusion_drift_psi / fraudfusion_drift_ks). Investigate upstream data quality before trusting model scores."
+          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-drift"
+
+      - alert: FraudFusionFeaturePSIDrift
+        expr: max(fraudfusion_drift_psi) > 0.25
+        for: 30m
+        labels:
+          severity: warning
+          service: fraudfusion-ml
+          team: ml
+          category: model-drift
+        annotations:
+          summary: "FraudFusion feature PSI above 0.25 for 30m"
+          description: "Sustained population stability index breach on at least one model feature. Review the per-feature fraudfusion_drift_psi series and consider retraining via mlops/cron/retrain.sh."
+          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-drift"
+
+      - alert: FraudFusionModelPerformanceDegraded
+        expr: fraudfusion_model_degraded == 1
+        for: 15m
+        labels:
+          severity: critical
+          service: fraudfusion-ml
+          team: ml
+          category: model-performance
+        annotations:
+          summary: "FraudFusion model performance below degradation threshold"
+          description: "Rolling precision/recall/F1 on confirmed labels breached degradation thresholds (fraudfusion_model_f1). Escalate to the ML oncall; consider champion rollback or expedited retraining."
+          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-degradation"
+
+      - alert: FraudFusionModelF1Low
+        expr: fraudfusion_model_f1 < 0.5
+        for: 1h
+        labels:
+          severity: warning
+          service: fraudfusion-ml
+          team: ml
+          category: model-performance
+        annotations:
+          summary: "FraudFusion rolling F1 below 0.5 for 1h"
+          description: "Sustained low F1 on labeled outcomes. Check label lag (fraud labels arrive 7-30 days late) before concluding true degradation."
+          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-degradation"
+
+      - alert: FraudFusionChallengerPromotion
+        expr: fraudfusion_model_promotion == 1
+        for: 0m
+        labels:
+          severity: info
+          service: fraudfusion-ml
+          team: ml
+          category: model-lifecycle
+        annotations:
+          summary: "FraudFusion challenger promoted over champion"
+          description: "The continuous-training gate promoted a challenger model version. Verify the model-router ConfigMap and registry alias (champion) were updated, and watch drift/performance alerts for regression."
+          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-promotion"

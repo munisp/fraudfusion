@@ -11,18 +11,25 @@ metadata:
   labels:
     app.kubernetes.io/name: model-router
 data:
+  # Champion and challenger are DISTINCT aml-ml-service Deployments pinned to
+  # different model versions (AML_MODEL_VERSION=v2 / v3), so arm selection
+  # actually changes the model served. The challenger Service/Deployment
+  # (aml-ml-service-v2) lives with the services lane; mirror
+  # deploy/kubernetes/aml-ml-service.yaml with name=aml-ml-service-v2 and
+  # AML_MODEL_VERSION=v3. Experiment config mirrors
+  # mlops/experiments/fraud-net-v3-vs-v2.yaml.
   experiments.yaml: |
-    experiment_id: fraud_net_v1_vs_v2
+    experiment_id: fraud_net_v2_vs_v3
     champion:
       name: champion
       model_name: fraud_net
-      model_version: v1
+      model_version: v2
       url: http://aml-ml-service.fraudfusion-services.svc.cluster.local:8100/v1/aml/score
     challenger:
       name: challenger
       model_name: fraud_net
-      model_version: v2
-      url: http://aml-ml-service.fraudfusion-services.svc.cluster.local:8100/v1/aml/score
+      model_version: v3
+      url: http://aml-ml-service-v2.fraudfusion-services.svc.cluster.local:8100/v1/aml/score
     challenger_traffic_pct: 10.0
 ---
 apiVersion: apps/v1

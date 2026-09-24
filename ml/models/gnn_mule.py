@@ -68,3 +68,39 @@ class MuleGNN(nn.Module):
 
 def backend_name() -> str:
     return "torch_geometric.SAGEConv" if HAS_PYG else "pure-torch SAGELayer"
+
+
+def remap_pyg_state_dict(sd: dict) -> dict:
+    """Convert a PyG SAGEConv state_dict to pure-torch SAGELayer keys.
+
+    PyG SAGEConv (mean aggr) computes lin_l(x) + lin_r(mean_neigh(x)) with the
+    bias on lin_l; SAGELayer computes lin_self(x) + lin_neigh(agg), biases on
+    both. The remap copies lin_l->lin_self, lin_r->lin_neigh (zero bias), so
+    CPU-only users can load weights.pt without installing torch_geometric.
+    """
+    out = {}
+    for k, v in sd.items():
+        if ".lin_l." in k:
+            out[k.replace(".lin_l.", ".lin_self.")] = v
+        elif ".lin_r." in k:
+            nk = k.replace(".lin_r.", ".lin_neigh.")
+            out[nk] = v
+            if nk.endswith(".weight"):
+                out[nk[: -len("weight")] + "bias"] = torch.zeros(v.size(0))
+        else:
+            out[k] = v
+    return out
+
+
+def load_state_dict_portable(model: "MuleGNN", path) -> "MuleGNN":
+    """Load weights.pt into `model`, transparently remapping PyG keys.
+
+    Works whether or not torch_geometric is installed: PyG-checkpoint keys
+    (conv*.lin_l/lin_r) are remapped onto the pure-torch SAGELayer modules.
+    """
+    sd = torch.load(path, weights_only=True, map_location="cpu")
+    try:
+        model.load_state_dict(sd)
+    except RuntimeError:
+        model.load_state_dict(remap_pyg_state_dict(sd))
+    return model

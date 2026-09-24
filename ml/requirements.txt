@@ -8,3 +8,8 @@ onnx>=1.16
 onnxruntime>=1.17
 mlflow>=2.12
 pytest>=8.0
+# Optional: Neo4j graph integration (ml/graph/*). Install on demand:
+# neo4j>=5.20
+# torch_geometric is optional for INFERENCE: gnn_mule weights.pt ships in the
+# pure-torch SAGELayer key format and PyG checkpoints auto-remap
+# (ml.models.gnn_mule.load_state_dict_portable).

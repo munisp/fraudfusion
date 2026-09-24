@@ -1,0 +1,20 @@
+# Champion/challenger experiment: fraud_net v3 (trained on dataset v2 with
+# agent-float / POS-fee / USSD-session realism) vs v2 (champion).
+# Consumed by mlops/serving/model_router.py; k8s override lives in
+# deploy/kubernetes/model-router.yaml (ConfigMap model-router-config).
+experiment_id: fraud_net_v2_vs_v3
+champion:
+  name: champion
+  model_name: fraud_net
+  model_version: v2
+  url: http://localhost:8100/v1/aml/score
+challenger:
+  name: challenger
+  model_name: fraud_net
+  model_version: v3
+  url: http://localhost:8101/v1/aml/score
+challenger_traffic_pct: 10.0
+# Analysis: mlops/experiments/analyze.py joins router score/outcome logs and
+# runs two-proportion z-tests on flag rate and fraud-capture recall. Promotion
+# gate: challenger recall >= champion recall AND flag-rate inflation < 20%
+# (see mlops/README.md runbook).

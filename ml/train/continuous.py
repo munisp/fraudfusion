@@ -130,7 +130,42 @@ def retrain_challenger(champion_dir: Path, new_df: pd.DataFrame,
         (dest / "vocab.json").write_text(json.dumps(vocab))
         np.savez(dest / "preprocess.npz", scaler_mean=mean, scaler_std=std)
         decision["promoted_path"] = str(dest)
+    _write_promotion_metrics(decision)
     return decision
+
+
+def _write_promotion_metrics(decision: dict) -> None:
+    """Prometheus textfile gauges for promotion decisions.
+
+    Consumed by observability/prometheus/fraudfusion-model.rules.yml
+    (FraudFusionChallengerPromotion alert). TEXTFILE_COLLECTOR_DIR is the
+    node-exporter textfile directory; silently skips if unset.
+    """
+    out_dir = os.environ.get("TEXTFILE_COLLECTOR_DIR")
+    if not out_dir:
+        return
+    try:
+        p = Path(out_dir) / "fraudfusion_model.prom"
+        lines = [
+            "# HELP fraudfusion_model_promotion 1 if the latest challenger was promoted",
+            "# TYPE fraudfusion_model_promotion gauge",
+            f'fraudfusion_model_promotion{{model="{decision["model"]}",'
+            f'challenger="{decision["challenger_version"]}"}} '
+            f'{1 if decision["promoted"] else 0}',
+            "# HELP fraudfusion_model_challenger_auc_pr latest challenger held-out AUC-PR",
+            "# TYPE fraudfusion_model_challenger_auc_pr gauge",
+            f'fraudfusion_model_challenger_auc_pr{{model="{decision["model"]}"}} '
+            f'{decision["challenger_metrics"]["auc_pr"]:.6f}',
+            "# HELP fraudfusion_model_champion_auc_pr champion held-out AUC-PR",
+            "# TYPE fraudfusion_model_champion_auc_pr gauge",
+            f'fraudfusion_model_champion_auc_pr{{model="{decision["model"]}"}} '
+            f'{decision["champion_metrics"]["auc_pr"]:.6f}',
+        ]
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text("\n".join(lines) + "\n")
+        tmp.rename(p)
+    except OSError as e:
+        print(f"promotion textfile export skipped: {e}")
 
 
 def main(threshold: int = 2000, epochs: int = 8, lr: float = 5e-4,
