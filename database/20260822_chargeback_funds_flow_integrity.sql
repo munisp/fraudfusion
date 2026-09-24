@@ -40,26 +40,47 @@ ALTER TABLE chargeback_transactions
     DROP CONSTRAINT IF EXISTS chargeback_transactions_currency_iso4217,
     ADD CONSTRAINT chargeback_transactions_currency_iso4217 CHECK (currency ~ '^[A-Z]{3}$');
 
--- The application uses the existing unique index for idempotency. Promote it to
--- a named constraint so PostgreSQL can enforce tenant-scoped dispute references.
+-- The application uses the unique index for idempotency. Ensure it exists
+-- (service boot normally creates it; a migration-only chain does not), then
+-- promote it to a named constraint so PostgreSQL can enforce tenant-scoped
+-- dispute references. Guarded on table+column presence for fresh-DB safety.
 DO $$
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'chargeback_transactions_tenant_transaction_key'
-    ) THEN
-        ALTER TABLE chargeback_transactions
-            ADD CONSTRAINT chargeback_transactions_tenant_transaction_key
-            UNIQUE USING INDEX chargeback_transactions_tenant_transaction_key;
+    IF to_regclass('chargeback_transactions') IS NOT NULL
+       AND EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='chargeback_transactions' AND column_name='tenant_id')
+       AND EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='chargeback_transactions' AND column_name='transaction_id')
+       AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chargeback_transactions_tenant_transaction_key')
+    THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'chargeback_transactions_tenant_transaction_key') THEN
+            EXECUTE 'CREATE UNIQUE INDEX chargeback_transactions_tenant_transaction_key
+                     ON chargeback_transactions (tenant_id, transaction_id)';
+        END IF;
+        EXECUTE 'ALTER TABLE chargeback_transactions
+                 ADD CONSTRAINT chargeback_transactions_tenant_transaction_key
+                 UNIQUE USING INDEX chargeback_transactions_tenant_transaction_key';
     END IF;
 END $$;
 
-ALTER TABLE dispute_records
-    DROP CONSTRAINT IF EXISTS dispute_records_transaction_tenant_fk,
-    ADD CONSTRAINT dispute_records_transaction_tenant_fk
-    FOREIGN KEY (tenant_id, transaction_id)
-    REFERENCES chargeback_transactions (tenant_id, transaction_id)
-    ON UPDATE RESTRICT
-    ON DELETE RESTRICT;
+-- FK depends on the tenant_transaction_key constraint above; skip gracefully
+-- if the constraint could not be created (fresh-DB ordering safety).
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chargeback_transactions_tenant_transaction_key')
+       AND to_regclass('dispute_records') IS NOT NULL
+       AND EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name='dispute_records' AND column_name='tenant_id')
+    THEN
+        EXECUTE 'ALTER TABLE dispute_records
+            DROP CONSTRAINT IF EXISTS dispute_records_transaction_tenant_fk,
+            ADD CONSTRAINT dispute_records_transaction_tenant_fk
+            FOREIGN KEY (tenant_id, transaction_id)
+            REFERENCES chargeback_transactions (tenant_id, transaction_id)
+            ON UPDATE RESTRICT
+            ON DELETE RESTRICT';
+    END IF;
+END $$;
 
 CREATE OR REPLACE FUNCTION prevent_chargeback_transaction_payload_mutation()
 RETURNS trigger

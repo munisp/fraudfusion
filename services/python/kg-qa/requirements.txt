@@ -1,0 +1,11 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.4
+httpx==0.28.1
+pandas>=2.2
+pyarrow>=15
+# Optional graph-server clients (service falls back to in-memory parquet
+# mode when neither is installed/reachable):
+# falkordb>=1.0    # official FalkorDB client
+# redis>=5         # fallback GRAPH.QUERY client for FalkorDB
+# neo4j>=5         # Bolt client for Neo4j

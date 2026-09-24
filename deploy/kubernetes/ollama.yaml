@@ -1,0 +1,136 @@
+# Ollama — local LLM runtime for the kg-qa analyst copilot (lane I2).
+#
+# kg-qa (services/python/kg-qa) uses ollama ONLY to rephrase grounded,
+# KG-cited template answers. When ollama is unreachable the service ships the
+# template answer unchanged (llm_used=false) — answers are never fabricated.
+#
+# IMPORTANT (honest capacity note):
+#   This manifest is CPU-only so it runs in dev/staging clusters without GPU
+#   nodes. llama3.2:3b on CPU is slow (single-digit tok/s per core) and is
+#   acceptable for analyst copilot latency but NOT for high-QPS production.
+#   For production, schedule on GPU nodes (nvidia.com/gpu limits + node
+#   selector) or front a larger quantized model behind a GPU-backed runtime.
+#
+# Model bootstrapping: the init container pulls OLLAMA_MODEL into the shared
+# model PVC on first start (requires egress to registry.ollama.ai — in
+# air-gapped clusters pre-load the PVC instead).
+#
+# Wiring:
+#   OLLAMA_URL=http://ollama.fraudfusion-services.svc.cluster.local:11434
+#   OLLAMA_MODEL=llama3.2:3b
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: ollama
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      # llama3.2:3b Q4_K_M is ~2GB; leave room for a second model.
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: ollama
+spec:
+  replicas: 1
+  # Recreate: the model PVC is ReadWriteOnce.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ollama
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ollama
+    spec:
+      initContainers:
+        - name: model-pull
+          image: ollama/ollama:0.5.7
+          command: ["/bin/sh", "-c"]
+          args:
+            # Start a throwaway server against the PVC, pull the model, stop.
+            - |
+              ollama serve & SERVER_PID=$!
+              for i in $(seq 1 30); do
+                ollama ls >/dev/null 2>&1 && break
+                sleep 1
+              done
+              ollama pull "$OLLAMA_MODEL"
+              kill $SERVER_PID
+          env:
+            - name: OLLAMA_MODEL
+              value: "llama3.2:3b"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      containers:
+        - name: ollama
+          image: ollama/ollama:0.5.7
+          ports:
+            - name: http
+              containerPort: 11434
+          env:
+            # CPU-only tuning: bound parallelism; a 3B model still wants
+            # ~4GB RAM headroom for context.
+            - name: OLLAMA_NUM_PARALLEL
+              value: "1"
+            - name: OLLAMA_KEEP_ALIVE
+              value: "10m"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: ollama
+spec:
+  selector:
+    app.kubernetes.io/name: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: http

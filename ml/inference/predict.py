@@ -185,8 +185,28 @@ def score_gnn(payload: dict, version: str = "v2") -> dict:
             "top_mule_probabilities": [round(float(probs[te][i]), 4) for i in top]}
 
 
+def score_fraud_calibrated(payload: dict, version: str = "v3",
+                           calibration_version: str = "v1") -> dict:
+    """Raw fraud_net score + Bayesian-calibrated probability with a 95%
+    credible interval from the shipped MCMC calibration posterior.
+    Fails loudly (FileNotFoundError) if the calibration artifact is missing —
+    run `python -m ml.bayesian.fraud_calibration` first."""
+    from ml.bayesian.fraud_calibration import BayesianCalibrator
+    raw = score_fraud(payload, version=version)
+    cal = BayesianCalibrator(ART / "bayesian_calibration" / calibration_version)
+    out = cal.calibrate_one(raw["fraud_probability"])
+    return {"model": "fraud_net+bayesian_calibration", "version": version,
+            "engine": raw["engine"],
+            "raw_score": out["raw_score"],
+            "calibrated_probability": out["calibrated_probability"],
+            "ci95": out["ci95"],
+            "posterior_version": out["posterior_version"],
+            "decision": raw["decision"]}
+
+
 SCORERS = {"fraud_net": score_fraud, "credit_net": score_credit,
-           "autoencoder": score_anomaly, "gnn_mule": score_gnn}
+           "autoencoder": score_anomaly, "gnn_mule": score_gnn,
+           "fraud_net_calibrated": score_fraud_calibrated}
 
 
 def main():

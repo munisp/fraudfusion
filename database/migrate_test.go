@@ -87,3 +87,43 @@ func TestMigrationsParseSanity(t *testing.T) {
 		}
 	}
 }
+
+// TestInsiderSoDMigration verifies the segregation-of-duties migration ships
+// idempotent DDL for every object the insider-fraud-detector service queries.
+func TestInsiderSoDMigration(t *testing.T) {
+	raw, err := migrationsFS.ReadFile("20260828_insider_sod.sql")
+	if err != nil {
+		t.Fatalf("read insider SoD migration: %v", err)
+	}
+	contents := string(raw)
+	for _, table := range []string{
+		"sod_matrix", "sod_assignments", "sod_violations",
+		"employee_vendor_overlap", "access_review_campaigns", "expense_claims",
+	} {
+		if !strings.Contains(contents, "CREATE TABLE IF NOT EXISTS "+table+" ") {
+			t.Fatalf("insider SoD migration missing idempotent CREATE TABLE for %s", table)
+		}
+	}
+	for _, fn := range []string{"sod_check_assignment", "sod_enforce_assignment", "vacation_compliance_pct"} {
+		if !strings.Contains(contents, "CREATE OR REPLACE FUNCTION "+fn) {
+			t.Fatalf("insider SoD migration missing function %s", fn)
+		}
+	}
+	if !strings.Contains(contents, "CREATE TRIGGER sod_assignments_enforce") {
+		t.Fatal("insider SoD migration must install the fail-closed assignment trigger")
+	}
+	// seeded incompatible-duty pairs the program document cites
+	for _, pair := range [][2]string{
+		{"approve_payment", "initiate_payment"},
+		{"approve_user", "create_user"},
+		{"delete_audit", "export_data"},
+		{"file_sar", "modify_watchlist"},
+	} {
+		if !strings.Contains(contents, "'"+pair[0]+"'") || !strings.Contains(contents, "'"+pair[1]+"'") {
+			t.Fatalf("sod_matrix seed missing pair %v", pair)
+		}
+	}
+	if !strings.Contains(contents, "ON CONFLICT DO NOTHING") {
+		t.Fatal("sod_matrix seed must be idempotent (ON CONFLICT DO NOTHING)")
+	}
+}

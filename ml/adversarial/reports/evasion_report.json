@@ -1,0 +1,469 @@
+{
+  "model": "fraud_net",
+  "version": "v3",
+  "n_samples": 4000,
+  "base_rate": 0.027499999850988388,
+  "epsilon_units": "L_inf in standardized (z-score) feature space",
+  "clean": {
+    "auc_pr": 0.432937970030772,
+    "auc_roc": 0.796001402196775,
+    "evasion@review": {
+      "threshold": 0.3,
+      "fraud_detected_clean": 39,
+      "evaded": 0,
+      "success_rate": 0.0
+    },
+    "evasion@block": {
+      "threshold": 0.8,
+      "fraud_detected_clean": 18,
+      "evaded": 0,
+      "success_rate": 0.0
+    }
+  },
+  "thresholds": {
+    "review": 0.3,
+    "block": 0.8
+  },
+  "attacks": [
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 0.0,
+      "pgd_steps": 1,
+      "auc_pr": 0.432937970030772,
+      "auc_roc": 0.796001402196775,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "mean_linf_z": 0.0,
+      "runtime_s": 0.01
+    },
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 0.1,
+      "pgd_steps": 1,
+      "auc_pr": 0.393096177636459,
+      "auc_roc": 0.7474316429072213,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 1,
+        "success_rate": 0.05555555555555555
+      },
+      "mean_linf_z": 0.10000001639127731,
+      "runtime_s": 0.03
+    },
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 0.25,
+      "pgd_steps": 1,
+      "auc_pr": 0.3404229028935713,
+      "auc_roc": 0.675494274363169,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 3,
+        "success_rate": 0.07692307692307693
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 1,
+        "success_rate": 0.05555555555555555
+      },
+      "mean_linf_z": 0.25,
+      "runtime_s": 0.02
+    },
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 0.5,
+      "pgd_steps": 1,
+      "auc_pr": 0.23449269627701508,
+      "auc_roc": 0.5633150268754382,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 9,
+        "success_rate": 0.23076923076923078
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 6,
+        "success_rate": 0.3333333333333333
+      },
+      "mean_linf_z": 0.5,
+      "runtime_s": 0.02
+    },
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 1.0,
+      "pgd_steps": 1,
+      "auc_pr": 0.08702434047317566,
+      "auc_roc": 0.38458985744332785,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 20,
+        "success_rate": 0.5128205128205128
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 11,
+        "success_rate": 0.6111111111111112
+      },
+      "mean_linf_z": 1.0,
+      "runtime_s": 0.02
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 0.0,
+      "pgd_steps": 20,
+      "auc_pr": 0.432937970030772,
+      "auc_roc": 0.796001402196775,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "mean_linf_z": 0.0,
+      "runtime_s": 0.01
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 0.1,
+      "pgd_steps": 20,
+      "auc_pr": 0.3929710461416118,
+      "auc_roc": 0.7470460387941108,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 1,
+        "success_rate": 0.05555555555555555
+      },
+      "mean_linf_z": 0.10000001639127731,
+      "runtime_s": 0.31
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 0.25,
+      "pgd_steps": 20,
+      "auc_pr": 0.33964935728095247,
+      "auc_roc": 0.6733676092544987,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 3,
+        "success_rate": 0.07692307692307693
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 1,
+        "success_rate": 0.05555555555555555
+      },
+      "mean_linf_z": 0.25,
+      "runtime_s": 0.3
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 0.5,
+      "pgd_steps": 20,
+      "auc_pr": 0.22887805237227124,
+      "auc_roc": 0.5541037625613461,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 9,
+        "success_rate": 0.23076923076923078
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 6,
+        "success_rate": 0.3333333333333333
+      },
+      "mean_linf_z": 0.5,
+      "runtime_s": 0.31
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 1.0,
+      "pgd_steps": 20,
+      "auc_pr": 0.08111787194867706,
+      "auc_roc": 0.339679831736387,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 20,
+        "success_rate": 0.5128205128205128
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 11,
+        "success_rate": 0.6111111111111112
+      },
+      "mean_linf_z": 1.0,
+      "runtime_s": 0.3
+    },
+    {
+      "engine": "art",
+      "attack": "fgsm",
+      "epsilon": 0.0,
+      "pgd_steps": 1,
+      "auc_pr": 0.432937970030772,
+      "auc_roc": 0.796001402196775,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "mean_linf_z": 0.0,
+      "runtime_s": 1.19
+    },
+    {
+      "engine": "art",
+      "attack": "fgsm",
+      "epsilon": 0.1,
+      "pgd_steps": 1,
+      "auc_pr": 0.4311759802339881,
+      "auc_roc": 0.7979995326010751,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 1,
+        "success_rate": 0.05555555555555555
+      },
+      "mean_linf_z": 0.10000001639127731,
+      "runtime_s": 0.07
+    },
+    {
+      "engine": "art",
+      "attack": "fgsm",
+      "epsilon": 0.25,
+      "pgd_steps": 1,
+      "auc_pr": 0.3670831243556434,
+      "auc_roc": 0.7969829399392381,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 4,
+        "success_rate": 0.10256410256410256
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 5,
+        "success_rate": 0.2777777777777778
+      },
+      "mean_linf_z": 0.25,
+      "runtime_s": 0.07
+    },
+    {
+      "engine": "art",
+      "attack": "fgsm",
+      "epsilon": 0.5,
+      "pgd_steps": 1,
+      "auc_pr": 0.2026585734810831,
+      "auc_roc": 0.7465342369712549,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 16,
+        "success_rate": 0.41025641025641024
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 10,
+        "success_rate": 0.5555555555555556
+      },
+      "mean_linf_z": 0.5,
+      "runtime_s": 0.07
+    },
+    {
+      "engine": "art",
+      "attack": "fgsm",
+      "epsilon": 1.0,
+      "pgd_steps": 1,
+      "auc_pr": 0.11662796348246837,
+      "auc_roc": 0.5588595466230427,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 30,
+        "success_rate": 0.7692307692307693
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 12,
+        "success_rate": 0.6666666666666666
+      },
+      "mean_linf_z": 1.0,
+      "runtime_s": 0.08
+    },
+    {
+      "engine": "art",
+      "attack": "pgd",
+      "epsilon": 0.0,
+      "pgd_steps": 20,
+      "auc_pr": 0.432937970030772,
+      "auc_roc": 0.796001402196775,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "mean_linf_z": 0.0,
+      "runtime_s": 0.72
+    },
+    {
+      "engine": "art",
+      "attack": "pgd",
+      "epsilon": 0.1,
+      "pgd_steps": 20,
+      "auc_pr": 0.4311245285820135,
+      "auc_roc": 0.7979504557139518,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 1,
+        "success_rate": 0.05555555555555555
+      },
+      "mean_linf_z": 0.10000001639127731,
+      "runtime_s": 0.61
+    },
+    {
+      "engine": "art",
+      "attack": "pgd",
+      "epsilon": 0.25,
+      "pgd_steps": 20,
+      "auc_pr": 0.36339371700413775,
+      "auc_roc": 0.7968076653423697,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 5,
+        "success_rate": 0.1282051282051282
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 5,
+        "success_rate": 0.2777777777777778
+      },
+      "mean_linf_z": 0.25,
+      "runtime_s": 0.59
+    },
+    {
+      "engine": "art",
+      "attack": "pgd",
+      "epsilon": 0.5,
+      "pgd_steps": 20,
+      "auc_pr": 0.1865409747738662,
+      "auc_roc": 0.738186492171068,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 18,
+        "success_rate": 0.46153846153846156
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 11,
+        "success_rate": 0.6111111111111112
+      },
+      "mean_linf_z": 0.5,
+      "runtime_s": 0.72
+    },
+    {
+      "engine": "art",
+      "attack": "pgd",
+      "epsilon": 1.0,
+      "pgd_steps": 20,
+      "auc_pr": 0.10937665658182558,
+      "auc_roc": 0.5016172002804393,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 31,
+        "success_rate": 0.7948717948717948
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 12,
+        "success_rate": 0.6666666666666666
+      },
+      "mean_linf_z": 1.0,
+      "runtime_s": 0.59
+    }
+  ]
+}

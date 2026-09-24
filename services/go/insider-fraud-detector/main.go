@@ -107,6 +107,15 @@ func main() {
 	api.GET("/alerts", application.getAlerts)
 	api.GET("/employee-risk-score/:employee_id", application.getEmployeeRiskScore)
 
+	// Insider-threat program endpoints (see docs/INSIDER_THREAT_PROGRAM.md).
+	insider := router.Group("/v1/insider")
+	insider.Use(application.authenticate())
+	insider.POST("/sod-check", application.sodCheck)
+	insider.POST("/collusion-graph", application.collusionGraph)
+	insider.POST("/ghost-vendor", application.ghostVendor)
+	insider.POST("/payroll-padding", application.payrollPadding)
+	insider.POST("/expense-abuse", application.expenseAbuse)
+
 	server := &http.Server{Addr: envOr("LISTEN_ADDR", ":8090"), Handler: router, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second}
 	log.Printf("%s listening on %s", serviceName, server.Addr)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -427,6 +436,7 @@ func (a *app) authenticate() gin.HandlerFunc {
 			return
 		}
 		c.Set("subject", subject)
+		c.Set("roles", a.keycloak.roleSet(claims))
 		c.Next()
 	}
 }
@@ -546,6 +556,31 @@ func (k *keycloakClient) introspectUncached(ctx context.Context, token string) (
 		return nil, fmt.Errorf("inactive token")
 	}
 	return claims, nil
+}
+
+// roleSet extracts every realm/client role from introspection claims for
+// per-endpoint role gates (hasAnyRole).
+func (k *keycloakClient) roleSet(claims map[string]interface{}) map[string]struct{} {
+	out := map[string]struct{}{}
+	read := func(value interface{}) {
+		if values, ok := value.([]interface{}); ok {
+			for _, item := range values {
+				if role, ok := item.(string); ok {
+					out[role] = struct{}{}
+				}
+			}
+		}
+		if values, ok := value.([]string); ok {
+			for _, role := range values {
+				out[role] = struct{}{}
+			}
+		}
+	}
+	read(claims["roles"])
+	if realm, ok := claims["realm_access"].(map[string]interface{}); ok {
+		read(realm["roles"])
+	}
+	return out
 }
 
 func (k *keycloakClient) authorized(claims map[string]interface{}) bool {

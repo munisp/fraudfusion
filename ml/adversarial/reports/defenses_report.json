@@ -1,0 +1,317 @@
+{
+  "model": "fraud_net",
+  "version": "v3",
+  "n_samples": 4000,
+  "base_rate": 0.027499999850988388,
+  "attack": "constrained PGD (steps=20), torch engine",
+  "epsilon_units": "L_inf in standardized (z-score) feature space",
+  "ensemble_weight": 0.5,
+  "smoothing": {
+    "sigma": 0.1,
+    "n": 25
+  },
+  "defenses": {
+    "none": {
+      "description": "undefended baseline (PGD, constrained)"
+    },
+    "clip_quantize": {
+      "description": "clamp +/-5 sigma, quantize to 0.05-sigma grid, snap binary flags"
+    },
+    "ensemble_rules": {
+      "description": "blend: 0.5*model + 0.5*rule_score (non-differentiable rules)"
+    },
+    "smoothing": {
+      "description": "mean prob over 25 N(0, 0.1) noise draws (smoothing-lite)"
+    }
+  },
+  "results": [
+    {
+      "defense": "none",
+      "epsilon": 0.0,
+      "auc_pr": 0.432937970030772,
+      "auc_roc": 0.796001402196775,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 0,
+        "success_rate": 0.0
+      }
+    },
+    {
+      "defense": "none",
+      "epsilon": 0.25,
+      "auc_pr": 0.339670013582028,
+      "auc_roc": 0.6731175508296331,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 3,
+        "success_rate": 0.07692307692307693
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 1,
+        "success_rate": 0.05555555555555555
+      }
+    },
+    {
+      "defense": "none",
+      "epsilon": 0.5,
+      "auc_pr": 0.22975449148110175,
+      "auc_roc": 0.5559312923580276,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 9,
+        "success_rate": 0.23076923076923078
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 6,
+        "success_rate": 0.3333333333333333
+      }
+    },
+    {
+      "defense": "none",
+      "epsilon": 1.0,
+      "auc_pr": 0.08126315245538315,
+      "auc_roc": 0.3387356859079224,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 20,
+        "success_rate": 0.5128205128205128
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 11,
+        "success_rate": 0.6111111111111112
+      }
+    },
+    {
+      "defense": "clip_quantize",
+      "epsilon": 0.0,
+      "auc_pr": 0.40518243304112417,
+      "auc_roc": 0.7901939705538679,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 36,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 11,
+        "evaded": 0,
+        "success_rate": 0.0
+      }
+    },
+    {
+      "defense": "clip_quantize",
+      "epsilon": 0.25,
+      "auc_pr": 0.28429642404671335,
+      "auc_roc": 0.6627670016358963,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 36,
+        "evaded": 5,
+        "success_rate": 0.1388888888888889
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 11,
+        "evaded": 1,
+        "success_rate": 0.09090909090909091
+      }
+    },
+    {
+      "defense": "clip_quantize",
+      "epsilon": 0.5,
+      "auc_pr": 0.14395328009979685,
+      "auc_roc": 0.5371418555737322,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 36,
+        "evaded": 13,
+        "success_rate": 0.3611111111111111
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 11,
+        "evaded": 6,
+        "success_rate": 0.5454545454545454
+      }
+    },
+    {
+      "defense": "clip_quantize",
+      "epsilon": 1.0,
+      "auc_pr": 0.019670566796926782,
+      "auc_roc": 0.29215938303341904,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 36,
+        "evaded": 25,
+        "success_rate": 0.6944444444444444
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 11,
+        "evaded": 10,
+        "success_rate": 0.9090909090909091
+      }
+    },
+    {
+      "defense": "ensemble_rules",
+      "epsilon": 0.0,
+      "auc_pr": 0.42568626480248173,
+      "auc_roc": 0.7929679831736387,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 37,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 4,
+        "evaded": 0,
+        "success_rate": 0.0
+      }
+    },
+    {
+      "defense": "ensemble_rules",
+      "epsilon": 0.25,
+      "auc_pr": 0.3461591762994114,
+      "auc_roc": 0.6706870764197242,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 37,
+        "evaded": 7,
+        "success_rate": 0.1891891891891892
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 4,
+        "evaded": 0,
+        "success_rate": 0.0
+      }
+    },
+    {
+      "defense": "ensemble_rules",
+      "epsilon": 0.5,
+      "auc_pr": 0.24774234992703817,
+      "auc_roc": 0.5536036457116149,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 37,
+        "evaded": 12,
+        "success_rate": 0.32432432432432434
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 4,
+        "evaded": 0,
+        "success_rate": 0.0
+      }
+    },
+    {
+      "defense": "ensemble_rules",
+      "epsilon": 1.0,
+      "auc_pr": 0.09136415425447493,
+      "auc_roc": 0.34835008179481186,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 37,
+        "evaded": 25,
+        "success_rate": 0.6756756756756757
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 4,
+        "evaded": 0,
+        "success_rate": 0.0
+      }
+    },
+    {
+      "defense": "smoothing",
+      "epsilon": 0.0,
+      "auc_pr": 0.43230989460762054,
+      "auc_roc": 0.7960878709978966,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 0,
+        "success_rate": 0.0
+      }
+    },
+    {
+      "defense": "smoothing",
+      "epsilon": 0.25,
+      "auc_pr": 0.34143159417915037,
+      "auc_roc": 0.6737462023837345,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 3,
+        "success_rate": 0.07692307692307693
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 1,
+        "success_rate": 0.05555555555555555
+      }
+    },
+    {
+      "defense": "smoothing",
+      "epsilon": 0.5,
+      "auc_pr": 0.23018978281381372,
+      "auc_roc": 0.5541388174807197,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 8,
+        "success_rate": 0.20512820512820512
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 6,
+        "success_rate": 0.3333333333333333
+      }
+    },
+    {
+      "defense": "smoothing",
+      "epsilon": 1.0,
+      "auc_pr": 0.08165629047932985,
+      "auc_roc": 0.3401425566721196,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 39,
+        "evaded": 20,
+        "success_rate": 0.5128205128205128
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 18,
+        "evaded": 11,
+        "success_rate": 0.6111111111111112
+      }
+    }
+  ]
+}

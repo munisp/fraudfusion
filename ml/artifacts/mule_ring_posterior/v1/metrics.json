@@ -1,0 +1,105 @@
+{
+  "model": "mule_ring_posterior",
+  "version": "v1",
+  "base_gnn": "gnn_mule/v2",
+  "n_accounts": 4000,
+  "n_mules": 54,
+  "auc_roc_gnn_only": 0.9997747367235457,
+  "auc_roc_posterior_mean": 0.9989910082408815,
+  "auc_pr_gnn_only": 0.9866921376262849,
+  "auc_pr_posterior_mean": 0.911908031480561,
+  "mean_ci95_width": 0.010933477411422853,
+  "mule_mean_ci95_width": 0.3808121971888761,
+  "posterior_mean": {
+    "b0": -8.25531087900709,
+    "w_gnn": 1.2709174536117136,
+    "w_fanin": 0.28401478144236536,
+    "w_incident_count": 0.32460523857539897,
+    "w_passthrough": 0.2881119794726875
+  },
+  "posterior_sd": {
+    "b0": 0.7015346432156626,
+    "w_gnn": 0.14079228147845385,
+    "w_fanin": 0.3457469175053195,
+    "w_incident_count": 0.364649829958863,
+    "w_passthrough": 0.27212209175227137
+  },
+  "rhat": [
+    1.0279573979348318,
+    1.007686797629948,
+    1.0191724107126978,
+    1.0171160081959723,
+    1.0007717906074152
+  ],
+  "ess": [
+    167.80152049878473,
+    406.9154086185116,
+    325.828819939751,
+    315.9401189473888,
+    1014.6245361798566
+  ],
+  "accept_rate": [
+    0.8693333333333333,
+    0.861,
+    0.8238333333333333,
+    0.8553333333333333
+  ],
+  "sampler": "nuts_lite",
+  "n_chains": 4,
+  "n_samples_per_chain": 3000,
+  "burn": 3000,
+  "seed": 42,
+  "uncertain_suspicious_examples": [
+    {
+      "node_index": 1661,
+      "is_mule_label": 1,
+      "gnn_score": 1.0,
+      "posterior_mean": 0.4413,
+      "ci95": [
+        0.0717,
+        0.8212
+      ]
+    },
+    {
+      "node_index": 3059,
+      "is_mule_label": 1,
+      "gnn_score": 0.9998,
+      "posterior_mean": 0.3511,
+      "ci95": [
+        0.0457,
+        0.7451
+      ]
+    },
+    {
+      "node_index": 2695,
+      "is_mule_label": 0,
+      "gnn_score": 0.9991,
+      "posterior_mean": 0.3208,
+      "ci95": [
+        0.0388,
+        0.7257
+      ]
+    },
+    {
+      "node_index": 778,
+      "is_mule_label": 0,
+      "gnn_score": 0.9939,
+      "posterior_mean": 0.3155,
+      "ci95": [
+        0.0375,
+        0.6899
+      ]
+    },
+    {
+      "node_index": 1607,
+      "is_mule_label": 0,
+      "gnn_score": 0.9998,
+      "posterior_mean": 0.3121,
+      "ci95": [
+        0.0837,
+        0.5777
+      ]
+    }
+  ],
+  "evaluation": "fit on full synthetic graph snapshot (labels are the synthetic ground truth; AUCs are in-sample)"
+}

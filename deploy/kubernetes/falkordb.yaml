@@ -1,0 +1,97 @@
+# FalkorDB — graph store for the FraudFusion knowledge graph (lane I2).
+#
+# Serves the kg-qa analyst-copilot service (services/python/kg-qa, :8300).
+# FalkorDB speaks the Redis protocol with GRAPH.* commands; the kg_load
+# loader (intelligence/kg_load/falkordb_load.py) MERGEs entities/relations
+# from the parquet KG store ($KG_DIR), and kg-qa queries it when FALKORDB_URL
+# is set (else it falls back to the in-memory parquet store).
+#
+# CPU-only is fine for FalkorDB itself. Persistence via AOF on a PVC.
+#
+# Wiring:
+#   FALKORDB_URL=redis://falkordb.fraudfusion-services.svc.cluster.local:6379
+#   FALKORDB_GRAPH=fraudfusion-kg
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: falkordb-data
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: falkordb
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: falkordb
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: falkordb
+spec:
+  replicas: 1
+  # Recreate: single-writer AOF volume cannot be attached to two pods.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: falkordb
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: falkordb
+    spec:
+      containers:
+        - name: falkordb
+          image: falkordb/falkordb:4.2.3
+          args:
+            - "--appendonly"
+            - "yes"
+            - "--save"
+            - "60"
+          ports:
+            - name: redis
+              containerPort: 6379
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: falkordb-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: falkordb
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: falkordb
+spec:
+  selector:
+    app.kubernetes.io/name: falkordb
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

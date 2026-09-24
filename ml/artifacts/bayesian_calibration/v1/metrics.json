@@ -1,0 +1,45 @@
+{
+  "model": "bayesian_calibration",
+  "version": "v1",
+  "base_model": "fraud_net/v3",
+  "n_val": 10284,
+  "val_base_rate": 0.03442240373395566,
+  "ece_before": 0.0026480965794454243,
+  "ece_after": 0.002418018419108996,
+  "brier_before": 0.021783073770020825,
+  "brier_after": 0.021642507749330728,
+  "nll_before": 0.1015457937879054,
+  "nll_after": 0.10128049075341215,
+  "posterior_mean_a": 1.096952321250235,
+  "posterior_mean_b": 0.3554975739522888,
+  "posterior_sd_a": 0.047953011415823414,
+  "posterior_sd_b": 0.154035097271356,
+  "ci95_a": [
+    1.0045788778811358,
+    1.1913878509505125
+  ],
+  "ci95_b": [
+    0.05670797139504235,
+    0.6616887472494015
+  ],
+  "rhat": [
+    1.0044237043811524,
+    1.0060926693274965
+  ],
+  "ess": [
+    883.211453166054,
+    687.6024375498149
+  ],
+  "accept_rate": [
+    0.899,
+    0.8896666666666667,
+    0.883,
+    0.901
+  ],
+  "sampler": "nuts_lite",
+  "n_chains": 4,
+  "n_samples_per_chain": 2000,
+  "burn": 1000,
+  "seed": 42,
+  "evaluation": "in-sample on the validation split used for fitting"
+}

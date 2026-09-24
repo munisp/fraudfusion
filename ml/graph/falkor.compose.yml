@@ -1,0 +1,27 @@
+# FalkorDB compose FRAGMENT (not wired into the repo's main compose files —
+# merge this service block into your local compose file to run a dev graph DB).
+#
+#   docker compose -f ml/graph/falkor.compose.yml up -d
+#   pip install redis
+#   python -m ml.graph.falkor_export
+#
+# FalkorDB speaks the Redis protocol (port 6379) and exposes openCypher via
+# GRAPH.QUERY — no Bolt driver needed. Default has NO AUTH: dev only; set
+# --requirepass via command args or run behind a private network in any
+# shared environment.
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    ports:
+      - "6379:6379"   # redis protocol / GRAPH.QUERY
+      - "3000:3000"   # FalkorDB browser UI
+    volumes:
+      - falkor-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  falkor-data:

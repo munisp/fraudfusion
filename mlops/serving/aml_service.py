@@ -60,6 +60,19 @@ MODEL_PATH = Path(os.getenv("AML_MODEL_PATH", "")) if os.getenv("AML_MODEL_PATH"
     ARTIFACT_DIR / "model.onnx",
 )
 
+
+def _default_calibration_dir() -> Path:
+    rel = Path("ml") / "artifacts" / "bayesian_calibration" / \
+        os.getenv("AML_CALIBRATION_VERSION", "v1")
+    repo_root = Path(__file__).resolve().parents[2]
+    for candidate in (repo_root / rel, Path.cwd() / rel, Path("/app") / rel):
+        if candidate.exists():
+            return candidate
+    return repo_root / rel
+
+
+CALIBRATION_DIR = Path(os.getenv("AML_CALIBRATION_DIR", str(_default_calibration_dir())))
+
 # ml lane contract (mirrors ml/data/synthetic_nigeria.py — do not import).
 NUMERIC_FEATURES = [
     "log_amount", "hour", "dow", "is_month_end", "is_market_day",
@@ -197,6 +210,70 @@ class FraudModel:
 
 
 # ---------------------------------------------------------------------------
+# Bayesian score calibration (ml lane artifact contract — read directly,
+# no code import across lanes):
+#   ml/artifacts/bayesian_calibration/<ver>/posterior.npz
+#     samples: (chains, n, 2) float64 — params (a, b)
+#     meta_json: JSON with version; parametrization logit(p)=a*logit(s)+b
+# ---------------------------------------------------------------------------
+class ScoreCalibrator:
+    """Posterior-mean logistic calibration with a 95% credible interval from
+    the shipped MCMC posterior samples. Loud fallback: if the artifact is
+    missing/unloadable, every response carries
+    ``calibration_mode: "uncalibrated_fallback"`` and a warning is logged —
+    never silent."""
+
+    def __init__(self) -> None:
+        self.samples: np.ndarray | None = None
+        self.calibration_mode = "uncalibrated_fallback"
+        self.posterior_version: str | None = None
+        self.load_error: str | None = None
+        self._try_load()
+
+    def _try_load(self) -> None:
+        path = CALIBRATION_DIR / "posterior.npz"
+        if not path.exists():
+            self.load_error = f"calibration artifact not found: {path}"
+            logger.warning(
+                "BAYESIAN CALIBRATION ARTIFACT MISSING at %s — /v1/aml/score_calibrated "
+                "will return UNCALIBRATED scores (calibration_mode=uncalibrated_fallback). "
+                "Fit via `python -m ml.bayesian.fraud_calibration`.",
+                path,
+            )
+            return
+        try:
+            z = np.load(path, allow_pickle=False)
+            samples = z["samples"].reshape(-1, z["samples"].shape[-1]).astype(np.float64)
+            if samples.shape[1] != 2:
+                raise ValueError(f"expected 2 calibration params, got {samples.shape[1]}")
+            meta = json.loads(str(z["meta_json"])) if "meta_json" in z else {}
+            self.samples = samples
+            self.posterior_version = f"bayesian_calibration/{meta.get('version', CALIBRATION_DIR.name)}"
+            self.calibration_mode = "bayesian"
+            logger.info("Loaded Bayesian calibration posterior from %s (%d draws, version %s)",
+                        path, len(samples), self.posterior_version)
+        except Exception as exc:  # noqa: BLE001 - never crash on load
+            self.load_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "BAYESIAN CALIBRATION FAILED TO LOAD (%s) — serving UNCALIBRATED scores.",
+                self.load_error,
+            )
+
+    def calibrate(self, raw_score: float) -> dict[str, Any]:
+        s = min(max(float(raw_score), 1e-6), 1 - 1e-6)
+        if self.samples is None:
+            return {"calibrated_probability": s, "ci95": [s, s],
+                    "calibration_mode": self.calibration_mode,
+                    "posterior_version": None}
+        z = math.log(s / (1 - s))
+        p = 1.0 / (1.0 + np.exp(-(self.samples[:, 0] * z + self.samples[:, 1])))
+        return {"calibrated_probability": float(p.mean()),
+                "ci95": [float(np.quantile(p, 0.025)), float(np.quantile(p, 0.975))],
+                "calibration_mode": self.calibration_mode,
+                "posterior_version": self.posterior_version}
+
+
+# ---------------------------------------------------------------------------
 # Rule-based fallback (transparent, deterministic)
 # ---------------------------------------------------------------------------
 def rule_based_score(features: dict[str, float]) -> float:
@@ -269,6 +346,17 @@ class AMLScoreResponse(BaseModel):
     detailed_scores: dict[str, float]
 
 
+class AMLCalibratedScoreResponse(BaseModel):
+    transaction_id: str
+    raw_score: float
+    calibrated_probability: float
+    ci95: list[float]
+    posterior_version: str | None
+    calibration_mode: str
+    model_mode: str
+    latency_ms: float
+
+
 def build_features(req: AMLScoreRequest) -> dict[str, float]:
     """Derive ml-contract numeric features from the transaction; caller
     overrides win (req.features)."""
@@ -297,6 +385,7 @@ def risk_band(score: float) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.model = FraudModel()
+    app.state.calibrator = ScoreCalibrator()
     app.state.requests_served = 0
     app.state.total_latency_ms = 0.0
     yield
@@ -326,6 +415,11 @@ async def health(request: Request) -> dict[str, Any]:
     }
     if model.load_error:
         payload["model_load_error"] = model.load_error
+    calibrator: ScoreCalibrator = request.app.state.calibrator
+    payload["calibration_mode"] = calibrator.calibration_mode
+    payload["calibration_posterior_version"] = calibrator.posterior_version
+    if calibrator.load_error:
+        payload["calibration_load_error"] = calibrator.load_error
     return payload
 
 
@@ -383,6 +477,39 @@ async def score(req: AMLScoreRequest, request: Request) -> AMLScoreResponse:
     )
 
 
+
+
+@app.post("/v1/aml/score_calibrated", response_model=AMLCalibratedScoreResponse)
+async def score_calibrated(req: AMLScoreRequest, request: Request) -> AMLCalibratedScoreResponse:
+    """Raw fraud_net score + Bayesian-calibrated probability with a 95%
+    credible interval from the shipped MCMC calibration posterior.
+
+    If the calibration artifact is missing, the response is LOUD:
+    calibration_mode="uncalibrated_fallback" and ci95 collapses onto the raw
+    score — callers must not treat that as calibration."""
+    start = time.perf_counter()
+    model: FraudModel = request.app.state.model
+    calibrator: ScoreCalibrator = request.app.state.calibrator
+    features = build_features(req)
+    raw = await asyncio.to_thread(model.predict_proba, features, req.categoricals)
+    cal = await asyncio.to_thread(calibrator.calibrate, raw)
+    latency_ms = (time.perf_counter() - start) * 1000
+    request.app.state.requests_served += 1
+    request.app.state.total_latency_ms += latency_ms
+    if PROMETHEUS:
+        REQUEST_COUNT.labels(model_mode=model.model_mode,
+                             risk_level=risk_band(cal["calibrated_probability"])).inc()
+        REQUEST_LATENCY.observe(latency_ms / 1000)
+    return AMLCalibratedScoreResponse(
+        transaction_id=req.transaction_id,
+        raw_score=round(raw, 6),
+        calibrated_probability=round(cal["calibrated_probability"], 6),
+        ci95=[round(cal["ci95"][0], 6), round(cal["ci95"][1], 6)],
+        posterior_version=cal["posterior_version"],
+        calibration_mode=cal["calibration_mode"],
+        model_mode=model.model_mode,
+        latency_ms=round(latency_ms, 3),
+    )
 
 
 class AMLBatchScoreRequest(BaseModel):

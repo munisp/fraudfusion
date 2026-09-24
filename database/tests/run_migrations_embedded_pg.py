@@ -29,28 +29,41 @@ def main() -> int:
 
     files = sorted(glob.glob(os.path.join(REPO, "database", "*.sql")))
     failures = []
+
+    def apply(f: str) -> str | None:
+        """Apply one SQL file via the psql binary with ON_ERROR_STOP.
+
+        NOTE: pgserver.psql() does NOT raise on SQL errors (it just prints
+        them), which can mask failures — always use psql -v ON_ERROR_STOP=1
+        and check the return code.
+        """
+        r = subprocess.run([psql, uri, "-v", "ON_ERROR_STOP=1", "-q", "-f", f],
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0 or "ERROR" in r.stderr:
+            return (r.stderr or r.stdout)[:300]
+        return None
+
     for f in files:
-        try:
-            srv.psql(open(f).read())
-            print("OK  ", os.path.basename(f))
-        except Exception as e:  # noqa: BLE001 - report any migration failure
+        err = apply(f)
+        if err:
             failures.append(os.path.basename(f))
-            print("FAIL", os.path.basename(f), "->", str(e)[:250])
+            print("FAIL", os.path.basename(f), "->", err)
+        else:
+            print("OK  ", os.path.basename(f))
     for f in files:  # second pass: idempotency
-        try:
-            srv.psql(open(f).read())
-        except Exception as e:  # noqa: BLE001
+        err = apply(f)
+        if err:
             failures.append(os.path.basename(f) + " (idempotency)")
-            print("IDEM-FAIL", os.path.basename(f), str(e)[:200])
+            print("IDEM-FAIL", os.path.basename(f), err)
     print(f"migrations: {len(files) - len(failures)}/{len(files)} applied, idempotent")
 
     for t in sorted(glob.glob(os.path.join(REPO, "database", "tests", "*verification*.sql"))):
-        try:
-            srv.psql(open(t).read())
-            print("PASS", os.path.basename(t))
-        except Exception as e:  # noqa: BLE001
+        err = apply(t)
+        if err:
             failures.append(os.path.basename(t))
-            print("FAIL", os.path.basename(t), "->", str(e)[:250])
+            print("FAIL", os.path.basename(t), "->", err)
+        else:
+            print("PASS", os.path.basename(t))
 
     # multi-tenant ledger stress: seed accounts, then run balanced journals
     env = dict(os.environ, PGOPTIONS="-c app.stress_tenants=3")
