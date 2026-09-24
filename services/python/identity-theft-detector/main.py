@@ -15,9 +15,11 @@ HARDENED: no fabricated verification results.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
+import time
 import os
 import re
 from contextlib import asynccontextmanager
@@ -53,6 +55,63 @@ def _required_env(name: str) -> str:
     return value
 
 
+# --- Introspection result cache (P3): token-hash TTL cache + singleflight ---
+_TOKEN_CACHE_TTL = float(os.getenv("AUTH_CACHE_TTL_SECONDS", "45"))
+_TOKEN_NEG_TTL = 5.0
+_TOKEN_CACHE_MAX = 10000
+_token_cache: dict = {}  # hash -> (expires_at, claims, exc)
+_token_inflight: dict = {}
+_token_cache_lock = asyncio.Lock()
+
+
+def _store_token_cache(key: str, entry) -> None:
+    if len(_token_cache) >= _TOKEN_CACHE_MAX:
+        now = time.monotonic()
+        for k in [k for k, v in _token_cache.items() if v[0] <= now]:
+            del _token_cache[k]
+        if len(_token_cache) >= _TOKEN_CACHE_MAX:
+            return  # correctness never depends on the cache
+    _token_cache[key] = entry
+
+
+async def _introspect_cached(client: httpx.AsyncClient, endpoint: str, token: str, data: dict) -> dict:
+    """Introspect via a bounded TTL cache keyed by token SHA-256 with
+    singleflight dedup; only a cold cache hits Keycloak."""
+    key = hashlib.sha256(token.encode()).hexdigest()
+    async with _token_cache_lock:
+        entry = _token_cache.get(key)
+        if entry and entry[0] > time.monotonic():
+            _, claims, exc = entry
+            if exc is not None:
+                raise exc
+            return claims
+        fut = _token_inflight.get(key)
+        leader = fut is None
+        if leader:
+            fut = asyncio.get_running_loop().create_future()
+            _token_inflight[key] = fut
+    if not leader:
+        claims, exc = await fut
+        if exc is not None:
+            raise exc
+        return claims
+    try:
+        response = await client.post(endpoint, data=data)
+        response.raise_for_status()
+        claims = response.json()
+        ttl = _TOKEN_CACHE_TTL if claims.get("active") is True else _TOKEN_NEG_TTL
+        _store_token_cache(key, (time.monotonic() + ttl, claims, None))
+        fut.set_result((claims, None))
+        return claims
+    except (httpx.HTTPError, ValueError) as exc:
+        _store_token_cache(key, (time.monotonic() + _TOKEN_NEG_TTL, None, exc))
+        fut.set_result((None, exc))
+        raise
+    finally:
+        async with _token_cache_lock:
+            _token_inflight.pop(key, None)
+
+
 async def authenticate(request: Request) -> dict[str, Any]:
     """Introspect the bearer token against Keycloak. Fails closed."""
     authorization = request.headers.get("authorization", "")
@@ -72,11 +131,12 @@ async def authenticate(request: Request) -> dict[str, Any]:
 
     endpoint = f"{keycloak_url}/realms/{realm}/protocol/openid-connect/token/introspect"
     try:
-        response = await request.app.state.http_client.post(
-            endpoint, data={"token": token, "client_id": client_id, "client_secret": client_secret}
+        claims = await _introspect_cached(
+            request.app.state.http_client,
+            endpoint,
+            token,
+            {"token": token, "client_id": client_id, "client_secret": client_secret},
         )
-        response.raise_for_status()
-        claims = response.json()
     except (httpx.HTTPError, ValueError) as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token validation unavailable") from exc
 
@@ -349,8 +409,9 @@ async def verify_document(request: DocumentVerificationRequest, http_request: Re
     # Real face matching: requires both feature vectors AND the model.
     if request.selfie_face_features and request.document_face_features:
         model = get_model(http_request)
-        probe = model.embed(request.selfie_face_features)
-        reference = model.embed(request.document_face_features)
+        # torch CPU inference holds the GIL — run it in a worker thread.
+        probe = await asyncio.to_thread(model.embed, request.selfie_face_features)
+        reference = await asyncio.to_thread(model.embed, request.document_face_features)
         if probe is None or reference is None:
             logger.warning("face_match requested but model unavailable — failing closed")
             raise HTTPException(
@@ -404,8 +465,8 @@ async def verify_biometric(request: BiometricVerificationRequest, http_request: 
         )
 
     model = get_model(http_request)
-    probe = model.embed(request.probe_features)
-    reference = model.embed(request.reference_features)
+    probe = await asyncio.to_thread(model.embed, request.probe_features)
+    reference = await asyncio.to_thread(model.embed, request.reference_features)
     if probe is None or reference is None:
         logger.warning("biometric requested but model unavailable — failing closed")
         raise HTTPException(

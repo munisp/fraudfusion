@@ -2,14 +2,21 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/munisp/fraudfusion/orchestrator/go/internal/apisix"
 	"github.com/munisp/fraudfusion/orchestrator/go/internal/dapr"
@@ -33,6 +40,11 @@ type Orchestrator struct {
 	apisix       *apisix.Client
 	tigerbeetle  *tigerbeetle.Client
 	lakehouseURL string
+	// apisixRoutes and tbAccounts memoize one-time provisioning work
+	// (APISIX route registration, TigerBeetle account creation) so it never
+	// repeats per journey execution.
+	apisixRoutes sync.Map
+	tbAccounts   sync.Map
 }
 
 // JourneyRequest represents a journey execution request
@@ -183,15 +195,85 @@ func NewOrchestrator(ctx context.Context) (*Orchestrator, error) {
 	}, nil
 }
 
-// ExecuteJourney executes a journey with the middleware integrations.
-// Event-bus publishes propagate errors; auxiliary integrations (APISIX route
-// registration, Dapr invocation, TigerBeetle ledger, cache writes) record
-// explicit warnings in the response instead of being silently dropped.
+// journeyResultTTL bounds how long a completed journey result is pollable and
+// reusable via the content-addressed cache.
+const journeyResultTTL = time.Hour
+
+// journeyCacheKey addresses cached results by the hash of the full request
+// payload so changed inputs never return stale results (previously the key
+// was only journey+user, which forced stale hits or cache bypasses).
+func journeyCacheKey(req *JourneyRequest) string {
+	canonical, _ := json.Marshal(struct {
+		JourneyID string                 `json:"journey_id"`
+		UserID    string                 `json:"user_id"`
+		TenantID  string                 `json:"tenant_id"`
+		Data      map[string]interface{} `json:"data"`
+	}{req.JourneyID, req.UserID, req.TenantID, req.Data})
+	sum := sha256.Sum256(canonical)
+	return "journey-result:" + hex.EncodeToString(sum[:])
+}
+
+// publishWithOutbox publishes to Kafka; when the publish exhausts its retries
+// the event is pushed to the Redis outbox list so a relayer can replay it,
+// and the error is still propagated to the caller.
+func (o *Orchestrator) publishWithOutbox(ctx context.Context, key string, events ...kafka.Event) error {
+	err := o.kafka.PublishEvents(ctx, key, events...)
+	if err == nil {
+		return nil
+	}
+	for _, event := range events {
+		if payload, marshalErr := json.Marshal(event); marshalErr == nil {
+			if pushErr := o.redis.PushOutbox(ctx, "kafka-outbox", payload); pushErr != nil {
+				log.Printf("kafka publish failed AND outbox fallback failed for event %s (%s): publish=%v outbox=%v", event.ID, event.Type, err, pushErr)
+			}
+		}
+	}
+	return err
+}
+
+// ensureJourneyRoute registers the APISIX route for a journey at most once
+// per process. Route registration is an etcd write — doing it per execution
+// put a consensus write on the request hot path.
+func (o *Orchestrator) ensureJourneyRoute(ctx context.Context, journeyID string) error {
+	if _, ok := o.apisixRoutes.Load(journeyID); ok {
+		return nil
+	}
+	route := apisix.Route{
+		ID:          fmt.Sprintf("route-journey-%s", journeyID),
+		URI:         fmt.Sprintf("/api/journey/%s/*", journeyID),
+		Methods:     []string{"GET"},
+		UpstreamURL: "http://journey-service:8080",
+	}
+	if err := o.apisix.CreateRoute(ctx, route); err != nil {
+		return err
+	}
+	o.apisixRoutes.Store(journeyID, struct{}{})
+	return nil
+}
+
+// ensureLedgerAccount creates the TigerBeetle settlement account at most once
+// per process instead of on every execution.
+func (o *Orchestrator) ensureLedgerAccount(ctx context.Context, accountID uint64) error {
+	if _, ok := o.tbAccounts.Load(accountID); ok {
+		return nil
+	}
+	if err := o.tigerbeetle.CreateAccount(ctx, accountID, 1, 100); err != nil {
+		return err
+	}
+	o.tbAccounts.Store(accountID, struct{}{})
+	return nil
+}
+
+// ExecuteJourney validates, authorizes, and starts a journey, then returns
+// immediately with a processing response. The workflow result is awaited in a
+// background goroutine (the request must not be pinned for minutes) and
+// stored in Redis for the poll endpoint GET /api/v1/journey/executions/{id}.
+// Event-bus publishes propagate errors after spooling to the Redis outbox;
+// auxiliary integrations (APISIX route registration, Dapr invocation,
+// TigerBeetle ledger, cache writes) record explicit warnings.
 func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) (*JourneyResponse, error) {
 	startTime := time.Now()
 	executionID := fmt.Sprintf("%s-%d", req.JourneyID, time.Now().UnixNano())
-
-	log.Printf("🎯 Executing Journey: %s (User: %s)", req.JourneyID, req.UserID)
 
 	response := &JourneyResponse{
 		Status:      "processing",
@@ -199,16 +281,18 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 		ExecutionID: executionID,
 		Data:        make(map[string]interface{}),
 	}
+	var warnMu sync.Mutex
 	warnings := []string{}
 	warn := func(format string, args ...interface{}) {
 		msg := fmt.Sprintf(format, args...)
 		log.Println("⚠️  " + msg)
+		warnMu.Lock()
 		warnings = append(warnings, msg)
+		warnMu.Unlock()
 	}
 
 	// Step 1: Keycloak authentication has already been validated by the HTTP handler.
-	// Step 2: Permify Authorization
-	log.Println("2️⃣  Checking authorization with Permify...")
+	// Step 2: Permify Authorization (cached ~10s per tenant/user/journey/action)
 	allowed, err := o.permify.CheckPermission(ctx, req.TenantID, req.UserID, req.JourneyID, "execute")
 	if err != nil || !allowed {
 		response.Status = "failed"
@@ -216,18 +300,16 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 		return response, fmt.Errorf("authorization failed: %w", err)
 	}
 
-	// Step 3: Redis Cache Check
-	log.Println("3️⃣  Checking Redis cache...")
-	cacheKey := fmt.Sprintf("journey:%s:%s", req.JourneyID, req.UserID)
+	// Step 3: Redis cache check, keyed by content hash so identical requests
+	// reuse the completed result.
+	cacheKey := journeyCacheKey(req)
 	var cachedResult JourneyResponse
 	if cacheErr := o.redis.GetJSON(ctx, cacheKey, &cachedResult); cacheErr == nil && cachedResult.Status == "completed" {
-		log.Println("✅ Cache hit! Returning cached result")
 		cachedResult.Duration = time.Since(startTime).String()
 		return &cachedResult, nil
 	}
 
-	// Step 4: Temporal Workflow
-	log.Println("4️⃣  Starting Temporal workflow...")
+	// Step 4: Temporal Workflow start (the only synchronous workflow call).
 	workflowID := fmt.Sprintf("workflow-%s", executionID)
 	workflowInput := temporal.WorkflowInput{
 		JourneyID: req.JourneyID,
@@ -242,120 +324,124 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 	}
 	response.Data["workflow_run_id"] = runID
 
-	// Step 5: Kafka Event Publishing — errors propagate; journeys must not
-	// continue silently when the audit event bus is down.
-	log.Println("5️⃣  Publishing event to Kafka...")
-	event := kafka.Event{
-		ID:   executionID,
-		Type: "journey.started",
-		Data: map[string]interface{}{
-			"journey_id": req.JourneyID,
-			"user_id":    req.UserID,
-		},
-	}
-	if err := o.kafka.PublishEvent(ctx, req.UserID, event); err != nil {
+	// Steps 5+6: lifecycle events published in ONE batched write. Errors
+	// propagate (after outbox spooling): journeys must not continue silently
+	// when the audit event bus is down.
+	if err := o.publishWithOutbox(ctx, req.UserID,
+		kafka.Event{ID: executionID, Type: "journey.started", Data: map[string]interface{}{"journey_id": req.JourneyID, "user_id": req.UserID}},
+		kafka.Event{ID: executionID, Type: "journey.processing", Data: req.Data},
+	); err != nil {
 		response.Status = "failed"
 		response.Error = fmt.Sprintf("Event publish failed: %v", err)
 		return response, err
 	}
 
-	// Step 6: Real-time processing event — now on Kafka (Fluvio removed).
-	log.Println("6️⃣  Streaming processing event to Kafka...")
-	processingEvent := kafka.Event{
-		ID:   executionID,
-		Type: "journey.processing",
-		Data: req.Data,
-	}
-	if err := o.kafka.PublishEvent(ctx, req.UserID, processingEvent); err != nil {
-		response.Status = "failed"
-		response.Error = fmt.Sprintf("Event publish failed: %v", err)
-		return response, err
-	}
-
-	// Step 7: Dapr Service Invocation (best-effort enrichment, explicit warning)
-	log.Println("7️⃣  Invoking services via Dapr...")
-	kycData := map[string]interface{}{"bvn": req.Data["bvn"], "user_id": req.UserID}
-	if kycResult, err := o.dapr.InvokeService(ctx, "kyc-service", "verify", kycData); err != nil {
-		warn("Dapr kyc-service invocation failed: %v", err)
-	} else {
-		response.Data["kyc_result"] = kycResult.Data
-	}
-
-	// Step 8: APISIX Route Registration (best-effort, explicit warning)
-	log.Println("8️⃣  Registering route in APISIX...")
-	route := apisix.Route{
-		ID:          fmt.Sprintf("route-%s", executionID),
-		URI:         fmt.Sprintf("/api/journey/%s", executionID),
-		Methods:     []string{"GET"},
-		UpstreamURL: "http://journey-service:8080",
-	}
-	if err := o.apisix.CreateRoute(ctx, route); err != nil {
-		warn("APISIX route registration failed: %v", err)
-	}
-
-	// Step 9: TigerBeetle Ledger Entry (explicit warning on failure; in the
-	// default build the client is a stub that returns ErrUnavailable — build
-	// with `-tags tigerbeetle` to enable the native client).
-	log.Println("9️⃣  Creating ledger entry in TigerBeetle...")
-	accountID := uint64(12345)
-	if err := o.tigerbeetle.CreateAccount(ctx, accountID, 1, 100); err != nil {
-		warn("TigerBeetle account creation failed: %v", err)
-	}
-	if amount, ok := req.Data["amount"].(float64); ok && amount > 0 {
-		transferID, err := tigerbeetle.NewTransferID()
+	// Steps 7-9 run concurrently: Dapr enrichment, APISIX route ensure, and
+	// the TigerBeetle ledger entry are independent of each other.
+	var kycResultData interface{}
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		kycData := map[string]interface{}{"bvn": req.Data["bvn"], "user_id": req.UserID}
+		kycResult, err := o.dapr.InvokeService(gctx, "kyc-service", "verify", kycData)
 		if err != nil {
-			warn("TigerBeetle transfer ID generation failed: %v", err)
-		} else if err := o.tigerbeetle.CreateTransfer(ctx, transferID, accountID, accountID+1, uint64(amount), 1, 200); err != nil {
-			warn("TigerBeetle transfer failed: %v", err)
+			warn("Dapr kyc-service invocation failed: %v", err)
+			return nil // best-effort enrichment
+		}
+		kycResultData = kycResult.Data
+		return nil
+	})
+	g.Go(func() error {
+		if err := o.ensureJourneyRoute(gctx, req.JourneyID); err != nil {
+			warn("APISIX route registration failed: %v", err)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		// In the default build the TigerBeetle client is a stub that returns
+		// ErrUnavailable — build with `-tags tigerbeetle` for the native client.
+		accountID := uint64(12345)
+		if err := o.ensureLedgerAccount(gctx, accountID); err != nil {
+			warn("TigerBeetle account creation failed: %v", err)
+		}
+		if amount, ok := req.Data["amount"].(float64); ok && amount > 0 {
+			transferID, err := tigerbeetle.NewTransferID()
+			if err != nil {
+				warn("TigerBeetle transfer ID generation failed: %v", err)
+			} else if err := o.tigerbeetle.CreateTransfer(gctx, transferID, accountID, accountID+1, uint64(amount), 1, 200); err != nil {
+				warn("TigerBeetle transfer failed: %v", err)
+			}
+		}
+		return nil
+	})
+	_ = g.Wait()
+	if kycResultData != nil {
+		response.Data["kyc_result"] = kycResultData
+	}
+
+	// Step 10: await the workflow result in the background with its own
+	// bounded context, then store the result for the poll endpoint and the
+	// content cache, and publish the completion event.
+	go o.awaitJourneyResult(req, cacheKey, executionID, workflowID, runID)
+
+	warnMu.Lock()
+	if len(warnings) > 0 {
+		response.Data["warnings"] = warnings
+	}
+	warnMu.Unlock()
+	response.Duration = time.Since(startTime).String()
+
+	return response, nil
+}
+
+// awaitJourneyResult completes the asynchronous half of journey execution.
+// Failures are recorded in the result store so pollers see a terminal state
+// instead of polling forever.
+func (o *Orchestrator) awaitJourneyResult(req *JourneyRequest, cacheKey, executionID, workflowID, runID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	result := &JourneyResponse{
+		Status:      "processing",
+		JourneyID:   req.JourneyID,
+		ExecutionID: executionID,
+		Data:        make(map[string]interface{}),
+	}
+
+	workflowResult, err := o.temporal.GetWorkflowResult(ctx, workflowID, runID)
+	if err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("Workflow execution failed: %v", err)
+	} else {
+		result.Status = workflowResult.Status
+		result.Decision = workflowResult.Decision
+		result.RiskScore = workflowResult.RiskScore
+		result.Data["workflow_result"] = workflowResult.Data
+	}
+
+	storeCtx, storeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer storeCancel()
+	if err := o.redis.SetJSON(storeCtx, "journey-exec:"+executionID, result, journeyResultTTL); err != nil {
+		log.Printf("⚠️  journey result store failed for %s: %v", executionID, err)
+	}
+	if result.Status == "completed" {
+		if err := o.redis.SetJSON(storeCtx, cacheKey, result, journeyResultTTL); err != nil {
+			log.Printf("⚠️  journey content cache write failed for %s: %v", executionID, err)
 		}
 	}
 
-	// Step 10: Get Temporal Workflow Result
-	log.Println("🔟 Getting workflow result from Temporal...")
-	workflowResult, err := o.temporal.GetWorkflowResult(ctx, workflowID, runID)
-	if err != nil {
-		response.Status = "failed"
-		response.Error = fmt.Sprintf("Workflow execution failed: %v", err)
-		return response, err
-	}
-
-	// Update response with workflow result
-	response.Status = workflowResult.Status
-	response.Decision = workflowResult.Decision
-	response.RiskScore = workflowResult.RiskScore
-	response.Data["workflow_result"] = workflowResult.Data
-
-	// Cache the result (explicitly logged on failure, non-fatal)
-	log.Println("💾 Caching result in Redis...")
-	if err := o.redis.SetJSON(ctx, cacheKey, response, 1*time.Hour); err != nil {
-		warn("Redis cache write failed: %v", err)
-	}
-
-	// Publish completion event — errors propagate.
-	log.Println("📢 Publishing completion event to Kafka...")
 	completionEvent := kafka.Event{
 		ID:   executionID,
 		Type: "journey.completed",
 		Data: map[string]interface{}{
 			"journey_id": req.JourneyID,
 			"user_id":    req.UserID,
-			"decision":   response.Decision,
-			"risk_score": response.RiskScore,
+			"decision":   result.Decision,
+			"risk_score": result.RiskScore,
 		},
 	}
-	if err := o.kafka.PublishEvent(ctx, req.UserID, completionEvent); err != nil {
-		response.Status = "failed"
-		response.Error = fmt.Sprintf("Completion event publish failed: %v", err)
-		return response, err
+	if err := o.publishWithOutbox(storeCtx, req.UserID, completionEvent); err != nil {
+		log.Printf("⚠️  completion event publish failed for %s (spooled to outbox): %v", executionID, err)
 	}
-
-	if len(warnings) > 0 {
-		response.Data["warnings"] = warnings
-	}
-	response.Duration = time.Since(startTime).String()
-	log.Printf("✅ Journey completed in %s (Decision: %s, Risk: %.2f)", response.Duration, response.Decision, response.RiskScore)
-
-	return response, nil
 }
 
 // Close closes all middleware clients
@@ -372,6 +458,28 @@ func (o *Orchestrator) Close() {
 	log.Println("✅ All connections closed")
 }
 
+// authenticate validates the bearer token (cached introspection) and returns
+// the token subject.
+func (o *Orchestrator) authenticate(w http.ResponseWriter, r *http.Request) (string, bool) {
+	authorization := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authorization, "Bearer ") {
+		http.Error(w, "authorization bearer token is required", http.StatusUnauthorized)
+		return "", false
+	}
+	claims, err := o.keycloak.ValidateToken(r.Context(), strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer ")))
+	if err != nil {
+		log.Printf("journey authorization failed: %v", err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return "", false
+	}
+	subject, ok := claims["sub"].(string)
+	if !ok || subject == "" {
+		http.Error(w, "token subject is required", http.StatusUnauthorized)
+		return "", false
+	}
+	return subject, true
+}
+
 // HTTP Handlers
 func (o *Orchestrator) handleExecuteJourney(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -379,20 +487,8 @@ func (o *Orchestrator) handleExecuteJourney(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	authorization := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authorization, "Bearer ") {
-		http.Error(w, "authorization bearer token is required", http.StatusUnauthorized)
-		return
-	}
-	claims, err := o.keycloak.ValidateToken(r.Context(), strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer ")))
-	if err != nil {
-		log.Printf("journey authorization failed: %v", err)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	subject, ok := claims["sub"].(string)
-	if !ok || subject == "" {
-		http.Error(w, "token subject is required", http.StatusUnauthorized)
+	subject, ok := o.authenticate(w, r)
+	if !ok {
 		return
 	}
 
@@ -413,15 +509,58 @@ func (o *Orchestrator) handleExecuteJourney(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	response, err := o.ExecuteJourney(r.Context(), &req)
-	if err != nil {
+	// Bound the accept path: authz + cache check + workflow start + batched
+	// publish + side integrations must answer well inside the budget.
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	response, err := o.ExecuteJourney(ctx, &req)
+	w.Header().Set("Content-Type", "application/json")
+	switch {
+	case err != nil:
 		w.WriteHeader(http.StatusInternalServerError)
+	case response.Status == "completed":
+		// Content-cache hit: the result is already final.
+		w.WriteHeader(http.StatusOK)
+	default:
+		// Journey accepted; poll GET /api/v1/journey/executions/{id}.
+		w.Header().Set("Location", "/api/v1/journey/executions/"+response.ExecutionID)
+		w.WriteHeader(http.StatusAccepted)
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+// handleGetJourneyExecution is the polling endpoint backing the 202 response
+// of handleExecuteJourney.
+func (o *Orchestrator) handleGetJourneyExecution(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, ok := o.authenticate(w, r); !ok {
+		return
+	}
+	executionID := strings.TrimPrefix(r.URL.Path, "/api/v1/journey/executions/")
+	if executionID == "" || strings.Contains(executionID, "/") {
+		http.Error(w, "execution ID is required", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	var result JourneyResponse
+	if err := o.redis.GetJSON(ctx, "journey-exec:"+executionID, &result); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]string{"status": "processing", "execution_id": executionID})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if result.Status == "processing" {
+		w.WriteHeader(http.StatusAccepted)
 	} else {
 		w.WriteHeader(http.StatusOK)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	json.NewEncoder(w).Encode(result)
 }
 
 // checkWithTimeout runs a health probe with a bounded timeout and returns
@@ -487,22 +626,42 @@ func main() {
 	log.Println("║   Production-Ready Journey Execution Engine                ║")
 	log.Println("╚════════════════════════════════════════════════════════════╝")
 
-	orchestrator, err := NewOrchestrator(context.Background())
+	runtimeCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	orchestrator, err := NewOrchestrator(runtimeCtx)
 	if err != nil {
 		log.Fatalf("❌ Failed to initialize orchestrator: %v", err)
 	}
 	defer orchestrator.Close()
 
 	// Setup HTTP routes
-	http.HandleFunc("/api/v1/journey/execute", orchestrator.handleExecuteJourney)
-	http.HandleFunc("/health", orchestrator.handleHealth)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/journey/execute", orchestrator.handleExecuteJourney)
+	mux.HandleFunc("/api/v1/journey/executions/", orchestrator.handleGetJourneyExecution)
+	mux.HandleFunc("/health", orchestrator.handleHealth)
 
 	port := getEnv("PORT", "8000")
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       90 * time.Second,
+	}
+	go func() {
+		<-runtimeCtx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
 	log.Printf("🚀 Orchestrator listening on port %s", port)
 	log.Printf("📍 Health check: http://localhost:%s/health", port)
-	log.Printf("📍 Execute journey: POST http://localhost:%s/api/v1/journey/execute", port)
+	log.Printf("📍 Execute journey: POST http://localhost:%s/api/v1/journey/execute (202 + poll /api/v1/journey/executions/{id})", port)
 
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("❌ Server failed: %v", err)
 	}
 }

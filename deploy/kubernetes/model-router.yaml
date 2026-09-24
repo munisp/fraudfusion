@@ -1,0 +1,91 @@
+# Model router (A/B champion/challenger routing, mlops/serving/model_router.py)
+# on port 8200. Build:
+#   docker build -f mlops/serving/Dockerfile.model-router -t ghcr.io/munisp/fraudfusion/model-router:latest .
+# The experiment config baked into the image points both arms at localhost;
+# override with the ConfigMap below so the champion arm reaches aml-ml-service.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-router-config
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: model-router
+data:
+  experiments.yaml: |
+    experiment_id: fraud_net_v1_vs_v2
+    champion:
+      name: champion
+      model_name: fraud_net
+      model_version: v1
+      url: http://aml-ml-service.fraudfusion-services.svc.cluster.local:8100/v1/aml/score
+    challenger:
+      name: challenger
+      model_name: fraud_net
+      model_version: v2
+      url: http://aml-ml-service.fraudfusion-services.svc.cluster.local:8100/v1/aml/score
+    challenger_traffic_pct: 10.0
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-router
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: model-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: model-router
+    spec:
+      containers:
+        - name: model-router
+          image: ghcr.io/munisp/fraudfusion/model-router:latest
+          env:
+            - name: PORT
+              value: "8200"
+            - name: EXPERIMENT_CONFIG
+              value: /app/config/experiments.yaml
+            - name: ROUTER_LOG_DIR
+              value: /app/data/router
+          ports:
+            - name: http
+              containerPort: 8200
+          volumeMounts:
+            - name: config
+              mountPath: /app/config/experiments.yaml
+              subPath: experiments.yaml
+              readOnly: true
+            - name: router-log
+              mountPath: /app/data/router
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: model-router-config
+        - name: router-log
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-router
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: model-router
+spec:
+  selector:
+    app.kubernetes.io/name: model-router
+  ports:
+    - name: http
+      port: 8200
+      targetPort: http

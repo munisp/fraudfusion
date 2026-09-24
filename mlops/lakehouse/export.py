@@ -11,6 +11,15 @@ ml/train/continuous.py are the raw feature columns:
 plus serving/lineage columns (transaction_id, customer_id, ts, amount,
 currency, country_code, transaction_type, risk_score, label_source).
 
+NDPA / data-protection controls:
+    * Every partition carries processing metadata columns
+      (processing_purpose, lawful_basis, pii_redacted) so downstream
+      consumers can enforce purpose limitation.
+    * Direct customer identifiers (customer_id) are pseudonymized by
+      default: salted SHA-256 (salt from LAKEHOUSE_PII_SALT). Raw
+      identifiers are written only with the explicit --include-pii opt-in,
+      which must be justified (e.g. fraud investigation lawful basis).
+
 Modes:
     default      read rows for a date range from Postgres via EXPORT_QUERY
     --synthetic  generate a realistic demo dataset so the loop is
@@ -19,11 +28,14 @@ Modes:
 Usage:
     python mlops/lakehouse/export.py --start 2026-01-01 --end 2026-01-07
     python mlops/lakehouse/export.py --synthetic --days 14 --rows-per-day 500
+    python mlops/lakehouse/export.py --start ... --end ... --include-pii \
+        --purpose fraud_investigation --lawful-basis legal_obligation
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import uuid
@@ -37,6 +49,34 @@ logger = logging.getLogger("lakehouse-export")
 
 LAKEHOUSE_DIR = Path(os.getenv("LAKEHOUSE_DIR", "mlops/data/lakehouse"))
 DATASET = "transactions"  # $LAKEHOUSE_DIR/transactions/dt=... (ml lane contract)
+
+# NDPA metadata defaults (overridable via CLI flags / env).
+DEFAULT_PURPOSE = os.getenv("EXPORT_PURPOSE", "fraud_detection_model_training")
+DEFAULT_LAWFUL_BASIS = os.getenv("EXPORT_LAWFUL_BASIS", "legitimate_interest")
+PII_COLUMNS = ("customer_id",)  # direct identifiers pseudonymized by default
+
+
+def pseudonymize(value: str, salt: str) -> str:
+    """Deterministic salted SHA-256 pseudonym for a direct identifier."""
+    return "pii_" + hashlib.sha256(f"{salt}:{value}".encode("utf-8")).hexdigest()[:32]
+
+
+def apply_privacy_controls(rows: list[dict], *, include_pii: bool, salt: str,
+                           purpose: str, lawful_basis: str) -> list[dict]:
+    """Attach purpose/lawful-basis metadata to every row and pseudonymize
+    direct customer identifiers unless --include-pii was passed."""
+    out = []
+    for row in rows:
+        record = dict(row)
+        if not include_pii:
+            for col in PII_COLUMNS:
+                if record.get(col):
+                    record[col] = pseudonymize(str(record[col]), salt)
+        record["processing_purpose"] = purpose
+        record["lawful_basis"] = lawful_basis
+        record["pii_redacted"] = not include_pii
+        out.append(record)
+    return out
 
 # ml lane contract (mirrors ml/data/synthetic_nigeria.py — do not import).
 NUMERIC_FEATURES = [
@@ -83,7 +123,7 @@ def write_partition(rows: list[dict], dt: str, lakehouse_dir: Path) -> Path:
     return path
 
 
-def export_from_postgres(start: str, end: str, lakehouse_dir: Path) -> int:
+def export_from_postgres(start: str, end: str, lakehouse_dir: Path, **privacy) -> int:
     database_url = os.getenv("DATABASE_URL")
     if not database_url:
         raise SystemExit("DATABASE_URL not set; use --synthetic for demo mode")
@@ -100,13 +140,13 @@ def export_from_postgres(start: str, end: str, lakehouse_dir: Path) -> int:
             dt = (ts.date() if hasattr(ts, "date") else ts).isoformat() if ts else start
             by_day.setdefault(dt, []).append(record)
         for dt, rows in by_day.items():
-            write_partition(rows, dt, lakehouse_dir)
+            write_partition(apply_privacy_controls(rows, **privacy), dt, lakehouse_dir)
             total += len(rows)
     return total
 
 
 def synthesize(days: int, rows_per_day: int, lakehouse_dir: Path, seed: int = 42,
-               label_fraction: float = 1.0) -> int:
+               label_fraction: float = 1.0, **privacy) -> int:
     """Deterministic synthetic partitions in the ml lane schema; ~5% fraud
     with separable signal. label_fraction < 1.0 simulates label lag (NULL
     is_fraud); ml/train/continuous.py requires fully labeled rows, so the
@@ -169,7 +209,7 @@ def synthesize(days: int, rows_per_day: int, lakehouse_dir: Path, seed: int = 42
                 "is_fraud": int(bool(fraud[i])) if rng.random() < label_fraction else None,
                 "label_source": "synthetic_demo",
             })
-        write_partition(rows, day.isoformat(), lakehouse_dir)
+        write_partition(apply_privacy_controls(rows, **privacy), day.isoformat(), lakehouse_dir)
         total += n
     return total
 
@@ -183,17 +223,35 @@ def main() -> None:
     parser.add_argument("--rows-per-day", type=int, default=500)
     parser.add_argument("--label-fraction", type=float, default=1.0,
                         help="synthetic: fraction of rows with is_fraud populated (1.0 = fully labeled)")
+    parser.add_argument("--include-pii", action="store_true",
+                        help="write raw customer identifiers (default: salted-SHA256 pseudonyms); "
+                             "requires a documented lawful basis")
+    parser.add_argument("--purpose", default=DEFAULT_PURPOSE,
+                        help="processing purpose metadata stamped on every exported row")
+    parser.add_argument("--lawful-basis", default=DEFAULT_LAWFUL_BASIS,
+                        help="NDPA lawful basis metadata stamped on every exported row")
     parser.add_argument("--lakehouse-dir", type=Path, default=LAKEHOUSE_DIR)
     args = parser.parse_args()
 
+    if args.include_pii:
+        logger.warning("--include-pii: exporting RAW customer identifiers (purpose=%s, "
+                       "lawful_basis=%s). Ensure this is authorized and access-controlled.",
+                       args.purpose, args.lawful_basis)
+    privacy = {
+        "include_pii": args.include_pii,
+        "salt": os.getenv("LAKEHOUSE_PII_SALT", "fraudfusion-lakehouse-v1"),
+        "purpose": args.purpose,
+        "lawful_basis": args.lawful_basis,
+    }
+
     if args.synthetic:
         total = synthesize(args.days, args.rows_per_day, args.lakehouse_dir,
-                           label_fraction=args.label_fraction)
+                           label_fraction=args.label_fraction, **privacy)
         logger.info("synthetic export complete: %d rows over %d partitions", total, args.days)
         return
     if not (args.start and args.end):
         raise SystemExit("--start and --end are required in DB mode (or use --synthetic)")
-    total = export_from_postgres(args.start, args.end, args.lakehouse_dir)
+    total = export_from_postgres(args.start, args.end, args.lakehouse_dir, **privacy)
     logger.info("export complete: %d rows", total)
 
 

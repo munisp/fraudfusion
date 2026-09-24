@@ -9,9 +9,24 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  esbuild: {
+    // Strip non-critical console output from production bundles.
+    pure: ['console.log', 'console.debug', 'console.info'],
+  },
   build: {
-    sourcemap: true,
+    target: 'es2018',
+    cssCodeSplit: true,
+    // Hidden sourcemaps: generated for error tracking upload but not served to users.
+    sourcemap: 'hidden',
     outDir: 'dist',
     emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'react-vendor': ['react', 'react-dom'],
+          icons: ['lucide-react'],
+        },
+      },
+    },
   },
 });

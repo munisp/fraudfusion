@@ -7,7 +7,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -105,7 +107,15 @@ func main() {
 	}
 
 	log.Printf("AML Monitor Service starting on port %s", port)
-	if err := r.Run(":" + port); err != nil {
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatal("Failed to start server:", err)
 	}
 }
@@ -142,10 +152,13 @@ func initDB() {
 		log.Fatal("Failed to ping database:", err)
 	}
 
-	// Set connection pool settings
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	// Set connection pool settings: keep idle conns == max so bursts don't
+	// pay a fresh TLS connect per query; size MaxOpenConns to PG
+	// max_connections / replica count.
+	db.SetMaxOpenConns(getEnvInt("DB_MAX_OPEN_CONNS", 25))
+	db.SetMaxIdleConns(getEnvInt("DB_MAX_IDLE_CONNS", 25))
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 
 	log.Println("Database connection established")
 }
@@ -307,41 +320,27 @@ func rateLimitMiddleware() gin.HandlerFunc {
 }
 
 func healthCheck(c *gin.Context) {
-	// Check database
-	dbHealthy := true
-	dbLatencyMs := float64(0)
-	dbStart := time.Now()
-	dbCtx, dbCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
-	if err := db.PingContext(dbCtx); err != nil {
-		dbHealthy = false
-	} else {
-		dbLatencyMs = float64(time.Since(dbStart).Microseconds()) / 1000.0
+	// Probes run concurrently with a 1s cap each: three sequential 3s probes
+	// could take ~9s and trip k8s liveness timeouts during a slow-ML incident.
+	var wg sync.WaitGroup
+	dbHealthy, redisHealthy, mlHealthy := true, true, true
+	dbLatencyMs, redisLatencyMs, mlLatencyMs := float64(0), float64(0), float64(0)
+	probe := func(check func(context.Context) error, healthy *bool, latency *float64) {
+		defer wg.Done()
+		start := time.Now()
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 1*time.Second)
+		defer cancel()
+		if err := check(ctx); err != nil {
+			*healthy = false
+			return
+		}
+		*latency = float64(time.Since(start).Microseconds()) / 1000.0
 	}
-	dbCancel()
-
-	// Check Redis
-	redisHealthy := true
-	redisLatencyMs := float64(0)
-	redisStart := time.Now()
-	redisCtx, redisCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
-	if err := redisClient.Ping(redisCtx).Err(); err != nil {
-		redisHealthy = false
-	} else {
-		redisLatencyMs = float64(time.Since(redisStart).Microseconds()) / 1000.0
-	}
-	redisCancel()
-
-	// Check ML inference service over HTTP
-	mlHealthy := true
-	mlLatencyMs := float64(0)
-	mlStart := time.Now()
-	mlCtx, mlCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
-	if err := mlClient.Health(mlCtx); err != nil {
-		mlHealthy = false
-	} else {
-		mlLatencyMs = float64(time.Since(mlStart).Microseconds()) / 1000.0
-	}
-	mlCancel()
+	wg.Add(3)
+	go probe(func(ctx context.Context) error { return db.PingContext(ctx) }, &dbHealthy, &dbLatencyMs)
+	go probe(func(ctx context.Context) error { return redisClient.Ping(ctx).Err() }, &redisHealthy, &redisLatencyMs)
+	go probe(func(ctx context.Context) error { return mlClient.Health(ctx) }, &mlHealthy, &mlLatencyMs)
+	wg.Wait()
 
 	// Determine overall status
 	status := "healthy"
@@ -376,6 +375,15 @@ func healthCheck(c *gin.Context) {
 		},
 		"version": os.Getenv("APP_VERSION"),
 	})
+}
+
+func getEnvInt(key string, fallback int) int {
+	if value := os.Getenv(key); value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
 }
 
 func getEnv(key, defaultValue string) string {

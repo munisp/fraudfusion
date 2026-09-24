@@ -23,7 +23,7 @@ with `vocab.json` + `preprocess.npz` from the artifact dir.
 | column | type | source | notes |
 |---|---|---|---|
 | transaction_id | string | DB / scoring | unique transaction key |
-| customer_id | string | DB / scoring | routing/bucketing key |
+| customer_id | string | DB / scoring | routing/bucketing key; salted-SHA256 pseudonym (`pii_*`) by default |
 | ts | timestamp (UTC) | DB | transaction time |
 | amount | double | DB | NGN amount |
 | currency, country_code, transaction_type | string | DB | lineage |
@@ -32,6 +32,26 @@ with `vocab.json` + `preprocess.npz` from the artifact dir.
 | risk_score | double | scoring service | model output probability in [0,1] |
 | is_fraud | int (nullable) | investigators | 1 = confirmed fraud, 0 = legit, NULL = unlabeled |
 | label_source | string (nullable) | investigators | e.g. `investigator`, `chargeback`, `synthetic_demo` |
+| processing_purpose | string | export.py | purpose-limitation metadata (default `fraud_detection_model_training`) |
+| lawful_basis | string | export.py | NDPA lawful-basis metadata (default `legitimate_interest`) |
+| pii_redacted | bool | export.py | true when direct identifiers were pseudonymized |
+
+## NDPA / PII controls
+
+`export.py` pseudonymizes direct customer identifiers (`customer_id`) by
+default with a salted SHA-256 (`LAKEHOUSE_PII_SALT` env, default
+`fraudfusion-lakehouse-v1` — set a real secret in shared environments) and
+stamps every row with `processing_purpose` / `lawful_basis` / `pii_redacted`
+metadata for purpose-limitation enforcement (NDPA). Raw identifiers are
+written only with the explicit opt-in:
+
+```bash
+python mlops/lakehouse/export.py --start 2026-01-01 --end 2026-01-07 \
+    --include-pii --purpose fraud_investigation --lawful-basis legal_obligation
+```
+
+`--include-pii` logs a loud WARNING; use it only with a documented lawful
+basis and restrict access to the resulting partitions.
 
 ## Writers / readers
 

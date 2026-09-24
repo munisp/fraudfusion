@@ -4,12 +4,13 @@
 # journeys exercise the same infrastructure seams as staging.
 #
 # Notes:
-#   - Keycloak realm import: mount deploy/keycloak/fraudfusion-realm.json into
-#     /opt/keycloak/data/import when that file is added (it does not exist yet);
-#     the import volume below is wired and simply inert until then.
+#   - Keycloak realm import: deploy/keycloak/fraudfusion-realm.json exists and
+#     is mounted below; it is imported at startup via --import-realm.
 #   - MLflow mirrors mlops/mlflow/docker-compose.yml on the shared e2e network.
 #   - aml-ml-service builds from the repo root (mlops/serving/Dockerfile) and
 #     falls back to its rule-based scorer when the ONNX artifact is absent.
+#   - temporal-orchestrator is a pure Temporal worker (no HTTP port); the dev
+#     Temporal server is temporalio/auto-setup (embedded SQLite, not for prod).
 services:
   postgres:
     image: postgres:16-alpine
@@ -49,9 +50,9 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_HEALTH_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
-    # When deploy/keycloak/fraudfusion-realm.json exists, uncomment:
-    # volumes:
-    #   - ../deploy/keycloak/fraudfusion-realm.json:/opt/keycloak/data/import/fraudfusion-realm.json:ro
+    # deploy/keycloak/fraudfusion-realm.json is imported at startup.
+    volumes:
+      - ../deploy/keycloak/fraudfusion-realm.json:/opt/keycloak/data/import/fraudfusion-realm.json:ro
     healthcheck:
       # ubi9-minimal ships curl-minimal; management port 9000 exposes health.
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/health/ready"]
@@ -150,6 +151,100 @@ services:
       LOCAL_E2E_TOKEN: local-contract-token
     ports:
       - "8088:8080"
+    networks: [fraudfusion-e2e]
+
+  model-router:
+    build:
+      context: ..
+      dockerfile: mlops/serving/Dockerfile.model-router
+      args:
+        # Both arms point at the local aml-ml-service; swap the challenger URL
+        # when running a second model version.
+        CHAMPION_URL: http://aml-ml-service:8100/v1/aml/score
+        CHALLENGER_URL: http://aml-ml-service:8100/v1/aml/score
+    depends_on:
+      aml-ml-service:
+        condition: service_healthy
+    environment:
+      PORT: "8200"
+      EXPERIMENT_CONFIG: /app/config/experiments.yaml
+      ROUTER_LOG_DIR: /app/data/router
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8200/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "8200:8200"
+    networks: [fraudfusion-e2e]
+
+  land-verification-service:
+    build:
+      context: ../services/land-verification-service
+    environment:
+      PORT: "8002"
+      # SQLite by default in local e2e (no DATABASE_URL); auth requires a
+      # Keycloak bearer token from the compose keycloak.
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: fraudfusion
+      KEYCLOAK_INSECURE_HTTP: "true"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8002/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "8002:8002"
+    networks: [fraudfusion-e2e]
+
+  onboarding-service:
+    build:
+      context: ../services/python/onboarding-service
+    environment:
+      PORT: "8085"
+      # SQLite default (no DATABASE_URL) keeps the local stack self-contained.
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: fraudfusion
+      KEYCLOAK_CLIENT_ID: onboarding-service
+      KEYCLOAK_CLIENT_SECRET: ${ONBOARDING_CLIENT_SECRET:-local_e2e_only}
+      KEYCLOAK_INSECURE_HTTP: "true"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8085/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "8085:8085"
+    networks: [fraudfusion-e2e]
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    ports:
+      - "7233:7233"
+    networks: [fraudfusion-e2e]
+
+  temporal-orchestrator:
+    build:
+      context: ../services/go/temporal-orchestrator
+    depends_on:
+      temporal:
+        condition: service_started
+    environment:
+      TEMPORAL_HOST: temporal:7233
+      SERVICE_LAND_VERIFICATION_SERVICE_URL: http://land-verification-service:8002
+    # The worker is a long-running process without an HTTP listener;
+    # healthcheck is process liveness only.
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 12
     networks: [fraudfusion-e2e]
 
 networks:

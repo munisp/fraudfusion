@@ -181,10 +181,11 @@ func Journey37ProfessionalConsultationWorkflow(ctx workflow.Context, input Journ
 	var availableProfessional *ProfessionalDetails
 	var availableSlot *AvailabilitySlot
 
+	// Fan out all availability checks concurrently, then evaluate results in
+	// directory order so the highest-ranked available professional still wins
+	// (same selection semantics as the previous sequential loop).
+	availabilityFutures := make([]workflow.Future, len(professionals))
 	for i, pro := range professionals {
-		logger.Info("Checking availability", "professional", pro.Name, "index", i+1)
-
-		var availability []AvailabilitySlot
 		availabilityInput := map[string]interface{}{
 			"professional_id":   pro.ID,
 			"preferred_date":    input.PreferredDate,
@@ -192,9 +193,12 @@ func Journey37ProfessionalConsultationWorkflow(ctx workflow.Context, input Journ
 			"consultation_type": input.ConsultationType,
 			"date_range_days":   7, // Check next 7 days
 		}
+		availabilityFutures[i] = workflow.ExecuteActivity(ctx, CheckProfessionalAvailabilityActivity, availabilityInput)
+	}
 
-		err = workflow.ExecuteActivity(ctx, CheckProfessionalAvailabilityActivity, availabilityInput).Get(ctx, &availability)
-		if err != nil {
+	for i, pro := range professionals {
+		var availability []AvailabilitySlot
+		if err := availabilityFutures[i].Get(ctx, &availability); err != nil {
 			logger.Warn("Failed to check availability", "professional", pro.Name, "error", err)
 			continue
 		}

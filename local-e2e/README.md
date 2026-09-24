@@ -9,10 +9,15 @@ This directory provides a **local contract-test simulator**, not a production st
 | postgres | 54329 | Contract-test database |
 | go-mobile-mock | 8088 | Go mock of the mobile/KYC API under contract test |
 | redis | 6380 | Cache/queue seam used by services |
-| keycloak | 8180 | OIDC issuer (start-dev); realm import wired for `deploy/keycloak/fraudfusion-realm.json` — **that file does not exist yet**, so the container starts with the default `master` realm until it is added (see commented volume in `docker-compose.yml`) |
+| keycloak | 8180 | OIDC issuer (start-dev); imports `deploy/keycloak/fraudfusion-realm.json` at startup (volume mounted in `docker-compose.yml`) |
 | permify | 3476/3478 | Authorization service (in-memory schema) |
 | mlflow (+ mlflow-db) | 5000 | Model registry, mirrors `mlops/mlflow/docker-compose.yml` |
 | aml-ml-service | 8100 | AML scorer from `mlops/serving`; starts in documented rule-fallback mode without the ONNX artifact |
+| model-router | 8200 | A/B champion/challenger router (`mlops/serving/Dockerfile.model-router`); both arms point at the local aml-ml-service |
+| land-verification-service | 8002 | Landlord/property verification (Keycloak bearer auth; SQLite persistence in local e2e) |
+| onboarding-service | 8085 | Tenant onboarding backend (`/api/v1/onboarding/*`) for ml-onboarding-portal, incl. staff dual-control approvals |
+| temporal | 7233 | Dev Temporal server (`temporalio/auto-setup`, embedded SQLite — not for prod) |
+| temporal-orchestrator | — | Temporal worker executing journey workflows (no HTTP port; process-liveness healthcheck) |
 
 All services carry healthchecks except `go-mobile-mock` (distroless image with no
 shell or curl); the contract script polls its `/healthz` with retries instead.

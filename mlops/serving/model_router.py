@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -98,6 +99,68 @@ def append_events(events: list[dict[str, Any]]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Buffered assignment log (P9): previously every request wrote its own
+# parquet file synchronously in the hot path — 5-30ms of disk I/O per score
+# plus thousands of tiny files. Events now buffer in memory and flush in a
+# background thread on a size OR time trigger, with a final flush on shutdown.
+# ---------------------------------------------------------------------------
+_FLUSH_SIZE = int(os.getenv("ROUTER_LOG_FLUSH_SIZE", "500"))
+_FLUSH_INTERVAL = float(os.getenv("ROUTER_LOG_FLUSH_INTERVAL_SECONDS", "5.0"))
+_event_buffer: list[dict[str, Any]] = []
+_event_lock = threading.Lock()
+_flush_now = threading.Event()
+_flush_stop = threading.Event()
+_flusher_thread: threading.Thread | None = None
+
+
+def buffer_event(event: dict[str, Any]) -> None:
+    """Append an event to the in-memory buffer; never blocks the caller on I/O."""
+    with _event_lock:
+        _event_buffer.append(event)
+        full = len(_event_buffer) >= _FLUSH_SIZE
+    if full:
+        _flush_now.set()
+
+
+def flush_events() -> None:
+    """Drain the buffer and write one batched parquet file."""
+    with _event_lock:
+        if not _event_buffer:
+            return
+        batch = _event_buffer[:]
+        _event_buffer.clear()
+    try:
+        append_events(batch)
+    except Exception:  # noqa: BLE001 - never lose events silently
+        logger.exception("router log flush failed; requeueing %d events", len(batch))
+        with _event_lock:
+            _event_buffer[:0] = batch
+
+
+def _flusher_loop() -> None:
+    while not _flush_stop.is_set():
+        _flush_now.wait(_FLUSH_INTERVAL)
+        _flush_now.clear()
+        flush_events()
+
+
+def start_event_flusher() -> None:
+    global _flusher_thread
+    if _flusher_thread is None or not _flusher_thread.is_alive():
+        _flush_stop.clear()
+        _flusher_thread = threading.Thread(target=_flusher_loop, name="router-log-flusher", daemon=True)
+        _flusher_thread.start()
+
+
+def stop_event_flusher() -> None:
+    _flush_stop.set()
+    _flush_now.set()
+    if _flusher_thread is not None:
+        _flusher_thread.join(timeout=10)
+    flush_events()  # final drain so shutdown never drops buffered events
+
+
+# ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 class RouteScoreRequest(BaseModel):
@@ -118,6 +181,7 @@ class OutcomeRequest(BaseModel):
 async def lifespan(app: FastAPI):
     app.state.config = load_config(CONFIG_PATH)
     app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(UPSTREAM_TIMEOUT))
+    start_event_flusher()
     logger.info(
         "Experiment %s loaded: challenger=%s pct=%.1f",
         app.state.config.experiment_id,
@@ -125,6 +189,7 @@ async def lifespan(app: FastAPI):
         app.state.config.challenger_traffic_pct,
     )
     yield
+    stop_event_flusher()
     await app.state.client.aclose()
 
 
@@ -175,7 +240,7 @@ async def route_score(req: RouteScoreRequest, request: Request) -> dict[str, Any
     finally:
         latency_ms = (time.perf_counter() - start) * 1000
 
-    append_events([{
+    buffer_event({
         "request_id": request_id,
         "ts": datetime.now(timezone.utc).isoformat(),
         "experiment_id": cfg.experiment_id,
@@ -191,7 +256,7 @@ async def route_score(req: RouteScoreRequest, request: Request) -> dict[str, Any
         "label": None,
         "label_source": None,
         "event_type": "score",
-    }])
+    })
 
     return {
         "request_id": request_id,
@@ -206,7 +271,7 @@ async def route_score(req: RouteScoreRequest, request: Request) -> dict[str, Any
 @app.post("/v1/route/outcome")
 async def record_outcome(req: OutcomeRequest) -> dict[str, Any]:
     """Label feedback endpoint: investigators attach ground truth to a score."""
-    append_events([{
+    buffer_event({
         "request_id": req.request_id,
         "ts": datetime.now(timezone.utc).isoformat(),
         "experiment_id": None,
@@ -222,7 +287,7 @@ async def record_outcome(req: OutcomeRequest) -> dict[str, Any]:
         "label": req.label,
         "label_source": req.source,
         "event_type": "outcome",
-    }])
+    })
     return {"status": "recorded", "request_id": req.request_id, "label": req.label}
 
 

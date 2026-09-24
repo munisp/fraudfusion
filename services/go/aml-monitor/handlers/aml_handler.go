@@ -9,6 +9,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -22,6 +24,9 @@ type AMLHandler struct {
 	repo *repository.AMLRepository
 	ml   *mlclient.Client
 }
+
+// batchWorkers bounds concurrent ML+DB work inside one batch request.
+const batchWorkers = 10
 
 func NewAMLHandler(repo *repository.AMLRepository, ml *mlclient.Client) *AMLHandler {
 	return &AMLHandler{
@@ -61,7 +66,7 @@ func (h *AMLHandler) AnalyzeTransaction(c *gin.Context) {
 	}
 
 	// Call the ML inference service over HTTP
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
 	mlReq := &mlclient.TransactionRequest{
@@ -142,66 +147,75 @@ func (h *AMLHandler) BatchAnalyzeTransactions(c *gin.Context) {
 		return
 	}
 
-	results := make([]map[string]interface{}, 0, len(req.Transactions))
-	flaggedCount := 0
-	sarRequiredCount := 0
+	results := make([]map[string]interface{}, len(req.Transactions))
+	var flaggedCount, sarRequiredCount int64
 
-	// Process each transaction
-	for _, txn := range req.Transactions {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Fan out with a bounded worker pool: 100 transactions serially paying an
+	// ML round trip each was the audit's worst batch path (A3).
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, batchWorkers)
+	for i := range req.Transactions {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			txn := req.Transactions[i]
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+			defer cancel()
 
-		mlReq := &mlclient.TransactionRequest{
-			TransactionID:   txn.TransactionID,
-			UserID:          txn.UserID,
-			Amount:          txn.Amount,
-			Currency:        txn.Currency,
-			TransactionType: txn.TransactionType,
-			CountryCode:     txn.CountryCode,
-			Timestamp:       time.Now().Unix(),
-		}
+			mlReq := &mlclient.TransactionRequest{
+				TransactionID:   txn.TransactionID,
+				UserID:          txn.UserID,
+				Amount:          txn.Amount,
+				Currency:        txn.Currency,
+				TransactionType: txn.TransactionType,
+				CountryCode:     txn.CountryCode,
+				Timestamp:       time.Now().Unix(),
+			}
 
-		resp, err := h.ml.AnalyzeTransaction(ctx, mlReq)
-		cancel()
+			resp, err := h.ml.AnalyzeTransaction(ctx, mlReq)
+			if err != nil {
+				// Fail closed: unscored transactions are flagged for manual review.
+				results[i] = map[string]interface{}{
+					"transaction_id": txn.TransactionID,
+					"risk_level":     "manual_review",
+					"flagged":        true,
+					"error":          "Analysis unavailable - routed to manual review",
+				}
+				return
+			}
 
-		if err != nil {
-			// Fail closed: unscored transactions are flagged for manual review.
-			results = append(results, map[string]interface{}{
-				"transaction_id": txn.TransactionID,
-				"risk_level":     "manual_review",
-				"flagged":        true,
-				"error":          "Analysis unavailable - routed to manual review",
-			})
-			continue
-		}
+			if resp.Flagged {
+				atomic.AddInt64(&flaggedCount, 1)
+			}
+			if resp.SarRequired {
+				atomic.AddInt64(&sarRequiredCount, 1)
+			}
 
-		if resp.Flagged {
-			flaggedCount++
-		}
-		if resp.SarRequired {
-			sarRequiredCount++
-		}
+			results[i] = map[string]interface{}{
+				"transaction_id": resp.TransactionID,
+				"risk_score":     resp.RiskScore,
+				"risk_level":     resp.RiskLevel,
+				"flagged":        resp.Flagged,
+				"sar_required":   resp.SarRequired,
+			}
 
-		results = append(results, map[string]interface{}{
-			"transaction_id": resp.TransactionID,
-			"risk_score":     resp.RiskScore,
-			"risk_level":     resp.RiskLevel,
-			"flagged":        resp.Flagged,
-			"sar_required":   resp.SarRequired,
-		})
-
-		// Store in database
-		analysis := &models.TransactionAnalysis{
-			TransactionID: txn.TransactionID,
-			UserID:        txn.UserID,
-			RiskScore:     int(resp.RiskScore),
-			RiskLevel:     resp.RiskLevel,
-			Flagged:       resp.Flagged,
-			SARRequired:   resp.SarRequired,
-			RiskFactors:   resp.RiskFactors,
-			CreatedAt:     time.Now(),
-		}
-		h.repo.StoreTransactionAnalysis(analysis)
+			// Store in database
+			analysis := &models.TransactionAnalysis{
+				TransactionID: txn.TransactionID,
+				UserID:        txn.UserID,
+				RiskScore:     int(resp.RiskScore),
+				RiskLevel:     resp.RiskLevel,
+				Flagged:       resp.Flagged,
+				SARRequired:   resp.SarRequired,
+				RiskFactors:   resp.RiskFactors,
+				CreatedAt:     time.Now(),
+			}
+			h.repo.StoreTransactionAnalysis(analysis)
+		}(i)
 	}
+	wg.Wait()
 
 	c.JSON(http.StatusOK, gin.H{
 		"total_analyzed":     len(req.Transactions),
@@ -266,7 +280,7 @@ func (h *AMLHandler) DetectSuspiciousPatterns(c *gin.Context) {
 	}
 
 	// Call the ML inference service over HTTP
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
 	defer cancel()
 
 	mlReq := &mlclient.PatternRequest{
@@ -314,7 +328,13 @@ func (h *AMLHandler) GetUserPatterns(c *gin.Context) {
 	daysStr := c.DefaultQuery("days", "30")
 	days, _ := strconv.Atoi(daysStr)
 
-	patterns, err := h.repo.GetUserPatterns(userID, days)
+	limit := 200
+	if raw := c.Query("limit"); raw != "" {
+		if parsed, parseErr := strconv.Atoi(raw); parseErr == nil {
+			limit = parsed
+		}
+	}
+	patterns, err := h.repo.GetUserPatterns(userID, days, limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve patterns"})
 		return
@@ -341,7 +361,7 @@ func (h *AMLHandler) GenerateSAR(c *gin.Context) {
 	}
 
 	// Call the ML inference service over HTTP
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
 	mlReq := &mlclient.SARRequest{
@@ -499,7 +519,7 @@ func (h *AMLHandler) CheckSanctions(c *gin.Context) {
 	}
 
 	// Call the ML inference service over HTTP
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
 	mlReq := &mlclient.SanctionsRequest{
@@ -580,7 +600,7 @@ func (h *AMLHandler) VerifySourceOfFunds(c *gin.Context) {
 	}
 
 	// Call the ML inference service over HTTP
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
 	mlReq := &mlclient.SourceOfFundsRequest{

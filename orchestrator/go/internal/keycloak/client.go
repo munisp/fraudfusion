@@ -2,16 +2,41 @@ package keycloak
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/munisp/fraudfusion/orchestrator/go/internal/backoff"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/httpx"
 )
+
+const (
+	// introspectCacheTTL bounds how long a positive introspection result is
+	// reused. Tokens typically live 5+ minutes; 45s bounds revocation lag.
+	introspectCacheTTL = 45 * time.Second
+	// introspectNegTTL bounds how long an inactive/failed introspection is
+	// reused, so a newly-activated token recovers quickly.
+	introspectNegTTL = 5 * time.Second
+	// introspectCacheMaxSize bounds memory: distinct tokens in flight.
+	introspectCacheMaxSize = 10000
+)
+
+// cacheEntry is a bounded-TTL introspection result. Err is set for negative
+// entries (inactive token, upstream failure); Claims is set for positive ones.
+type cacheEntry struct {
+	claims    map[string]interface{}
+	err       error
+	expiresAt time.Time
+}
 
 // Client performs confidential-client OpenID Connect interactions with Keycloak.
 type Client struct {
@@ -20,6 +45,10 @@ type Client struct {
 	clientID     string
 	clientSecret string
 	httpClient   *http.Client
+
+	cacheMu sync.Mutex
+	cache   map[string]*cacheEntry
+	group   singleflight.Group
 }
 
 // TokenResponse is the Keycloak token response returned by the OpenID Connect token endpoint.
@@ -47,7 +76,8 @@ func NewClient(serverURL, realm, clientID, clientSecret string) (*Client, error)
 		realm:        realm,
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		httpClient:   &http.Client{Timeout: 10 * time.Second, Transport: httpx.SharedTransport()},
+		cache:        make(map[string]*cacheEntry),
 	}, nil
 }
 
@@ -109,11 +139,81 @@ func (c *Client) Login(ctx context.Context, username, password string) (*TokenRe
 // ValidateToken uses Keycloak's confidential-client token introspection endpoint and returns
 // only claims reported by the identity provider. Any transport, protocol, or inactive-token result
 // denies access.
+//
+// Results are cached in-process: positive results for introspectCacheTTL,
+// negative results for introspectNegTTL, keyed by SHA-256 of the token (the
+// raw token is never used as a map key). Concurrent misses for the same token
+// are deduplicated via singleflight so an expired-token burst costs one
+// upstream round trip instead of N.
 func (c *Client) ValidateToken(ctx context.Context, token string) (map[string]interface{}, error) {
 	if token == "" {
 		return nil, fmt.Errorf("access token is required")
 	}
+	sum := sha256.Sum256([]byte(token))
+	key := hex.EncodeToString(sum[:])
 
+	if claims, err, ok := c.lookupCache(key); ok {
+		return claims, err
+	}
+
+	result, err, _ := c.group.Do(key, func() (interface{}, error) {
+		if claims, err, ok := c.lookupCache(key); ok {
+			return claims, err
+		}
+		claims, introspectErr := c.introspectUncached(ctx, token)
+		if introspectErr != nil {
+			c.storeCache(key, &cacheEntry{err: introspectErr, expiresAt: time.Now().Add(introspectNegTTL)})
+			// Return a nil error to singleflight so every waiter shares the
+			// negative outcome; the real error travels inside the entry.
+			return nil, nil
+		}
+		c.storeCache(key, &cacheEntry{claims: claims, expiresAt: time.Now().Add(introspectCacheTTL)})
+		return claims, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		// Negative outcome shared by the singleflight leader.
+		if _, cacheErr, ok := c.lookupCache(key); ok {
+			return nil, cacheErr
+		}
+		return nil, fmt.Errorf("token introspection failed")
+	}
+	return result.(map[string]interface{}), nil
+}
+
+func (c *Client) lookupCache(key string) (map[string]interface{}, error, bool) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	entry, ok := c.cache[key]
+	if !ok || time.Now().After(entry.expiresAt) {
+		return nil, nil, false
+	}
+	return entry.claims, entry.err, true
+}
+
+func (c *Client) storeCache(key string, entry *cacheEntry) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	if len(c.cache) >= introspectCacheMaxSize {
+		now := time.Now()
+		for k, e := range c.cache {
+			if now.After(e.expiresAt) {
+				delete(c.cache, k)
+			}
+		}
+		if len(c.cache) >= introspectCacheMaxSize {
+			// Cache full of live entries: skip caching rather than evicting
+			// arbitrarily; correctness never depends on the cache.
+			return
+		}
+	}
+	c.cache[key] = entry
+}
+
+// introspectUncached performs the upstream introspection round trip.
+func (c *Client) introspectUncached(ctx context.Context, token string) (map[string]interface{}, error) {
 	form := url.Values{
 		"token":         {token},
 		"client_id":     {c.clientID},

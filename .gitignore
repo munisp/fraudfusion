@@ -20,6 +20,11 @@ artifacts/
 # Go test binaries
 *.test
 
+# Runtime SQLite databases / generated reports (local dev)
+services/python/onboarding-service/data/
+services/land-verification-service/data/
+services/land-verification-service/reports/output/
+
 # Local contract-test build output
 local-e2e/go-mobile-mock/go-mobile-mock
 
@@ -33,7 +38,10 @@ services/go/crypto-fraud-detector/crypto-fraud-detector
 services/go/investment-fraud-detector/investment-fraud-detector
 services/go/sim-swap-detector/sim-swap-detector
 services/go/insider-fraud-detector/insider-fraud-detector
+services/go/chargeback-fraud-detector/chargeback-fraud-detector
 services/go/aml-monitor/aml-monitor
 services/go/temporal-orchestrator/temporal-orchestrator
+services/go/ledger-command/ledger-command
 orchestrator/go/cmd/orchestrator/orchestrator
 database/cmd/migrate/migrate
+observability/release-gate-metrics/release-gate-metrics

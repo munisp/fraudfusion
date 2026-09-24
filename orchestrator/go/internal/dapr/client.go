@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/munisp/fraudfusion/orchestrator/go/internal/backoff"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/httpx"
 )
 
 // Client talks to a Dapr sidecar over HTTP.
@@ -38,7 +39,7 @@ func NewClient(baseURL, appID string) (*Client, error) {
 	if _, err := url.ParseRequestURI(baseURL); err != nil {
 		return nil, fmt.Errorf("invalid Dapr sidecar URL: %w", err)
 	}
-	return &Client{baseURL: baseURL, appID: appID, httpClient: &http.Client{Timeout: 10 * time.Second}}, nil
+	return &Client{baseURL: baseURL, appID: appID, httpClient: &http.Client{Timeout: 10 * time.Second, Transport: httpx.SharedTransport()}}, nil
 }
 
 // InvokeService calls POST /v1.0/invoke/{appID}/method/{method} and decodes

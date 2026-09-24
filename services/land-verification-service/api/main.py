@@ -6,6 +6,7 @@ Authentication: Keycloak bearer-token introspection (fail-closed); see api/auth.
 CORS: comma-separated allow-list via LAND_VERIFY_CORS_ORIGINS (never '*').
 """
 
+import asyncio
 import os
 import uuid
 from datetime import datetime
@@ -125,6 +126,22 @@ def _result_to_response(result) -> dict:
     }
 
 
+async def _read_upload(file: UploadFile, max_bytes: int) -> bytes:
+    """Stream an upload in 1MB chunks, aborting as soon as the cap is
+    exceeded instead of buffering an unbounded body in memory."""
+    chunks = bytearray()
+    while True:
+        chunk = await file.read(1 << 20)
+        if not chunk:
+            break
+        chunks.extend(chunk)
+        if len(chunks) > max_bytes:
+            raise HTTPException(status_code=400, detail="File too large (max 50MB)")
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+    return bytes(chunks)
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="Land Document Verification Service",
@@ -190,11 +207,7 @@ def create_app() -> FastAPI:
     ):
         """Verify a land document. The user id comes from the Keycloak token."""
         try:
-            file_data = await file.read()
-            if len(file_data) == 0:
-                raise HTTPException(status_code=400, detail="Empty file uploaded")
-            if len(file_data) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=400, detail="File too large (max 50MB)")
+            file_data = await _read_upload(file, MAX_UPLOAD_BYTES)
 
             request = _build_request(
                 file.filename, len(file_data), file.content_type, document_type, state, user_id
@@ -219,7 +232,7 @@ def create_app() -> FastAPI:
     async def get_verification_status(
         verification_id: str, user_id: str = Depends(get_current_user)
     ):
-        status = workflow.get_status(verification_id)
+        status = await asyncio.to_thread(workflow.get_status, verification_id)
         if status is None:
             raise HTTPException(status_code=404, detail="Verification not found")
         return VerificationStatusResponse(
@@ -259,10 +272,11 @@ def create_app() -> FastAPI:
 
             documents = []
             for i, file in enumerate(files):
-                file_data = await file.read()
-                if len(file_data) == 0 or len(file_data) > MAX_UPLOAD_BYTES:
+                try:
+                    file_data = await _read_upload(file, MAX_UPLOAD_BYTES)
+                except HTTPException:
                     raise HTTPException(
-                        status_code=400, detail=f"Invalid file size for {file.filename}"
+                        status_code=400, detail=f"Invalid file (empty or >50MB) for {file.filename}"
                     )
                 documents.append(
                     (
@@ -306,4 +320,13 @@ app = create_app()
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api.main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8002")), reload=True)
+    # reload=True is a dev auto-reload mode — never in the production path.
+    uvicorn.run(
+        "api.main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8002")),
+        workers=int(os.getenv("UVICORN_WORKERS", "4")),
+        loop="uvloop",
+        http="httptools",
+        reload=False,
+    )

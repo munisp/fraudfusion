@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -125,9 +126,18 @@ func main() {
 	}
 
 	log.Printf("Investment Fraud Detector Service starting on port %s", port)
-	if err := r.Run(":" + port); err != nil {
+		server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatal("Failed to start server:", err)
 	}
+
 }
 
 func analyzeInvestmentScheme(c *gin.Context) {
@@ -811,6 +821,13 @@ func initDB() {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
+	// Bound the pool: unlimited connections can exhaust PG max_connections,
+	// and the default of 2 idle connections forces a TLS handshake per query.
+	db.SetMaxOpenConns(getEnvInt("DB_MAX_OPEN_CONNS", 25))
+	db.SetMaxIdleConns(getEnvInt("DB_MAX_IDLE_CONNS", 25))
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
 	if err := withBackoff(func() error { return db.Ping() }); err != nil {
 		log.Fatal("Failed to ping database:", err)
 	}
@@ -861,6 +878,16 @@ func corsMiddleware() gin.HandlerFunc {
 }
 
 // authMiddleware is implemented in auth.go (Keycloak token introspection, fail-closed).
+
+
+func getEnvInt(key string, fallback int) int {
+	if value := os.Getenv(key); value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {

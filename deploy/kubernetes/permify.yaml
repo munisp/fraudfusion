@@ -31,7 +31,7 @@ spec:
     spec:
       containers:
         - name: permify
-          image: ghcr.io/permify/permify:v1.2.0
+          image: ghcr.io/permify/permify:v1.2.9
           args: ["serve"]
           env:
             - name: PERMIFY_AUTHN_PRESHARED_KEYS

@@ -1,7 +1,9 @@
-import React, { useState } from 'react';
-import Dashboard from './pages/Dashboard';
-import FraudAlerts from './pages/FraudAlerts';
-import KYCVerifications from './pages/KYCVerifications';
+import React, { Suspense, lazy, useState } from 'react';
+
+// Section-level code splitting: each back-office page ships as its own chunk.
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const FraudAlerts = lazy(() => import('./pages/FraudAlerts'));
+const KYCVerifications = lazy(() => import('./pages/KYCVerifications'));
 
 type Page = 'dashboard' | 'fraud-alerts' | 'kyc-verifications';
 
@@ -43,9 +45,11 @@ export default function App() {
         </div>
       </header>
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {page === 'dashboard' && <Dashboard />}
-        {page === 'fraud-alerts' && <FraudAlerts />}
-        {page === 'kyc-verifications' && <KYCVerifications />}
+        <Suspense fallback={<p role="status" aria-live="polite" className="text-gray-500">Loading section…</p>}>
+          {page === 'dashboard' && <Dashboard />}
+          {page === 'fraud-alerts' && <FraudAlerts />}
+          {page === 'kyc-verifications' && <KYCVerifications />}
+        </Suspense>
       </main>
     </div>
   );

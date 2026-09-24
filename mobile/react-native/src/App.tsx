@@ -5,6 +5,7 @@
 
 import React, { useEffect, useState } from 'react';
 import {
+  InteractionManager,
   SafeAreaView,
   StatusBar,
   StyleSheet,
@@ -41,6 +42,7 @@ import FraudAlertsScreen from './screens/FraudAlertsScreen';
 import { initializeApp } from './services/AppService';
 import { setupPushNotifications } from './services/NotificationService';
 import { checkBiometricSupport } from './services/BiometricService';
+import { AuthService } from './services/AuthService';
 import { logger } from './services/logger';
 
 // Types
@@ -49,6 +51,36 @@ import { RootStackParamList, MainTabParamList } from './types/navigation';
 const Stack = createStackNavigator<RootStackParamList>();
 const Tab = createBottomTabNavigator<MainTabParamList>();
 
+// Hoisted to module scope so the navigator does not recreate the icon closure
+// on every render (M5 memoization fix).
+function tabBarIcon(routeName: string) {
+  return function TabBarIcon({ focused, color, size }: { focused: boolean; color: string; size: number }) {
+    let iconName: string;
+
+    switch (routeName) {
+      case 'Dashboard':
+        iconName = focused ? 'view-dashboard' : 'view-dashboard-outline';
+        break;
+      case 'KYC':
+        iconName = focused ? 'account-check' : 'account-check-outline';
+        break;
+      case 'Documents':
+        iconName = focused ? 'file-document' : 'file-document-outline';
+        break;
+      case 'Alerts':
+        iconName = focused ? 'alert-circle' : 'alert-circle-outline';
+        break;
+      case 'Profile':
+        iconName = focused ? 'account' : 'account-outline';
+        break;
+      default:
+        iconName = 'circle';
+    }
+
+    return <Icon name={iconName} size={size} color={color} />;
+  };
+}
+
 /**
  * Main Tab Navigator
  */
@@ -56,31 +88,7 @@ function MainTabs() {
   return (
     <Tab.Navigator
       screenOptions={({ route }) => ({
-        tabBarIcon: ({ focused, color, size }) => {
-          let iconName: string;
-
-          switch (route.name) {
-            case 'Dashboard':
-              iconName = focused ? 'view-dashboard' : 'view-dashboard-outline';
-              break;
-            case 'KYC':
-              iconName = focused ? 'account-check' : 'account-check-outline';
-              break;
-            case 'Documents':
-              iconName = focused ? 'file-document' : 'file-document-outline';
-              break;
-            case 'Alerts':
-              iconName = focused ? 'alert-circle' : 'alert-circle-outline';
-              break;
-            case 'Profile':
-              iconName = focused ? 'account' : 'account-outline';
-              break;
-            default:
-              iconName = 'circle';
-          }
-
-          return <Icon name={iconName} size={size} color={color} />;
-        },
+        tabBarIcon: tabBarIcon(route.name),
         tabBarActiveTintColor: '#1e40af',
         tabBarInactiveTintColor: '#6b7280',
         headerShown: false,
@@ -124,38 +132,50 @@ function App(): React.JSX.Element {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
 
   useEffect(() => {
-    initializeApplication();
+    let cancelled = false;
+
+    /**
+     * Initialize application: only the work required to render the first
+     * frame runs on the splash path. Push-notification registration and
+     * biometric capability probing are deferred until after interactions.
+     */
+    const initializeApplication = async () => {
+      try {
+        // Critical: runtime config validation + foreground message subscription.
+        await initializeApp();
+
+        // Restore the persisted session so returning users skip Login.
+        const session = await AuthService.restoreSession();
+        if (!cancelled) {
+          setIsAuthenticated(session !== null);
+        }
+
+        // Non-critical init deferred until after the first frame is interactive.
+        InteractionManager.runAfterInteractions(() => {
+          void setupPushNotifications().catch((error: unknown) => {
+            logger.warn('notifications.setup_deferred_failed', { reason: error instanceof Error ? error.message : 'unknown_error' });
+          });
+          void checkBiometricSupport()
+            .then((supported) => logger.info('biometric.support_checked', { supported }))
+            .catch((error: unknown) => {
+              logger.warn('biometric.support_check_failed', { reason: error instanceof Error ? error.message : 'unknown_error' });
+            });
+        });
+      } catch (error) {
+        logger.error('app.initialization_failed', { reason: error instanceof Error ? error.message : 'unknown_error' });
+      } finally {
+        // Splash gates on real readiness only — no artificial delay.
+        if (!cancelled) {
+          setIsLoading(false);
+        }
+      }
+    };
+
+    void initializeApplication();
+    return () => {
+      cancelled = true;
+    };
   }, []);
-
-  /**
-   * Initialize application
-   */
-  const initializeApplication = async () => {
-    try {
-      // Initialize app services
-      await initializeApp();
-
-      // Setup push notifications
-      await setupPushNotifications();
-
-      // Check biometric support
-      const biometricSupported = await checkBiometricSupport();
-      logger.info('biometric.support_checked', { supported: biometricSupported });
-
-      // Check authentication status
-      // const authStatus = await checkAuthStatus();
-      // setIsAuthenticated(authStatus);
-
-      // Simulate loading
-      setTimeout(() => {
-        setIsLoading(false);
-      }, 2000);
-
-    } catch (error) {
-      logger.error('app.initialization_failed', { reason: error instanceof Error ? error.message : 'unknown_error' });
-      setIsLoading(false);
-    }
-  };
 
   const backgroundStyle = {
     backgroundColor: isDarkMode ? '#1f2937' : '#ffffff',

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import math
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -170,6 +173,9 @@ async def lifespan(app: FastAPI):
         command_timeout=10,
     )
     app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    # Load the ONNX artifact at startup so the first request does not pay
+    # model-load latency.
+    app.state.scorer = OnnxScorer()
     yield
     await app.state.http_client.aclose()
     await app.state.pool.close()
@@ -192,6 +198,65 @@ def required_roles() -> set[str]:
     return values
 
 
+
+# --- Introspection result cache (P3): token-hash TTL cache + singleflight ---
+_TOKEN_CACHE_TTL = float(os.getenv("AUTH_CACHE_TTL_SECONDS", "45"))
+_TOKEN_NEG_TTL = 5.0
+_TOKEN_CACHE_MAX = 10000
+_token_cache: dict[str, tuple[float, Any, Any]] = {}  # hash -> (expires_at, claims, exc)
+_token_inflight: dict[str, asyncio.Future] = {}
+_token_cache_lock = asyncio.Lock()
+
+
+def _store_token_cache(key: str, entry: tuple[float, Any, Any]) -> None:
+    if len(_token_cache) >= _TOKEN_CACHE_MAX:
+        now = time.monotonic()
+        for k in [k for k, v in _token_cache.items() if v[0] <= now]:
+            del _token_cache[k]
+        if len(_token_cache) >= _TOKEN_CACHE_MAX:
+            return  # correctness never depends on the cache
+    _token_cache[key] = entry
+
+
+async def _introspect_cached(client: httpx.AsyncClient, endpoint: str, token: str, data: dict[str, str]) -> dict[str, Any]:
+    """Introspect via a bounded TTL cache keyed by token SHA-256 with
+    singleflight dedup; only a cold cache hits Keycloak."""
+    key = hashlib.sha256(token.encode()).hexdigest()
+    async with _token_cache_lock:
+        entry = _token_cache.get(key)
+        if entry and entry[0] > time.monotonic():
+            _, claims, exc = entry
+            if exc is not None:
+                raise exc
+            return claims
+        fut = _token_inflight.get(key)
+        leader = fut is None
+        if leader:
+            fut = asyncio.get_running_loop().create_future()
+            _token_inflight[key] = fut
+    if not leader:
+        claims, exc = await fut
+        if exc is not None:
+            raise exc
+        return claims
+    try:
+        response = await client.post(endpoint, data=data)
+        response.raise_for_status()
+        claims: dict[str, Any] = response.json()
+        # Active results get the full TTL; inactive/error results get the
+        # short negative TTL so newly-activated tokens recover quickly.
+        ttl = _TOKEN_CACHE_TTL if claims.get("active") is True else _TOKEN_NEG_TTL
+        _store_token_cache(key, (time.monotonic() + ttl, claims, None))
+        fut.set_result((claims, None))
+        return claims
+    except (httpx.HTTPError, ValueError) as exc:
+        _store_token_cache(key, (time.monotonic() + _TOKEN_NEG_TTL, None, exc))
+        fut.set_result((None, exc))
+        raise
+    finally:
+        async with _token_cache_lock:
+            _token_inflight.pop(key, None)
+
 async def authenticate(request: Request, authorization: str = Header(default="")) -> AuthenticatedSubject:
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="bearer token required")
@@ -204,16 +269,16 @@ async def authenticate(request: Request, authorization: str = Header(default="")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Keycloak must use HTTPS")
     endpoint = f"{keycloak_url}/realms/{required_env('KEYCLOAK_REALM')}/protocol/openid-connect/token/introspect"
     try:
-        response = await request.app.state.http_client.post(
+        claims = await _introspect_cached(
+            request.app.state.http_client,
             endpoint,
+            token,
             data={
                 "token": token,
                 "client_id": required_env("KEYCLOAK_CLIENT_ID"),
                 "client_secret": required_env("KEYCLOAK_CLIENT_SECRET"),
             },
         )
-        response.raise_for_status()
-        claims: dict[str, Any] = response.json()
     except (httpx.HTTPError, ValueError) as error:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token validation unavailable") from error
 
@@ -267,7 +332,7 @@ async def detect_takeover(event: LoginEvent, request: Request, _: AuthenticatedS
                 event.tenant_id, event.user_id, event.ip_address, event.device_id, event.location, event.user_agent, event.timestamp,
             )
             rule_score, indicators = takeover_score(history, event)
-            model_proba = get_scorer(request).predict_proba(login_features(event, history))
+            model_proba = await asyncio.to_thread(get_scorer(request).predict_proba, login_features(event, history))
             risk_score, score_mode = blend_score(model_proba, rule_score)
             if score_mode == "rule_fallback":
                 logger.warning("takeover_detection served by RULE FALLBACK for user=%s", event.user_id)
@@ -296,7 +361,7 @@ async def analyze_login(event: LoginEvent, request: Request, _: AuthenticatedSub
             event.tenant_id, event.user_id, event.ip_address, event.device_id, event.location, event.user_agent, event.timestamp,
         )
         rule_score, indicators = login_score(history, event)
-        model_proba = get_scorer(request).predict_proba(login_features(event, history))
+        model_proba = await asyncio.to_thread(get_scorer(request).predict_proba, login_features(event, history))
         risk_score, score_mode = blend_score(model_proba, rule_score)
         if score_mode == "rule_fallback":
             logger.warning("login_analysis served by RULE FALLBACK for user=%s", event.user_id)

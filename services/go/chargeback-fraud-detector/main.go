@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -61,6 +64,10 @@ type keycloakClient struct {
 	clientSecret string
 	httpClient   *http.Client
 	roles        map[string]struct{}
+
+	cacheMu  sync.Mutex
+	cache    map[string]*introspectCacheEntry
+	inflight map[string]*introspectCall
 }
 
 type app struct {
@@ -452,6 +459,8 @@ func newKeycloakClient() (*keycloakClient, error) {
 		clientSecret: requiredEnv("KEYCLOAK_CLIENT_SECRET"),
 		httpClient:   &http.Client{Timeout: 5 * time.Second},
 		roles:        map[string]struct{}{},
+		cache:        make(map[string]*introspectCacheEntry),
+		inflight:     make(map[string]*introspectCall),
 	}
 	for _, role := range strings.Split(envOr("KEYCLOAK_REQUIRED_ROLES", "fraud_analyst,fraud_operator,admin"), ",") {
 		role = strings.TrimSpace(role)
@@ -465,7 +474,84 @@ func newKeycloakClient() (*keycloakClient, error) {
 	return client, nil
 }
 
+
+const (
+	// introspectCacheTTL takes the Keycloak round trip (10-40ms) off every
+	// authenticated request; revocation lag is bounded by the TTL.
+	introspectCacheTTL = 45 * time.Second
+	// introspectNegTTL bounds reuse of failed/inactive results.
+	introspectNegTTL      = 5 * time.Second
+	introspectCacheMaxLen = 10000
+)
+
+type introspectCacheEntry struct {
+	claims    map[string]interface{}
+	err       error
+	expiresAt time.Time
+}
+
+// introspectCall deduplicates concurrent introspection misses for the same
+// token (singleflight): followers wait on done and share the leader's result.
+type introspectCall struct {
+	done   chan struct{}
+	claims map[string]interface{}
+	err    error
+}
+
+// introspect validates the token through a bounded TTL cache keyed by the
+// SHA-256 of the token (the raw token is never a map key) with singleflight
+// dedup on misses. Only a cold cache reaches Keycloak.
 func (k *keycloakClient) introspect(ctx context.Context, token string) (map[string]interface{}, error) {
+	if token == "" {
+		return nil, fmt.Errorf("empty access token")
+	}
+	sum := sha256.Sum256([]byte(token))
+	key := hex.EncodeToString(sum[:])
+
+	k.cacheMu.Lock()
+	if entry, ok := k.cache[key]; ok && time.Now().Before(entry.expiresAt) {
+		k.cacheMu.Unlock()
+		return entry.claims, entry.err
+	}
+	if call, ok := k.inflight[key]; ok {
+		k.cacheMu.Unlock()
+		select {
+		case <-call.done:
+			return call.claims, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &introspectCall{done: make(chan struct{})}
+	k.inflight[key] = call
+	k.cacheMu.Unlock()
+
+	claims, err := k.introspectUncached(ctx, token)
+	ttl := introspectCacheTTL
+	if err != nil {
+		ttl = introspectNegTTL
+	}
+
+	k.cacheMu.Lock()
+	if len(k.cache) >= introspectCacheMaxLen {
+		now := time.Now()
+		for ck, e := range k.cache {
+			if now.After(e.expiresAt) {
+				delete(k.cache, ck)
+			}
+		}
+	}
+	if len(k.cache) < introspectCacheMaxLen {
+		k.cache[key] = &introspectCacheEntry{claims: claims, err: err, expiresAt: time.Now().Add(ttl)}
+	}
+	delete(k.inflight, key)
+	call.claims, call.err = claims, err
+	close(call.done)
+	k.cacheMu.Unlock()
+	return claims, err
+}
+
+func (k *keycloakClient) introspectUncached(ctx context.Context, token string) (map[string]interface{}, error) {
 	if token == "" {
 		return nil, fmt.Errorf("empty access token")
 	}

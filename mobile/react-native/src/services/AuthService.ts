@@ -20,6 +20,21 @@ type IdentityConfig = AuthConfiguration & { issuer: string; clientId: string; re
 
 const keychainService = 'com.fraudfusion.mobile.session';
 
+// In-memory session cache: avoids a native Keychain bridge round-trip on every
+// API call. `undefined` means "not yet read from secure storage this launch".
+let cachedSession: Session | null | undefined;
+// Single-flight refresh so concurrent requests share one token refresh.
+let refreshInFlight: Promise<Session> | null = null;
+
+// Refresh access tokens this far ahead of expiry instead of failing at 401.
+const REFRESH_MARGIN_MS = 60_000;
+
+function isExpiringSoon(session: Session): boolean {
+  if (!session.accessTokenExpirationDate) return false;
+  const expiresAt = Date.parse(session.accessTokenExpirationDate);
+  return Number.isFinite(expiresAt) && expiresAt - Date.now() <= REFRESH_MARGIN_MS;
+}
+
 function requiredConfig(): IdentityConfig {
   const runtime = globalThis as typeof globalThis & { __FRAUDFUSION_AUTH_CONFIG__?: IdentityConfig };
   const config = runtime.__FRAUDFUSION_AUTH_CONFIG__;
@@ -73,6 +88,7 @@ async function persistSession(result: AuthorizeResult | RefreshResult): Promise<
     service: keychainService,
     accessible: Keychain.ACCESSIBLE.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
   });
+  cachedSession = session;
   return session;
 }
 
@@ -85,14 +101,45 @@ export const AuthService = {
   },
 
   async restoreSession(): Promise<Session | null> {
+    // Serve from memory after the first restore; Keychain is only touched once
+    // per launch (and again after sign-in/sign-out/refresh mutates the cache).
+    if (cachedSession !== undefined) return cachedSession;
     const stored = await Keychain.getGenericPassword({ service: keychainService });
-    if (!stored) return null;
+    if (!stored) {
+      cachedSession = null;
+      return null;
+    }
     try {
-      return JSON.parse(stored.password) as Session;
+      cachedSession = JSON.parse(stored.password) as Session;
+      return cachedSession;
     } catch {
       await Keychain.resetGenericPassword({ service: keychainService });
+      cachedSession = null;
       logger.warn('auth.invalid_secure_session_removed');
       return null;
+    }
+  },
+
+  /**
+   * Returns the cached session, proactively refreshing the access token when it
+   * expires within REFRESH_MARGIN_MS. Concurrent callers share one refresh.
+   * Falls back to the stored (stale) session if the refresh fails, letting the
+   * server's 401 drive re-authentication.
+   */
+  async getValidSession(): Promise<Session | null> {
+    const session = await this.restoreSession();
+    if (!session || !isExpiringSoon(session)) return session;
+    if (!session.refreshToken) return session;
+    if (!refreshInFlight) {
+      refreshInFlight = this.refreshSession(session).finally(() => {
+        refreshInFlight = null;
+      });
+    }
+    try {
+      return await refreshInFlight;
+    } catch (error) {
+      logger.warn('auth.proactive_refresh_failed', { reason: error instanceof Error ? error.message : 'unknown_error' });
+      return session;
     }
   },
 
@@ -114,6 +161,7 @@ export const AuthService = {
       }
     }
     await Keychain.resetGenericPassword({ service: keychainService });
+    cachedSession = null;
     logger.info('auth.sign_out_completed');
   },
 };

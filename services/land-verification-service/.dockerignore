@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+Dockerfile
+.dockerignore
+data/
+reports_out/

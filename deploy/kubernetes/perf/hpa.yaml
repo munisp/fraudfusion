@@ -1,0 +1,95 @@
+# HorizontalPodAutoscalers for the latency-critical services.
+# CPU-based scaling everywhere; the commented example shows the latency-aware
+# custom-metric variant (requires prometheus-adapter exposing
+# http_server_request_duration_seconds p95 per service).
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: crypto-fraud-detector
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: crypto-fraud-detector }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: investment-fraud-detector
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: investment-fraud-detector }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sim-swap-detector
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: sim-swap-detector }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: advance-fee-fraud-detector
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: advance-fee-fraud-detector }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: aml-monitor
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: aml-monitor }
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ledger-command
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: ledger-command }
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 60 } }
+    # Latency-aware variant (prometheus-adapter required):
+    # - type: Pods
+    #   pods:
+    #     metric:
+    #       name: http_request_duration_p95_seconds
+    #       selector:
+    #         matchLabels: { service: ledger-command }
+    #     target: { type: AverageValue, averageValue: 100m }  # scale when p95 > 100ms
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: orchestrator
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: orchestrator }
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 60 } }

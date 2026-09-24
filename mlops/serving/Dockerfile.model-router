@@ -1,0 +1,31 @@
+# model-router — A/B experiment routing service (port 8200).
+# Serves mlops/serving/model_router.py; experiment YAML mounted via EXPERIMENT_CONFIG.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PORT=8200 \
+    EXPERIMENT_CONFIG=/app/config/experiments.yaml \
+    ROUTER_LOG_DIR=/app/data/router
+
+WORKDIR /app
+
+# Arm URLs are baked at build time; compose/k8s pass in-cluster URLs.
+ARG CHAMPION_URL=http://localhost:8100/v1/aml/score
+ARG CHALLENGER_URL=http://localhost:8101/v1/aml/score
+
+COPY mlops/serving/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY mlops/serving/model_router.py /app/model_router.py
+
+RUN groupadd --system app && useradd --system --gid app app \
+    && mkdir -p /app/config /app/data/router \
+    && printf 'experiment_id: fraud_net_v1_vs_v2\nchampion:\n  name: champion\n  model_name: fraud_net\n  model_version: v1\n  url: %s\nchallenger:\n  name: challenger\n  model_name: fraud_net\n  model_version: v2\n  url: %s\nchallenger_traffic_pct: 10.0\n' "$CHAMPION_URL" "$CHALLENGER_URL" > /app/config/experiments.yaml \
+    && chown -R app:app /app
+USER app:app
+
+EXPOSE 8200
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD python -c "import os,urllib.request;urllib.request.urlopen('http://localhost:'+os.environ.get('PORT','8200')+'/health')" || exit 1
+
+CMD ["python", "/app/model_router.py"]

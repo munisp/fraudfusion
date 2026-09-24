@@ -11,7 +11,9 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -128,7 +130,15 @@ func main() {
 	}
 
 	log.Printf("Crypto Fraud Detector Service starting on port %s", port)
-	if err := r.Run(":" + port); err != nil {
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatal("Failed to start server:", err)
 	}
 }
@@ -141,20 +151,20 @@ func analyzeTransaction(c *gin.Context) {
 	}
 
 	// Perform risk analysis
-	analysis := performRiskAnalysis(&txn)
+	analysis := performRiskAnalysis(c.Request.Context(), &txn)
 
 	// Store in database
-	storeTransactionAnalysis(&txn, analysis)
+	storeTransactionAnalysis(c.Request.Context(), &txn, analysis)
 
 	c.JSON(http.StatusOK, analysis)
 }
 
-func performRiskAnalysis(txn *CryptoTransaction) *CryptoRiskAnalysis {
+func performRiskAnalysis(ctx context.Context, txn *CryptoTransaction) *CryptoRiskAnalysis {
 	riskScore := 0
 	riskFactors := []string{}
 
 	// Check wallet reputation
-	walletRisk := checkWalletReputation(txn.WalletAddress)
+	walletRisk := checkWalletReputation(ctx, txn.WalletAddress)
 	riskScore += walletRisk
 
 	if walletRisk > 70 {
@@ -175,7 +185,7 @@ func performRiskAnalysis(txn *CryptoTransaction) *CryptoRiskAnalysis {
 
 	// Check for P2P trading patterns
 	if strings.Contains(strings.ToLower(txn.Platform), "p2p") {
-		p2pRisk := analyzeP2PRisk(txn)
+		p2pRisk := analyzeP2PRisk(ctx, txn)
 		riskScore += p2pRisk
 		if p2pRisk > 0 {
 			riskFactors = append(riskFactors, "P2P trading risk detected")
@@ -183,7 +193,7 @@ func performRiskAnalysis(txn *CryptoTransaction) *CryptoRiskAnalysis {
 	}
 
 	// Check transaction velocity
-	velocityRisk := checkTransactionVelocity(txn.UserID)
+	velocityRisk := checkTransactionVelocity(ctx, txn.UserID)
 	riskScore += velocityRisk
 	if velocityRisk > 20 {
 		riskFactors = append(riskFactors, "Unusual transaction velocity")
@@ -220,9 +230,8 @@ func performRiskAnalysis(txn *CryptoTransaction) *CryptoRiskAnalysis {
 	}
 }
 
-func checkWalletReputation(address string) int {
+func checkWalletReputation(ctx context.Context, address string) int {
 	// Check cache first
-	ctx := context.Background()
 	cacheKey := fmt.Sprintf("wallet:risk:%s", address)
 
 	if val, err := redisClient.Get(ctx, cacheKey).Result(); err == nil {
@@ -231,9 +240,19 @@ func checkWalletReputation(address string) int {
 		return score
 	}
 
-	// Check database for blacklisted wallets
+	// One round trip: blacklist check + wallet history aggregates.
 	var blacklisted bool
-	db.QueryRow("SELECT EXISTS(SELECT 1 FROM crypto_blacklist WHERE wallet_address = $1)", address).Scan(&blacklisted)
+	var txnCount int
+	var avgAmount float64
+	err := db.QueryRowContext(ctx, `
+		SELECT
+			EXISTS(SELECT 1 FROM crypto_blacklist WHERE wallet_address = $1),
+			(SELECT COUNT(*) FROM crypto_transactions WHERE wallet_address = $1),
+			(SELECT COALESCE(AVG(amount), 0) FROM crypto_transactions WHERE wallet_address = $1)
+	`, address).Scan(&blacklisted, &txnCount, &avgAmount)
+	if err != nil {
+		log.Printf("wallet reputation query failed for %s: %v", address, err)
+	}
 
 	if blacklisted {
 		if err := redisClient.Set(ctx, cacheKey, "100", 24*time.Hour).Err(); err != nil {
@@ -241,15 +260,6 @@ func checkWalletReputation(address string) int {
 		}
 		return 100
 	}
-
-	// Check wallet transaction history
-	var txnCount int
-	var avgAmount float64
-	db.QueryRow(`
-		SELECT COUNT(*), COALESCE(AVG(amount), 0)
-		FROM crypto_transactions
-		WHERE wallet_address = $1
-	`, address).Scan(&txnCount, &avgAmount)
 
 	riskScore := 0
 
@@ -294,32 +304,25 @@ func isLegitimateExchange(platform string) bool {
 	return false
 }
 
-func analyzeP2PRisk(txn *CryptoTransaction) int {
+func analyzeP2PRisk(ctx context.Context, txn *CryptoTransaction) int {
 	riskScore := 0
 
-	// Check for common P2P scam indicators
-
-	// Very new account doing P2P
-	var accountAge int
-	db.QueryRow(`
-		SELECT EXTRACT(DAY FROM NOW() - created_at)
-		FROM users
-		WHERE id = $1
-	`, txn.UserID).Scan(&accountAge)
+	// One round trip: account age + recent P2P velocity.
+	var accountAge, recentP2PCount int
+	err := db.QueryRowContext(ctx, `
+		SELECT
+			COALESCE((SELECT EXTRACT(DAY FROM NOW() - created_at) FROM users WHERE id = $1), 0),
+			(SELECT COUNT(*) FROM crypto_transactions
+				WHERE user_id = $1 AND platform LIKE '%p2p%'
+				AND timestamp >= NOW() - INTERVAL '24 hours')
+	`, txn.UserID).Scan(&accountAge, &recentP2PCount)
+	if err != nil {
+		log.Printf("p2p risk query failed for user %s: %v", txn.UserID, err)
+	}
 
 	if accountAge < 7 {
 		riskScore += 25
 	}
-
-	// Multiple P2P transactions in short time
-	var recentP2PCount int
-	db.QueryRow(`
-		SELECT COUNT(*)
-		FROM crypto_transactions
-		WHERE user_id = $1
-		AND platform LIKE '%p2p%'
-		AND timestamp >= NOW() - INTERVAL '24 hours'
-	`, txn.UserID).Scan(&recentP2PCount)
 
 	if recentP2PCount > 5 {
 		riskScore += 30
@@ -328,22 +331,19 @@ func analyzeP2PRisk(txn *CryptoTransaction) int {
 	return riskScore
 }
 
-func checkTransactionVelocity(userID string) int {
+func checkTransactionVelocity(ctx context.Context, userID string) int {
+	// One scan computing both windows instead of two COUNT(*) round trips.
 	var count24h, count1h int
-
-	db.QueryRow(`
-		SELECT COUNT(*)
+	err := db.QueryRowContext(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE timestamp >= NOW() - INTERVAL '24 hours'),
+			COUNT(*) FILTER (WHERE timestamp >= NOW() - INTERVAL '1 hour')
 		FROM crypto_transactions
-		WHERE user_id = $1
-		AND timestamp >= NOW() - INTERVAL '24 hours'
-	`, userID).Scan(&count24h)
-
-	db.QueryRow(`
-		SELECT COUNT(*)
-		FROM crypto_transactions
-		WHERE user_id = $1
-		AND timestamp >= NOW() - INTERVAL '1 hour'
-	`, userID).Scan(&count1h)
+		WHERE user_id = $1 AND timestamp >= NOW() - INTERVAL '24 hours'
+	`, userID).Scan(&count24h, &count1h)
+	if err != nil {
+		log.Printf("velocity query failed for user %s: %v", userID, err)
+	}
 
 	riskScore := 0
 
@@ -403,12 +403,12 @@ func verifyWallet(c *gin.Context) {
 		return
 	}
 
-	verification := performWalletVerification(req.WalletAddress)
+	verification := performWalletVerification(c.Request.Context(), req.WalletAddress)
 
 	c.JSON(http.StatusOK, verification)
 }
 
-func performWalletVerification(address string) *WalletVerification {
+func performWalletVerification(ctx context.Context, address string) *WalletVerification {
 	// Check if wallet is blacklisted
 	var blacklisted bool
 	db.QueryRow("SELECT EXISTS(SELECT 1 FROM crypto_blacklist WHERE wallet_address = $1)", address).Scan(&blacklisted)
@@ -422,7 +422,7 @@ func performWalletVerification(address string) *WalletVerification {
 	`, address).Scan(&firstSeen, &lastActivity)
 
 	// Calculate risk score
-	riskScore := checkWalletReputation(address)
+	riskScore := checkWalletReputation(ctx, address)
 
 	// Get associated exchanges
 	rows, _ := db.Query(`
@@ -475,7 +475,7 @@ func analyzeP2PTrade(c *gin.Context) {
 		return
 	}
 	alerts := detectP2PFraud(&req)
-	if err := storeP2PAlerts(alerts); err != nil {
+	if err := storeP2PAlerts(c.Request.Context(), alerts); err != nil {
 		log.Printf("failed to persist P2P alerts: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist P2P alerts"})
 		return
@@ -551,17 +551,29 @@ func storeP2PTrade(trade *p2pTradeRequest) error {
 	return err
 }
 
-func storeP2PAlerts(alerts []*P2PTradingAlert) error {
-	for _, alert := range alerts {
-		if _, err := db.Exec(`INSERT INTO p2p_trading_alerts (trade_id, seller_id, buyer_id, amount, currency, alert_type, severity, description, detected_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, alert.TradeID, alert.SellerID, alert.BuyerID, alert.Amount, alert.Currency, alert.AlertType, alert.Severity, alert.Description, alert.DetectedAt); err != nil {
-			return err
-		}
+// storeP2PAlerts inserts all alerts in ONE multi-row statement instead of an
+// N+1 loop of round trips.
+func storeP2PAlerts(ctx context.Context, alerts []*P2PTradingAlert) error {
+	if len(alerts) == 0 {
+		return nil
 	}
-	return nil
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO p2p_trading_alerts (trade_id, seller_id, buyer_id, amount, currency, alert_type, severity, description, detected_at) VALUES `)
+	args := make([]interface{}, 0, len(alerts)*9)
+	for i, alert := range alerts {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		base := i*9 + 1
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)", base, base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8)
+		args = append(args, alert.TradeID, alert.SellerID, alert.BuyerID, alert.Amount, alert.Currency, alert.AlertType, alert.Severity, alert.Description, alert.DetectedAt)
+	}
+	_, err := db.ExecContext(ctx, sb.String(), args...)
+	return err
 }
 
-func storeTransactionAnalysis(txn *CryptoTransaction, analysis *CryptoRiskAnalysis) {
-	_, err := db.Exec(`
+func storeTransactionAnalysis(ctx context.Context, txn *CryptoTransaction, analysis *CryptoRiskAnalysis) {
+	_, err := db.ExecContext(ctx, `
 		INSERT INTO crypto_transactions
 		(id, user_id, wallet_address, cryptocurrency, amount, transaction_type, platform, risk_score, risk_level, flagged, timestamp)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
@@ -572,6 +584,13 @@ func storeTransactionAnalysis(txn *CryptoTransaction, analysis *CryptoRiskAnalys
 	}
 }
 
+// maxBatchSize bounds the batch endpoint so one request cannot queue
+// thousands of analyses; batchWorkers bounds concurrent DB/Redis work.
+const (
+	maxBatchSize = 100
+	batchWorkers = 8
+)
+
 func batchAnalyzeTransactions(c *gin.Context) {
 	var req struct {
 		Transactions []CryptoTransaction `json:"transactions"`
@@ -581,17 +600,32 @@ func batchAnalyzeTransactions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	results := []gin.H{}
-	for _, txn := range req.Transactions {
-		analysis := performRiskAnalysis(&txn)
-		storeTransactionAnalysis(&txn, analysis)
-		results = append(results, gin.H{
-			"transaction_id": txn.ID,
-			"risk_score":     analysis.RiskScore,
-			"flagged":        analysis.Flagged,
-		})
+	if len(req.Transactions) > maxBatchSize {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("batch size exceeds limit of %d", maxBatchSize)})
+		return
 	}
+
+	ctx := c.Request.Context()
+	results := make([]gin.H, len(req.Transactions))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, batchWorkers)
+	for i := range req.Transactions {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			txn := &req.Transactions[i]
+			analysis := performRiskAnalysis(ctx, txn)
+			storeTransactionAnalysis(ctx, txn, analysis)
+			results[i] = gin.H{
+				"transaction_id": txn.ID,
+				"risk_score":     analysis.RiskScore,
+				"flagged":        analysis.Flagged,
+			}
+		}(i)
+	}
+	wg.Wait()
 
 	c.JSON(http.StatusOK, gin.H{
 		"total_analyzed": len(req.Transactions),
@@ -624,7 +658,7 @@ func getTransactionRisk(c *gin.Context) {
 
 func getWalletRisk(c *gin.Context) {
 	address := c.Param("address")
-	verification := performWalletVerification(address)
+	verification := performWalletVerification(c.Request.Context(), address)
 	c.JSON(http.StatusOK, verification)
 }
 
@@ -912,11 +946,27 @@ func initDB() {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
+	// Bound the pool: unlimited connections can exhaust PG max_connections,
+	// and the default of 2 idle connections forces a TLS handshake per query.
+	db.SetMaxOpenConns(getEnvInt("DB_MAX_OPEN_CONNS", 25))
+	db.SetMaxIdleConns(getEnvInt("DB_MAX_IDLE_CONNS", 25))
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
 	if err := withBackoff(func() error { return db.Ping() }); err != nil {
 		log.Fatal("Failed to ping database:", err)
 	}
 
 	log.Println("Database connection established")
+}
+
+func getEnvInt(key string, fallback int) int {
+	if value := os.Getenv(key); value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
 }
 
 func initRedis() {

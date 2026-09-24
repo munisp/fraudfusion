@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/munisp/fraudfusion/orchestrator/go/internal/backoff"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/httpx"
 )
 
 // Client manages routes through the APISIX Admin API.
@@ -37,7 +38,7 @@ func NewClient(adminURL, apiKey string) (*Client, error) {
 	if _, err := url.ParseRequestURI(adminURL); err != nil {
 		return nil, fmt.Errorf("invalid APISIX admin URL: %w", err)
 	}
-	return &Client{adminURL: adminURL, apiKey: apiKey, httpClient: &http.Client{Timeout: 10 * time.Second}}, nil
+	return &Client{adminURL: adminURL, apiKey: apiKey, httpClient: &http.Client{Timeout: 10 * time.Second, Transport: httpx.SharedTransport()}}, nil
 }
 
 // CreateRoute creates or replaces a named APISIX route via PUT /apisix/admin/routes/{id}.

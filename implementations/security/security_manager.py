@@ -8,6 +8,7 @@ authorization, encryption, input validation, and security auditing.
 import hashlib
 import hmac
 import os
+import threading
 import secrets
 import jwt
 import bcrypt
@@ -479,6 +480,8 @@ class SecurityManager:
         self.audit_logger = AuditLogger()
         self.authorization_manager = AuthorizationManager()
         self.database_url = self.config.database_url or os.getenv("DATABASE_URL", "").strip()
+        self._conn_pool = None
+        self._pool_lock = threading.Lock()
         if not self.database_url:
             raise ValueError("DATABASE_URL must be configured for SecurityManager")
 
@@ -580,9 +583,26 @@ class SecurityManager:
 
         return True
 
+    def _pool(self):
+        """Lazily created thread-safe connection pool. Previously every
+        operation opened a brand-new connection (TCP+TLS+auth handshake,
+        ~5-30ms each; authenticate_user made up to 4 per login)."""
+        if self._conn_pool is None:
+            with self._pool_lock:
+                if self._conn_pool is None:
+                    from psycopg2 import pool as _pg_pool
+
+                    self._conn_pool = _pg_pool.ThreadedConnectionPool(
+                        minconn=int(os.environ.get("SECURITY_DB_POOL_MIN", "2")),
+                        maxconn=int(os.environ.get("SECURITY_DB_POOL_MAX", "10")),
+                        dsn=self.database_url,
+                        connect_timeout=5,
+                    )
+        return self._conn_pool
+
     @contextmanager
     def _connection(self):
-        connection = psycopg2.connect(self.database_url, connect_timeout=5)
+        connection = self._pool().getconn()
         try:
             yield connection
             connection.commit()
@@ -590,7 +610,7 @@ class SecurityManager:
             connection.rollback()
             raise
         finally:
-            connection.close()
+            self._pool().putconn(connection)
 
     def _get_user(self, username: str) -> Optional[Dict[str, Any]]:
         """Retrieve only active, unlocked users through a parameterized database query."""

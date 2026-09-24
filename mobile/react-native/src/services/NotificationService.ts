@@ -29,10 +29,19 @@ async function authenticatedHeaders(): Promise<Record<string, string>> {
   return { Authorization: `Bearer ${session.accessToken}` };
 }
 
-const messagingClient = getMessaging();
+// Lazy-init: avoid paying the Firebase native module cost at import/startup
+// time; the client is created on first use (after the first frame).
+type MessagingClient = ReturnType<typeof getMessaging>;
+let messagingClient: MessagingClient | undefined;
+function messaging(): MessagingClient {
+  if (!messagingClient) {
+    messagingClient = getMessaging();
+  }
+  return messagingClient;
+}
 
 async function ensureNotificationPermission(): Promise<void> {
-  const authorization = await requestPermission(messagingClient);
+  const authorization = await requestPermission(messaging());
   const granted = authorization === MessagingAuthorizationStatus.AUTHORIZED
     || authorization === MessagingAuthorizationStatus.PROVISIONAL;
   if (!granted) {
@@ -51,8 +60,8 @@ async function ensureAndroidChannel(): Promise<string> {
 export const NotificationService = {
   async registerCurrentDevice(): Promise<void> {
     await ensureNotificationPermission();
-    await registerDeviceForRemoteMessages(messagingClient);
-    const token = await getToken(messagingClient);
+    await registerDeviceForRemoteMessages(messaging());
+    const token = await getToken(messaging());
     if (!token) {
       throw new Error('Push provider did not return a device token');
     }
@@ -65,19 +74,19 @@ export const NotificationService = {
   },
 
   async unregisterCurrentDevice(): Promise<void> {
-    const token = await getToken(messagingClient);
+    const token = await getToken(messaging());
     if (!token) return;
     await axios.delete(`${apiBaseUrl()}/devices/push-tokens`, {
       headers: await authenticatedHeaders(),
       data: { token, provider: 'fcm' },
       timeout: 10_000,
     });
-    await deleteToken(messagingClient);
+    await deleteToken(messaging());
     logger.info('notifications.device_token_unregistered');
   },
 
   subscribeForegroundMessages(): () => void {
-    return onMessage(messagingClient, async (message: RemoteMessage) => {
+    return onMessage(messaging(), async (message: RemoteMessage) => {
       await this.displayForegroundMessage(message);
     });
   },

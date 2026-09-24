@@ -12,6 +12,9 @@ DATABASE_URL points at a postgres instance (requires psycopg).
 from __future__ import annotations
 
 import asyncio
+import os
+import threading
+from contextlib import contextmanager
 import hashlib
 import os
 import sqlite3
@@ -61,14 +64,48 @@ class VerificationStore:
                 ) from exc
         else:
             Path(DEFAULT_SQLITE_PATH).parent.mkdir(parents=True, exist_ok=True)
+
+        # Connection pooling: previously every state transition opened and
+        # closed a brand-new connection (6+ connect/query/close cycles per
+        # verification, each a TCP+TLS+auth handshake on PostgreSQL).
+        self._pool = None
+        self._sqlite_conn = None
+        self._sqlite_lock = threading.Lock()
+        if self._pg:
+            try:
+                from psycopg_pool import ConnectionPool
+
+                self._pool = ConnectionPool(
+                    self.database_url,
+                    min_size=1,
+                    max_size=int(os.getenv("DB_POOL_MAX", "4")),
+                    open=False,
+                )
+                self._pool.open()
+            except ImportError:
+                pass  # fall back to per-call connections below
+        else:
+            self._sqlite_conn = sqlite3.connect(DEFAULT_SQLITE_PATH, check_same_thread=False)
         self._init_schema()
 
-    def _connect(self):
-        if self._pg:
+    @contextmanager
+    def _connection(self):
+        # Yield a pooled PostgreSQL connection or the shared SQLite
+        # connection (serialized on a lock; SQLite serializes anyway).
+        if self._pool is not None:
+            with self._pool.connection() as conn:
+                yield conn
+        elif self._pg:
             import psycopg
 
-            return psycopg.connect(self.database_url)
-        return sqlite3.connect(DEFAULT_SQLITE_PATH)
+            conn = psycopg.connect(self.database_url)
+            try:
+                yield conn
+            finally:
+                conn.close()
+        else:
+            with self._sqlite_lock:
+                yield self._sqlite_conn
 
     @staticmethod
     def _placeholder(is_pg: bool) -> str:
@@ -77,8 +114,7 @@ class VerificationStore:
     def _init_schema(self) -> None:
         ph = self._placeholder(self._pg)
         id_col = "SERIAL PRIMARY KEY" if self._pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 f"""
@@ -103,8 +139,6 @@ class VerificationStore:
                 """
             )
             conn.commit()
-        finally:
-            conn.close()
 
     def record_transition(
         self,
@@ -119,8 +153,7 @@ class VerificationStore:
                 f"Illegal transition {from_status.value} -> {to_status.value}"
             )
         ph = self._placeholder(self._pg)
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             conn.cursor().execute(
                 f"INSERT INTO verification_states "
                 f"(verification_id, from_status, to_status, reason, actor, created_at) "
@@ -135,12 +168,9 @@ class VerificationStore:
                 ),
             )
             conn.commit()
-        finally:
-            conn.close()
 
     def current_status(self, verification_id: str) -> Optional[VerificationStatus]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT to_status FROM verification_states WHERE verification_id = %s"
@@ -152,12 +182,9 @@ class VerificationStore:
             )
             row = cur.fetchone()
             return VerificationStatus(row[0]) if row else None
-        finally:
-            conn.close()
 
     def history(self, verification_id: str) -> list[dict[str, Any]]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT from_status, to_status, reason, actor, created_at "
@@ -177,13 +204,10 @@ class VerificationStore:
                 }
                 for row in cur.fetchall()
             ]
-        finally:
-            conn.close()
 
     def save_result(self, verification_id: str, payload: str) -> None:
         ph = self._placeholder(self._pg)
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             cur = conn.cursor()
             if self._pg:
                 cur.execute(
@@ -200,12 +224,9 @@ class VerificationStore:
                     (verification_id, payload, datetime.utcnow().isoformat()),
                 )
             conn.commit()
-        finally:
-            conn.close()
 
     def load_result(self, verification_id: str) -> Optional[str]:
-        conn = self._connect()
-        try:
+        with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT payload FROM verification_results WHERE verification_id = %s"
@@ -215,8 +236,6 @@ class VerificationStore:
             )
             row = cur.fetchone()
             return row[0] if row else None
-        finally:
-            conn.close()
 
 
 class VerificationWorkflow:
@@ -225,6 +244,13 @@ class VerificationWorkflow:
     def __init__(self, store: Optional[VerificationStore] = None):
         self.store = store or VerificationStore()
 
+    async def _record(self, *args) -> None:
+        # Pooled but still blocking driver calls; keep them off the event loop.
+        await asyncio.to_thread(self.store.record_transition, *args)
+
+    async def _save(self, *args) -> None:
+        await asyncio.to_thread(self.store.save_result, *args)
+
     async def verify_document(
         self, file_data: bytes, request: VerificationRequest
     ) -> VerificationResult:
@@ -232,33 +258,33 @@ class VerificationWorkflow:
         vid = request.verification_id
         doc_type = request.document_upload.document_type
 
-        self.store.record_transition(vid, None, VerificationStatus.RECEIVED, "document uploaded")
+        await self._record(vid, None, VerificationStatus.RECEIVED, "document uploaded")
 
         # ---- Document analysis (OCR + structure checks) ---------------------
-        self.store.record_transition(
+        await self._record(
             vid, VerificationStatus.RECEIVED, VerificationStatus.DOCUMENT_ANALYSIS, "OCR started"
         )
-        extracted, ocr_confidence = await self._analyze_document(file_data, doc_type)
+        extracted, ocr_confidence = await asyncio.to_thread(self._analyze_document_sync, file_data, doc_type)
 
         # ---- Fraud screening on the extracted content -----------------------
         fraud = self._detect_fraud(file_data, extracted, ocr_confidence)
         if fraud["fraud_probability"] >= 0.8:
-            self.store.record_transition(
+            await self._record(
                 vid,
                 VerificationStatus.DOCUMENT_ANALYSIS,
                 VerificationStatus.FRAUD_REVIEW,
                 "high fraud probability",
             )
-            self.store.record_transition(
+            await self._record(
                 vid, VerificationStatus.FRAUD_REVIEW, VerificationStatus.REJECTED, "auto-rejected"
             )
             rejected = self._result(vid, VerificationStatus.REJECTED, doc_type, extracted,
                                     ocr_confidence, fraud, started)
-            self.store.save_result(vid, rejected.model_dump_json())
+            await self._save(vid, rejected.model_dump_json())
             return rejected
 
         # ---- Land registry lookup -------------------------------------------
-        self.store.record_transition(
+        await self._record(
             vid, VerificationStatus.DOCUMENT_ANALYSIS, VerificationStatus.REGISTRY_LOOKUP,
             "registry query",
         )
@@ -272,13 +298,13 @@ class VerificationWorkflow:
         registry_ok = registry.get("registered", False)
         if not registry_ok:
             # Unregistered parcels need a physical site inspection before a verdict.
-            self.store.record_transition(
+            await self._record(
                 vid, VerificationStatus.REGISTRY_LOOKUP, VerificationStatus.SITE_INSPECTION,
                 "registry miss; inspection required",
             )
             status = VerificationStatus.SITE_INSPECTION
         else:
-            self.store.record_transition(
+            await self._record(
                 vid, VerificationStatus.REGISTRY_LOOKUP, VerificationStatus.COMPLETED,
                 "registry match",
             )
@@ -291,7 +317,7 @@ class VerificationWorkflow:
         result.coordinate_verification = coordinates
         result.parcel = self._parcel_from(extracted, request)
         result.parties = self._parties_from(extracted)
-        self.store.save_result(vid, result.model_dump_json())
+        await self._save(vid, result.model_dump_json())
         return result
 
     async def batch_verify(
@@ -308,7 +334,7 @@ class VerificationWorkflow:
         return self.store.history(verification_id)
 
     # ------------------------------------------------------------------ steps
-    async def _analyze_document(
+    def _analyze_document_sync(
         self, file_data: bytes, doc_type: DocumentType
     ) -> tuple[dict[str, Any], float]:
         """Extract structured data from the document.
@@ -317,7 +343,6 @@ class VerificationWorkflow:
         plug in an OCR engine here). Confidence is derived from how much
         machine-readable content the file carries.
         """
-        await asyncio.sleep(0)  # keep the pipeline async
         text = file_data.decode("utf-8", errors="ignore")
         extracted: dict[str, Any] = {"document_type": doc_type.value}
         for marker, key in (

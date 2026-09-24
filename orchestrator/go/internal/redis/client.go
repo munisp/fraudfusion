@@ -61,6 +61,13 @@ func (c *Client) SetJSON(ctx context.Context, key string, value interface{}, ttl
 	return c.rdb.Set(ctx, c.key(key), raw, ttl).Err()
 }
 
+// PushOutbox appends a raw payload to the durable outbox list. It is the
+// fallback sink for Kafka publishes that exhaust retries: a relayer can drain
+// the list and republish without losing the event.
+func (c *Client) PushOutbox(ctx context.Context, list string, payload []byte) error {
+	return c.rdb.RPush(ctx, c.key(list), payload).Err()
+}
+
 // Ping reports whether Redis answers; used by /health.
 func (c *Client) Ping(ctx context.Context) error {
 	if err := c.rdb.Ping(ctx).Err(); err != nil {

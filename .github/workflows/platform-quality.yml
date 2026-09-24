@@ -1,0 +1,109 @@
+name: Platform Quality Gates (Python, Web, Containers)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Compile-check every Python module
+        run: |
+          set -euo pipefail
+          python -m compileall -q ml mlops services/python services/land-verification-service
+      - name: onboarding-service unit tests (SQLite backend)
+        working-directory: services/python/onboarding-service
+        run: |
+          pip install -r requirements-dev.txt
+          python -m pytest tests/ -q
+      - name: Python detectors install + compile
+        run: |
+          set -euo pipefail
+          pip install -r services/python/account-takeover-detector/requirements.txt
+          pip install -r services/python/identity-theft-detector/requirements.txt
+      - name: land-verification-service install + import check
+        run: |
+          set -euo pipefail
+          pip install -r services/land-verification-service/requirements.txt
+          cd services/land-verification-service && python -c "from api.main import app"
+      - name: mlops serving install + import check
+        run: |
+          set -euo pipefail
+          pip install -r mlops/serving/requirements.txt
+          python -c "import importlib.util as u; \
+          [u.spec_from_file_location(m, f'mlops/serving/{m}.py') for m in ('aml_service', 'model_router')]"
+      - name: ml lane smoke tests
+        run: |
+          set -euo pipefail
+          pip install -r ml/requirements.txt
+          python -m pytest ml/tests -q
+
+  web-frontend-build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - frontend
+          - frontend/kyc-frontend
+          - implementations/backoffice-ui
+          - ml-onboarding-portal
+    defaults:
+      run:
+        working-directory: ${{ matrix.app }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: npm
+          cache-dependency-path: ${{ matrix.app }}/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build
+
+  docker-build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Go services (context = module dir)
+          - { name: aml-monitor, context: services/go/aml-monitor, dockerfile: services/go/aml-monitor/Dockerfile }
+          - { name: crypto-fraud-detector, context: services/go/crypto-fraud-detector, dockerfile: services/go/crypto-fraud-detector/Dockerfile }
+          - { name: investment-fraud-detector, context: services/go/investment-fraud-detector, dockerfile: services/go/investment-fraud-detector/Dockerfile }
+          - { name: sim-swap-detector, context: services/go/sim-swap-detector, dockerfile: services/go/sim-swap-detector/Dockerfile }
+          - { name: advance-fee-fraud-detector, context: services/go/advance-fee-fraud-detector, dockerfile: services/go/advance-fee-fraud-detector/Dockerfile }
+          - { name: chargeback-fraud-detector, context: services/go/chargeback-fraud-detector, dockerfile: services/go/chargeback-fraud-detector/Dockerfile }
+          - { name: insider-fraud-detector, context: services/go/insider-fraud-detector, dockerfile: services/go/insider-fraud-detector/Dockerfile }
+          - { name: temporal-orchestrator, context: services/go/temporal-orchestrator, dockerfile: services/go/temporal-orchestrator/Dockerfile }
+          - { name: orchestrator, context: orchestrator/go, dockerfile: orchestrator/go/Dockerfile }
+          # Python services
+          - { name: aml-ml-service, context: ., dockerfile: mlops/serving/Dockerfile }
+          - { name: model-router, context: ., dockerfile: mlops/serving/Dockerfile.model-router }
+          - { name: account-takeover-detector, context: services/python/account-takeover-detector, dockerfile: services/python/account-takeover-detector/Dockerfile }
+          - { name: identity-theft-detector, context: services/python/identity-theft-detector, dockerfile: services/python/identity-theft-detector/Dockerfile }
+          - { name: onboarding-service, context: services/python/onboarding-service, dockerfile: services/python/onboarding-service/Dockerfile }
+          - { name: land-verification-service, context: services/land-verification-service, dockerfile: services/land-verification-service/Dockerfile }
+          # Web frontends
+          - { name: journey-dashboard, context: frontend, dockerfile: frontend/Dockerfile }
+          - { name: kyc-frontend, context: frontend/kyc-frontend, dockerfile: frontend/kyc-frontend/Dockerfile }
+          - { name: backoffice-ui, context: implementations/backoffice-ui, dockerfile: implementations/backoffice-ui/Dockerfile }
+          - { name: ml-onboarding-portal, context: ml-onboarding-portal, dockerfile: ml-onboarding-portal/Dockerfile }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ${{ matrix.name }} image
+        run: >-
+          docker build --pull
+          --file ${{ matrix.dockerfile }}
+          --tag fraudfusion/${{ matrix.name }}:ci
+          ${{ matrix.context }}

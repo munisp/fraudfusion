@@ -14,19 +14,40 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/munisp/fraudfusion/orchestrator/go/internal/backoff"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/httpx"
 )
 
 //go:embed schema.perm
 var schema string
+
+const (
+	// decisionCacheTTL briefly caches allow/deny decisions. Short enough that
+	// relationship changes propagate within seconds; long enough to take the
+	// Permify round trip off the hot path for repeated journey executions.
+	decisionCacheTTL     = 10 * time.Second
+	decisionCacheMaxSize = 50000
+)
+
+type decisionEntry struct {
+	allowed   bool
+	expiresAt time.Time
+}
 
 // Client calls the Permify REST endpoints.
 type Client struct {
 	apiURL     string
 	apiKey     string
 	httpClient *http.Client
+
+	decisionMu sync.Mutex
+	decisions  map[string]*decisionEntry
+	group      singleflight.Group
 }
 
 // NewClient validates the Permify configuration. The API key is required:
@@ -42,7 +63,12 @@ func NewClient(apiURL, apiKey string) (*Client, error) {
 	if _, err := url.ParseRequestURI(apiURL); err != nil {
 		return nil, fmt.Errorf("invalid Permify API URL: %w", err)
 	}
-	return &Client{apiURL: apiURL, apiKey: apiKey, httpClient: &http.Client{Timeout: 5 * time.Second}}, nil
+	return &Client{
+		apiURL:     apiURL,
+		apiKey:     apiKey,
+		httpClient: &http.Client{Timeout: 5 * time.Second, Transport: httpx.SharedTransport()},
+		decisions:  make(map[string]*decisionEntry),
+	}, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, payload interface{}) ([]byte, error) {
@@ -93,6 +119,66 @@ func (c *Client) CheckPermission(ctx context.Context, tenantID, userID, resource
 		return false, fmt.Errorf("tenant, user, resource, and action are required")
 	}
 
+	cacheKey := tenantID + "|" + userID + "|" + resourceID + "|" + action
+	if allowed, ok := c.lookupDecision(cacheKey); ok {
+		return allowed, nil
+	}
+
+	result, err, _ := c.group.Do(cacheKey, func() (interface{}, error) {
+		if allowed, ok := c.lookupDecision(cacheKey); ok {
+			return allowed, nil
+		}
+		allowed, err := c.checkPermissionUncached(ctx, tenantID, userID, resourceID, action)
+		if err != nil {
+			// Fail closed and do NOT cache failures: a Permify blip must not
+			// pin denials, and singleflight still dedupes the concurrent burst.
+			return false, err
+		}
+		c.storeDecision(cacheKey, allowed)
+		return allowed, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
+func (c *Client) lookupDecision(key string) (bool, bool) {
+	c.decisionMu.Lock()
+	defer c.decisionMu.Unlock()
+	entry, ok := c.decisions[key]
+	if !ok || time.Now().After(entry.expiresAt) {
+		return false, false
+	}
+	return entry.allowed, true
+}
+
+func (c *Client) storeDecision(key string, allowed bool) {
+	c.decisionMu.Lock()
+	defer c.decisionMu.Unlock()
+	if len(c.decisions) >= decisionCacheMaxSize {
+		now := time.Now()
+		for k, e := range c.decisions {
+			if now.After(e.expiresAt) {
+				delete(c.decisions, k)
+			}
+		}
+		if len(c.decisions) >= decisionCacheMaxSize {
+			return
+		}
+	}
+	c.decisions[key] = &decisionEntry{allowed: allowed, expiresAt: time.Now().Add(decisionCacheTTL)}
+}
+
+// InvalidateDecisions drops all cached decisions; call after relationship
+// writes when immediate propagation is required.
+func (c *Client) InvalidateDecisions() {
+	c.decisionMu.Lock()
+	defer c.decisionMu.Unlock()
+	c.decisions = make(map[string]*decisionEntry)
+}
+
+func (c *Client) checkPermissionUncached(ctx context.Context, tenantID, userID, resourceID, action string) (bool, error) {
 	payload := map[string]interface{}{
 		"metadata": map[string]interface{}{
 			"snap_token":     "",

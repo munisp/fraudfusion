@@ -1,5 +1,6 @@
 import axios, { AxiosHeaders, InternalAxiosRequestConfig } from 'axios';
 import { AuthService } from './AuthService';
+import { logger } from './logger';
 
 export interface DashboardSummary { openCases: number; pendingKyc: number; unreadNotifications: number; riskLevel: 'low' | 'medium' | 'high'; }
 export interface KycSession { id: string; status: 'created' | 'documents_required' | 'biometric_required' | 'video_required' | 'under_review' | 'approved' | 'rejected'; updatedAt: string; decisionReason?: string; }
@@ -15,9 +16,19 @@ function apiBaseUrl(): string {
   return baseUrl.replace(/\/$/, '');
 }
 
-const client = axios.create({ timeout: 15_000 });
+// Per-class timeouts: reads fail fast, mutations get room, uploads get the most.
+const GET_TIMEOUT_MS = 10_000;
+const MUTATION_TIMEOUT_MS = 15_000;
+const UPLOAD_TIMEOUT_MS = 60_000;
+// Bounded retry for idempotent GETs only (exponential backoff: 250ms, 500ms).
+const MAX_GET_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 250;
+
+const client = axios.create({ timeout: GET_TIMEOUT_MS });
 client.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
-  const session = await AuthService.restoreSession();
+  // Session is served from an in-memory cache (no Keychain bridge call per
+  // request) and proactively refreshed before expiry.
+  const session = await AuthService.getValidSession();
   if (!session) throw new Error('Authenticated session required');
   config.baseURL = apiBaseUrl();
   config.headers = AxiosHeaders.from(config.headers);
@@ -26,19 +37,65 @@ client.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
   return config;
 });
 
+// In-flight GET dedup: rapid tab switches re-mount screens that fire identical
+// GETs; concurrent callers share a single network request.
+const inFlightGets = new Map<string, Promise<unknown>>();
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryable(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  // Network failure / timeout, or a transient server error.
+  if (!error.response) return true;
+  return error.response.status >= 500;
+}
+
+async function get<T>(path: string, timeoutMs: number = GET_TIMEOUT_MS): Promise<T> {
+  const key = `GET ${path}`;
+  const existing = inFlightGets.get(key);
+  if (existing) return existing as Promise<T>;
+
+  const request = (async (): Promise<T> => {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return (await client.get(path, { timeout: timeoutMs })).data as T;
+      } catch (error) {
+        if (attempt >= MAX_GET_ATTEMPTS || !isRetryable(error)) throw error;
+        const delayMs = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+        logger.warn('api.get_retry_scheduled', { path, attempt, delayMs });
+        await sleep(delayMs);
+      }
+    }
+  })();
+
+  inFlightGets.set(key, request);
+  try {
+    return await request;
+  } finally {
+    inFlightGets.delete(key);
+  }
+}
+
+async function send<T>(method: 'post' | 'patch', path: string, body?: unknown, timeoutMs: number = MUTATION_TIMEOUT_MS): Promise<T> {
+  // Mutations are never auto-retried (not idempotent) and never deduped.
+  return (await client[method](path, body, { timeout: timeoutMs })).data as T;
+}
+
 export const MobileApi = {
-  dashboard: async (): Promise<DashboardSummary> => (await client.get('/mobile/dashboard')).data,
-  profile: async (): Promise<Profile> => (await client.get('/auth/me')).data,
-  updateProfile: async (payload: Partial<Profile>): Promise<Profile> => (await client.patch('/mobile/profile', payload)).data,
-  notifications: async (): Promise<NotificationRecord[]> => (await client.get('/notifications')).data,
-  markNotificationRead: async (id: string): Promise<void> => { await client.post(`/notifications/${id}/read`); },
-  alerts: async (): Promise<FraudAlert[]> => (await client.get('/mobile/fraud-alerts')).data,
-  documents: async (): Promise<DocumentRecord[]> => (await client.get('/documents')).data,
-  createKycSession: async (): Promise<KycSession> => (await client.post('/kyc/sessions')).data,
-  kycSession: async (id: string): Promise<KycSession> => (await client.get(`/kyc/sessions/${id}`)).data,
-  beginDocumentUpload: async (sessionId: string, documentType: string, name: string): Promise<{ uploadUrl: string; documentId: string }> => (await client.post(`/kyc/sessions/${sessionId}/documents`, { documentType, name })).data,
-  completeDocumentUpload: async (sessionId: string, documentId: string): Promise<KycSession> => (await client.post(`/kyc/sessions/${sessionId}/documents/${documentId}/complete`)).data,
-  biometricChallenge: async (sessionId: string): Promise<{ challengeId: string; prompt: string }> => (await client.post(`/kyc/sessions/${sessionId}/biometric-challenge`)).data,
-  submitBiometric: async (sessionId: string, challengeId: string): Promise<KycSession> => (await client.post(`/kyc/sessions/${sessionId}/biometric-challenge/${challengeId}/complete`)).data,
-  submitVideoKyc: async (sessionId: string, videoReference: string): Promise<KycSession> => (await client.post(`/kyc/sessions/${sessionId}/video`, { videoReference })).data,
+  dashboard: (): Promise<DashboardSummary> => get('/mobile/dashboard'),
+  profile: (): Promise<Profile> => get('/auth/me'),
+  updateProfile: (payload: Partial<Profile>): Promise<Profile> => send('patch', '/mobile/profile', payload),
+  notifications: (): Promise<NotificationRecord[]> => get('/notifications'),
+  markNotificationRead: async (id: string): Promise<void> => { await send('post', `/notifications/${id}/read`); },
+  alerts: (): Promise<FraudAlert[]> => get('/mobile/fraud-alerts'),
+  documents: (): Promise<DocumentRecord[]> => get('/documents'),
+  createKycSession: (): Promise<KycSession> => send('post', '/kyc/sessions'),
+  kycSession: (id: string): Promise<KycSession> => get(`/kyc/sessions/${id}`),
+  beginDocumentUpload: (sessionId: string, documentType: string, name: string): Promise<{ uploadUrl: string; documentId: string }> => send('post', `/kyc/sessions/${sessionId}/documents`, { documentType, name }, UPLOAD_TIMEOUT_MS),
+  completeDocumentUpload: (sessionId: string, documentId: string): Promise<KycSession> => send('post', `/kyc/sessions/${sessionId}/documents/${documentId}/complete`, undefined, UPLOAD_TIMEOUT_MS),
+  biometricChallenge: (sessionId: string): Promise<{ challengeId: string; prompt: string }> => send('post', `/kyc/sessions/${sessionId}/biometric-challenge`),
+  submitBiometric: (sessionId: string, challengeId: string): Promise<KycSession> => send('post', `/kyc/sessions/${sessionId}/biometric-challenge/${challengeId}/complete`),
+  submitVideoKyc: (sessionId: string, videoReference: string): Promise<KycSession> => send('post', `/kyc/sessions/${sessionId}/video`, { videoReference }, UPLOAD_TIMEOUT_MS),
 };

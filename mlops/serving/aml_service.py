@@ -19,6 +19,8 @@ never silent: /health and every response carry ``"model_mode": "rule_fallback"``
 
 from __future__ import annotations
 
+import asyncio
+
 import json
 import logging
 import math
@@ -341,7 +343,10 @@ async def score(req: AMLScoreRequest, request: Request) -> AMLScoreResponse:
     features = build_features(req)
 
     infer_start = time.perf_counter()
-    risk = model.predict_proba(features, req.categoricals)
+    # ORT releases the GIL for native compute but the call still occupies the
+    # coroutine thread; run it in a worker thread so concurrent requests
+    # don't serialize on one uvicorn worker.
+    risk = await asyncio.to_thread(model.predict_proba, features, req.categoricals)
     infer_ms = (time.perf_counter() - infer_start) * 1000
 
     level = risk_band(risk)
@@ -378,7 +383,63 @@ async def score(req: AMLScoreRequest, request: Request) -> AMLScoreResponse:
     )
 
 
+
+
+class AMLBatchScoreRequest(BaseModel):
+    transactions: list[AMLScoreRequest] = Field(min_length=1, max_length=500)
+
+
+class AMLBatchScoreResponse(BaseModel):
+    results: list[AMLScoreResponse]
+    count: int
+
+
+@app.post("/v1/aml/score:batch", response_model=AMLBatchScoreResponse)
+async def score_batch(req: AMLBatchScoreRequest, request: Request) -> AMLBatchScoreResponse:
+    """Batch scoring: one round trip for up to 500 transactions. The aml
+    monitor's batch endpoint previously looped over single-score calls."""
+    model: FraudModel = request.app.state.model
+
+    def _score_one(item: AMLScoreRequest) -> AMLScoreResponse:
+        start = time.perf_counter()
+        features = build_features(item)
+        risk = model.predict_proba(features, item.categoricals)
+        level = risk_band(risk)
+        flagged = risk >= MEDIUM_RISK_THRESHOLD
+        sar_required = risk >= HIGH_RISK_THRESHOLD
+        recommendation = (
+            "file_sar_and_block" if sar_required
+            else "step_up_verification" if flagged
+            else "allow"
+        )
+        latency_ms = (time.perf_counter() - start) * 1000
+        return AMLScoreResponse(
+            transaction_id=item.transaction_id,
+            risk_score=round(risk, 6),
+            risk_level=level,
+            flagged=flagged,
+            sar_required=sar_required,
+            recommendation=recommendation,
+            model_mode=model.model_mode,
+            model_name=MODEL_NAME,
+            model_version=MODEL_VERSION,
+            latency_ms=round(latency_ms, 3),
+            detailed_scores={"fraud_probability": round(risk, 6), "inference_ms": round(latency_ms, 3)},
+        )
+
+    results = await asyncio.to_thread(lambda: [_score_one(item) for item in req.transactions])
+    request.app.state.requests_served += len(results)
+    return AMLBatchScoreResponse(results=results, count=len(results))
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8100")))
+    uvicorn.run(
+        "aml_service:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8100")),
+        workers=int(os.getenv("UVICORN_WORKERS", "4")),
+        loop="uvloop",
+        http="httptools",
+    )

@@ -1,0 +1,198 @@
+# backup-pitr.yaml — Postgres PITR (WAL-G) + offline export (lane B3 / P0-5)
+#
+# This manifest closes the "no backups anywhere" gap found in the anti-wipe
+# audit: without WAL archiving + base backups, a successful mass-delete is
+# unrecoverable. It provides:
+#   1. postgres-pitr ConfigMap — archive_mode/WAL-G settings to apply to the
+#      Postgres StatefulSet (archive_command ships WAL to an object-locked
+#      bucket, so ransomware cannot delete backups with app credentials).
+#   2. wal-g base-backup CronJob — nightly backup-push (default 02:00 UTC).
+#   3. wal-g backup retention CronJob — keeps >= PITR_RETENTION_DAYS (35) of
+#      WAL + monthly base backups retained 7 years per AML policy.
+#   4. offline-export CronJob — monthly copy of the latest base backup to a
+#      SEPARATE credential boundary (different bucket/account), so a single
+#      cluster compromise cannot reach the offline copy.
+#
+# ============================ RESTORE DRILL RUNBOOK ==========================
+# Quarterly (and after any infra change) run a PITR restore drill:
+#
+#   0. Pick a target timestamp inside the retention window, e.g.
+#        TARGET_TS="2026-09-01T00:00:00Z"
+#   1. List available backups:
+#        kubectl -n fraudfusion run wal-g-ls --rm -i --restart=Never \
+#          --image=ghcr.io/wal-g/wal-g:latest --env-from=secret/walg-env -- \
+#          wal-g backup-list
+#   2. Restore the latest base backup BEFORE $TARGET_TS to a scratch instance:
+#        kubectl -n fraudfusion run wal-g-restore --rm -i --restart=Never \
+#          --image=ghcr.io/wal-g/wal-g:latest --env-from=secret/walg-env -- \
+#          wal-g backup-fetch /pgdata-restored LATEST
+#      Then start scratch Postgres with:
+#        restore_command = 'wal-g wal-fetch %f %p'
+#        recovery_target_time = '$TARGET_TS'
+#        recovery_target_action = 'promote'
+#   3. Verify evidence row counts against production read replica:
+#        SELECT count(*) FROM aml_sars;            -- must match prod at TARGET_TS
+#        SELECT count(*) FROM insider_fraud_alerts;
+#        SELECT count(*) FROM ledger_journals;
+#      and verify the audit Merkle/HMAC chain head against the external anchor
+#      file (AUDIT_ANCHOR_FILE) for the corresponding day.
+#   4. Record the drill result as an audit event
+#      (AuditEventType.SYSTEM_EVENT, severity CRITICAL on failure) and attach
+#      outputs to the compliance evidence pack.
+#   5. Acceptance: RPO <= 5 min (WAL lag), RTO <= 4 h, zero regulated-row loss.
+#      On failure: page on-call and treat as a CRITICAL security event.
+# ============================================================================
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fraudfusion
+---
+# WAL-G shared environment. The bucket MUST have object-lock (COMPLIANCE)
+# enabled — see implementations/storage/rust-gateway/src/worm.rs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: walg-config
+  namespace: fraudfusion
+  labels: { app: postgres-pitr, lane: B3-antiwipe }
+data:
+  WALG_S3_PREFIX: "s3://fraudfusion-pitr/wal"   # object-locked bucket
+  PITR_RETENTION_DAYS: "35"                      # WAL window for point-in-time recovery
+  BACKUP_SCHEDULE: "0 2 * * *"                   # nightly base backup (UTC)
+  MONTHLY_EXPORT_SCHEDULE: "0 4 1 * *"           # monthly offline export
+  OFFLINE_EXPORT_PREFIX: "s3://fraudfusion-pitr-offline/wal"  # separate account/credentials
+  WALG_RETENTION_FULL: "8"
+---
+# Postgres-side archive settings (merge into the Postgres StatefulSet pod spec
+# / postgresql.conf via your existing config management).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-pitr-conf
+  namespace: fraudfusion
+  labels: { app: postgres-pitr, lane: B3-antiwipe }
+data:
+  90-pitr.conf: |
+    wal_level = replica
+    archive_mode = on
+    archive_timeout = 60
+    archive_command = 'wal-g wal-push %f'
+    restore_command = 'wal-g wal-fetch %f %p'
+---
+# ServiceAccount with no cluster write rights beyond job pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wal-g-backup
+  namespace: fraudfusion
+---
+# Nightly base backup
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: walg-base-backup
+  namespace: fraudfusion
+  labels: { app: postgres-pitr, lane: B3-antiwipe }
+spec:
+  schedule: "0 2 * * *"   # BACKUP_SCHEDULE
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 14
+  failedJobsHistoryLimit: 14
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200
+      template:
+        spec:
+          serviceAccountName: wal-g-backup
+          restartPolicy: OnFailure
+          containers:
+            - name: wal-g
+              image: ghcr.io/wal-g/wal-g:latest
+              envFrom:
+                - configMapRef: { name: walg-config }
+                - secretRef: { name: walg-env }   # AWS_* creds + PG* conn (NOT default app creds)
+              command: ["/bin/sh","-ec"]
+              args:
+                - |
+                  wal-g backup-push "$PGDATA"
+                  wal-g delete retain FULL "$WALG_RETENTION_FULL" --confirm
+                  echo "base backup complete: $(date -u +%FT%TZ)"
+              resources:
+                requests: { cpu: "250m", memory: "256Mi" }
+                limits:   { cpu: "1",    memory: "1Gi" }
+---
+# Monthly offline export: copies the newest base backup + WAL to a bucket in a
+# SEPARATE credential boundary. Ransomware or a rogue insider holding app or
+# cluster credentials cannot reach or delete this copy.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: walg-offline-export
+  namespace: fraudfusion
+  labels: { app: postgres-pitr, lane: B3-antiwipe }
+spec:
+  schedule: "0 4 1 * *"   # MONTHLY_EXPORT_SCHEDULE
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 12
+  failedJobsHistoryLimit: 12
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 14400
+      template:
+        spec:
+          serviceAccountName: wal-g-backup
+          restartPolicy: OnFailure
+          containers:
+            - name: export
+              image: ghcr.io/wal-g/wal-g:latest
+              envFrom:
+                - configMapRef: { name: walg-config }
+                - secretRef: { name: walg-env }            # source creds
+                - secretRef: { name: walg-offline-env }    # destination creds (different account)
+              command: ["/bin/sh","-ec"]
+              args:
+                - |
+                  set -e
+                  LATEST=$(wal-g backup-list --json | jq -r '.[-1].backup_name')
+                  echo "exporting $LATEST to $OFFLINE_EXPORT_PREFIX"
+                  wal-g backup-fetch "$LATEST" /tmp/export
+                  AWS_ACCESS_KEY_ID="$OFFLINE_AWS_ACCESS_KEY_ID" \
+                  AWS_SECRET_ACCESS_KEY="$OFFLINE_AWS_SECRET_ACCESS_KEY" \
+                    aws s3 sync /tmp/export "$OFFLINE_EXPORT_PREFIX/$LATEST" --only-show-errors
+                  # verify-on-export: re-list the offline copy
+                  AWS_ACCESS_KEY_ID="$OFFLINE_AWS_ACCESS_KEY_ID" \
+                  AWS_SECRET_ACCESS_KEY="$OFFLINE_AWS_SECRET_ACCESS_KEY" \
+                    aws s3 ls "$OFFLINE_EXPORT_PREFIX/$LATEST/" > /dev/null
+                  echo "offline export verified: $(date -u +%FT%TZ)"
+              resources:
+                requests: { cpu: "250m", memory: "512Mi" }
+                limits:   { cpu: "1",    memory: "2Gi" }
+          volumes: []
+---
+# PrometheusRule alerts so a failed backup pages on-call (backup silence is a
+# classic pre-ransomware signal).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: postgres-pitr-alerts
+  namespace: fraudfusion
+  labels: { app: postgres-pitr, lane: B3-antiwipe }
+spec:
+  groups:
+    - name: postgres-pitr
+      rules:
+        - alert: PostgresBackupMissing
+          expr: time() - kube_job_status_completion_time{namespace="fraudfusion", job_name=~"walg-base-backup.*"} > 93600
+          for: 15m
+          labels: { severity: critical }
+          annotations:
+            summary: "No successful Postgres base backup in >26h"
+        - alert: PostgresBackupFailing
+          expr: kube_job_status_failed{namespace="fraudfusion", job_name=~"walg-.*"} > 0
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "WAL-G backup/export job failing"

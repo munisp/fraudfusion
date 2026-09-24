@@ -2,14 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,10 +22,37 @@ import (
 // Keycloak token-introspection authentication, FAIL-CLOSED. The previous
 // middleware only checked that an Authorization header was present.
 
+const (
+	// introspectCacheTTL bounds reuse of a positive introspection result;
+	// short enough to bound revocation lag, long enough to take the Keycloak
+	// round trip (10-40ms) off every scoring call.
+	introspectCacheTTL = 45 * time.Second
+	// introspectNegTTL bounds reuse of negative results so newly-activated
+	// tokens recover within seconds.
+	introspectNegTTL = 5 * time.Second
+	// introspectCacheMaxSize bounds cache memory (distinct live tokens).
+	introspectCacheMaxSize = 10000
+)
+
 type authPrincipal struct {
 	Subject  string
 	TenantID string
 	Roles    map[string]struct{}
+}
+
+// introspectEntry is a bounded-TTL cached introspection outcome.
+type introspectEntry struct {
+	principal *authPrincipal
+	err       error
+	expiresAt time.Time
+}
+
+// introspectCall deduplicates concurrent misses for the same token
+// (singleflight): waiters block on done and share the leader's outcome.
+type introspectCall struct {
+	done      chan struct{}
+	principal *authPrincipal
+	err       error
 }
 
 type keycloakIntrospector struct {
@@ -29,6 +60,10 @@ type keycloakIntrospector struct {
 	clientID         string
 	clientSecret     string
 	httpClient       *http.Client
+
+	cacheMu sync.Mutex
+	cache   map[string]*introspectEntry
+	inflight map[string]*introspectCall
 }
 
 func newKeycloakIntrospector() (*keycloakIntrospector, error) {
@@ -57,13 +92,96 @@ func newKeycloakIntrospector() (*keycloakIntrospector, error) {
 		introspectionURL: introspectionURL,
 		clientID:         clientID,
 		clientSecret:     clientSecret,
-		httpClient:       &http.Client{Timeout: 5 * time.Second},
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   3 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 32,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
+		cache:    make(map[string]*introspectEntry),
+		inflight: make(map[string]*introspectCall),
 	}, nil
 }
 
-// introspect validates the token against Keycloak with capped exponential
-// backoff. Any failure denies access.
+func tokenCacheKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func (k *keycloakIntrospector) lookupCache(key string) (*authPrincipal, error, bool) {
+	k.cacheMu.Lock()
+	defer k.cacheMu.Unlock()
+	entry, ok := k.cache[key]
+	if !ok || time.Now().After(entry.expiresAt) {
+		return nil, nil, false
+	}
+	return entry.principal, entry.err, true
+}
+
+func (k *keycloakIntrospector) storeCache(key string, entry *introspectEntry) {
+	k.cacheMu.Lock()
+	defer k.cacheMu.Unlock()
+	if len(k.cache) >= introspectCacheMaxSize {
+		now := time.Now()
+		for ck, e := range k.cache {
+			if now.After(e.expiresAt) {
+				delete(k.cache, ck)
+			}
+		}
+		if len(k.cache) >= introspectCacheMaxSize {
+			return // correctness never depends on the cache
+		}
+	}
+	k.cache[key] = entry
+}
+
+// introspect validates the token with a bounded TTL cache (keyed by token
+// hash, never the raw token) and singleflight dedup; only a cache miss with
+// no in-flight call reaches Keycloak, with capped exponential backoff. Any
+// failure denies access.
 func (k *keycloakIntrospector) introspect(ctx context.Context, token string) (*authPrincipal, error) {
+	key := tokenCacheKey(token)
+	if principal, err, ok := k.lookupCache(key); ok {
+		return principal, err
+	}
+
+	k.cacheMu.Lock()
+	if call, ok := k.inflight[key]; ok {
+		k.cacheMu.Unlock()
+		select {
+		case <-call.done:
+			return call.principal, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &introspectCall{done: make(chan struct{})}
+	k.inflight[key] = call
+	k.cacheMu.Unlock()
+
+	principal, err := k.introspectWithRetry(ctx, token)
+	ttl := introspectCacheTTL
+	if err != nil {
+		ttl = introspectNegTTL
+	}
+	k.storeCache(key, &introspectEntry{principal: principal, err: err, expiresAt: time.Now().Add(ttl)})
+
+	k.cacheMu.Lock()
+	delete(k.inflight, key)
+	call.principal, call.err = principal, err
+	close(call.done)
+	k.cacheMu.Unlock()
+	return principal, err
+}
+
+func (k *keycloakIntrospector) introspectWithRetry(ctx context.Context, token string) (*authPrincipal, error) {
 	var principal *authPrincipal
 	var lastErr error
 	delay := 100 * time.Millisecond

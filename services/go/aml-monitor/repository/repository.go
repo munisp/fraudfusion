@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -210,18 +211,23 @@ func (r *AMLRepository) StorePattern(p *models.SuspiciousPattern) error {
 }
 
 // GetUserPatterns lists patterns detected for a user within a lookback window.
-func (r *AMLRepository) GetUserPatterns(userID string, days int) ([]*models.SuspiciousPattern, error) {
+func (r *AMLRepository) GetUserPatterns(userID string, days int, limit int) ([]*models.SuspiciousPattern, error) {
 	if err := r.requireDB(); err != nil {
 		return nil, err
 	}
 	if days <= 0 {
 		days = 30
 	}
+	// Bound the result set: previously unbounded, scanning and marshaling
+	// every pattern row for the user on each request.
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	rows, err := r.db.QueryContext(ctx, `SELECT id, user_id, pattern_type, description, confidence,
 		transaction_ids, total_amount, detected_at FROM aml_patterns
-		WHERE user_id=$1 AND detected_at >= now() - ($2 || ' days')::interval ORDER BY detected_at DESC`, userID, days)
+		WHERE user_id=$1 AND detected_at >= now() - ($2 || ' days')::interval ORDER BY detected_at DESC LIMIT $3`, userID, days, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -456,26 +462,41 @@ func (r *AMLRepository) GetDailyReport(date time.Time) (*models.DailyReport, err
 	end := start.Add(24 * time.Hour)
 
 	report := &models.DailyReport{Date: start}
-	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*),
-		COUNT(*) FILTER (WHERE flagged),
-		COUNT(*) FILTER (WHERE risk_level IN ('high','critical','manual_review')),
-		COALESCE(AVG(risk_score),0) FROM aml_transaction_analyses
-		WHERE created_at >= $1 AND created_at < $2`, start, end).
-		Scan(&report.TotalTransactions, &report.FlaggedTransactions, &report.HighRiskTransactions, &report.AverageRiskScore)
-	if err != nil {
-		return nil, err
-	}
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM aml_sars WHERE created_at >= $1 AND created_at < $2`, start, end).Scan(&report.SARsGenerated); err != nil {
-		return nil, err
-	}
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM aml_sars WHERE status='filed' AND updated_at >= $1 AND updated_at < $2`, start, end).Scan(&report.SARsFiled); err != nil {
-		return nil, err
-	}
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM aml_patterns WHERE detected_at >= $1 AND detected_at < $2`, start, end).Scan(&report.PatternsDetected); err != nil {
-		return nil, err
-	}
-	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE is_sanctioned) FROM aml_sanctions_checks WHERE checked_at >= $1 AND checked_at < $2`, start, end).Scan(&report.SanctionsChecks, &report.SanctionsMatches); err != nil {
-		return nil, err
+	// The four aggregates touch different tables, so they run concurrently
+	// instead of serially (worst-case latency = slowest scan, not the sum).
+	// The two aml_sars counts are merged into one scan with FILTER.
+	var wg sync.WaitGroup
+	errs := make([]error, 4)
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		errs[0] = r.db.QueryRowContext(ctx, `SELECT COUNT(*),
+			COUNT(*) FILTER (WHERE flagged),
+			COUNT(*) FILTER (WHERE risk_level IN ('high','critical','manual_review')),
+			COALESCE(AVG(risk_score),0) FROM aml_transaction_analyses
+			WHERE created_at >= $1 AND created_at < $2`, start, end).
+			Scan(&report.TotalTransactions, &report.FlaggedTransactions, &report.HighRiskTransactions, &report.AverageRiskScore)
+	}()
+	go func() {
+		defer wg.Done()
+		errs[1] = r.db.QueryRowContext(ctx, `SELECT COUNT(*),
+			COUNT(*) FILTER (WHERE status='filed' AND updated_at >= $1 AND updated_at < $2)
+			FROM aml_sars WHERE created_at >= $1 AND created_at < $2`, start, end).
+			Scan(&report.SARsGenerated, &report.SARsFiled)
+	}()
+	go func() {
+		defer wg.Done()
+		errs[2] = r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM aml_patterns WHERE detected_at >= $1 AND detected_at < $2`, start, end).Scan(&report.PatternsDetected)
+	}()
+	go func() {
+		defer wg.Done()
+		errs[3] = r.db.QueryRowContext(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE is_sanctioned) FROM aml_sanctions_checks WHERE checked_at >= $1 AND checked_at < $2`, start, end).Scan(&report.SanctionsChecks, &report.SanctionsMatches)
+	}()
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
 	}
 	return report, nil
 }

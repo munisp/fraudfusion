@@ -131,15 +131,31 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 	}
 	logger.Info("Land details extracted", "data", extractedData)
 
-	// Step 2: Query Land Registry for ownership history
-	logger.Info("Step 2: Querying Land Registry for ownership history")
-	var ownershipHistory []OwnershipRecord
+	// Steps 2, 3 and 5 depend only on the extracted document data, so they
+	// run concurrently (fan-out/fan-in) instead of serially — journey
+	// latency becomes max(step) rather than sum(steps).
+	logger.Info("Steps 2+3+5: Fanning out land registry, claimant, and owner queries")
 	registryInput := map[string]interface{}{
 		"property_address": input.PropertyAddress,
 		"state":            input.State,
 		"document_ref":     extractedData["certificate_number"],
 	}
-	err = workflow.ExecuteActivity(ctx, QueryLandRegistryActivity, registryInput).Get(ctx, &ownershipHistory)
+	claimantsInput := map[string]interface{}{
+		"property_address":   input.PropertyAddress,
+		"state":              input.State,
+		"certificate_number": extractedData["certificate_number"],
+	}
+	ownerInput := map[string]interface{}{
+		"certificate_number": extractedData["certificate_number"],
+		"state":              input.State,
+	}
+	registryFuture := workflow.ExecuteActivity(ctx, QueryLandRegistryActivity, registryInput)
+	claimantsFuture := workflow.ExecuteActivity(ctx, DetectMultipleClaimantsActivity, claimantsInput)
+	ownerFuture := workflow.ExecuteActivity(ctx, VerifyCurrentOwnerActivity, ownerInput)
+
+	// Step 2: Query Land Registry for ownership history
+	var ownershipHistory []OwnershipRecord
+	err = registryFuture.Get(ctx, &ownershipHistory)
 	if err != nil {
 		logger.Error("Failed to query Land Registry", "error", err)
 		// Continue with partial data
@@ -150,14 +166,8 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 	}
 
 	// Step 3: Detect multiple claimants
-	logger.Info("Step 3: Detecting multiple claimants")
 	var claimants []Claimant
-	claimantsInput := map[string]interface{}{
-		"property_address":   input.PropertyAddress,
-		"state":              input.State,
-		"certificate_number": extractedData["certificate_number"],
-	}
-	err = workflow.ExecuteActivity(ctx, DetectMultipleClaimantsActivity, claimantsInput).Get(ctx, &claimants)
+	err = claimantsFuture.Get(ctx, &claimants)
 	if err != nil {
 		logger.Error("Failed to detect claimants", "error", err)
 		claimants = []Claimant{}
@@ -220,14 +230,10 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 		}
 	}
 
-	// Step 5: Verify current owner
+	// Step 5: Verify current owner (future started above, alongside steps 2+3)
 	logger.Info("Step 5: Verifying current owner")
 	var currentOwner map[string]interface{}
-	ownerInput := map[string]interface{}{
-		"certificate_number": extractedData["certificate_number"],
-		"state":              input.State,
-	}
-	err = workflow.ExecuteActivity(ctx, VerifyCurrentOwnerActivity, ownerInput).Get(ctx, &currentOwner)
+	err = ownerFuture.Get(ctx, &currentOwner)
 	if err != nil {
 		logger.Error("Failed to verify current owner", "error", err)
 		output.FraudDetected = true

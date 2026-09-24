@@ -24,6 +24,19 @@ pub struct AppConfig {
     pub enable_audit_log: bool,
     pub cache_ttl_seconds: u64,
     pub cache_max_size_mb: u64,
+
+    // --- anti-wipe / WORM policy (lane B3) ---
+    pub enable_versioning: bool,
+    pub object_lock_mode: String,
+    pub object_lock_retention_days: u32,
+    pub worm_enforce_on_boot: bool,
+    pub worm_buckets: Vec<String>,
+    pub keycloak_delete_role: String,
+    pub delete_token_ttl_seconds: u64,
+    pub delete_token_key: Option<String>,
+    pub soft_delete_tombstone_retention_days: u64,
+    pub dual_control_required: bool,
+    pub lockdown_state_path: String,
 }
 
 impl AppConfig {
@@ -62,6 +75,25 @@ impl AppConfig {
             enable_audit_log: bool_env("ENABLE_AUDIT_LOG", true)?,
             cache_ttl_seconds: env::var("CACHE_TTL_SECONDS").unwrap_or_else(|_| "300".to_string()).parse()?,
             cache_max_size_mb: env::var("CACHE_MAX_SIZE_MB").unwrap_or_else(|_| "512".to_string()).parse()?,
+            enable_versioning: bool_env("RUSTFS_ENABLE_VERSIONING", true)?,
+            object_lock_mode: {
+                let mode = env::var("OBJECT_LOCK_MODE").unwrap_or_else(|_| "COMPLIANCE".to_string()).to_uppercase();
+                if mode != "COMPLIANCE" && mode != "GOVERNANCE" && mode != "OFF" {
+                    anyhow::bail!("OBJECT_LOCK_MODE must be COMPLIANCE, GOVERNANCE or OFF")
+                }
+                mode
+            },
+            object_lock_retention_days: env::var("OBJECT_LOCK_RETENTION_DAYS").unwrap_or_else(|_| "2555".to_string()).parse()?,
+            worm_enforce_on_boot: bool_env("WORM_ENFORCE_ON_BOOT", true)?,
+            worm_buckets: env::var("WORM_BUCKETS").unwrap_or_default()
+                .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            keycloak_delete_role: env::var("KEYCLOAK_DELETE_ROLE").unwrap_or_else(|_| "storage_admin".to_string()),
+            delete_token_ttl_seconds: env::var("DELETE_TOKEN_TTL_SECONDS").unwrap_or_else(|_| "300".to_string()).parse()?,
+            delete_token_key: env::var("DELETE_TOKEN_KEY").ok().filter(|v| !v.trim().is_empty())
+                .or_else(|| env::var("DELETE_TOKEN_KEY_URI").ok().filter(|v| !v.trim().is_empty())),
+            soft_delete_tombstone_retention_days: env::var("SOFT_DELETE_TOMBSTONE_RETENTION_DAYS").unwrap_or_else(|_| "90".to_string()).parse()?,
+            dual_control_required: bool_env("DUAL_CONTROL_REQUIRED", true)?,
+            lockdown_state_path: env::var("STORAGE_LOCKDOWN_STATE").unwrap_or_else(|_| "/var/lib/fraudfusion/storage/lockdown.json".to_string()),
         })
     }
 }

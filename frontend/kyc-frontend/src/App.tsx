@@ -1,12 +1,14 @@
-import React from 'react';
+import React, { Suspense, lazy } from 'react';
 import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom';
 import './App.css';
 import Home from './pages/Home';
-import KYCVerification from './pages/KYCVerification';
-import BiometricVerification from './pages/BiometricVerification';
-import DocumentVerification from './pages/DocumentVerification';
-import Screening from './pages/Screening';
-import RiskAssessment from './pages/RiskAssessment';
+
+// Route-level code splitting: each verification step ships as its own chunk.
+const KYCVerification = lazy(() => import('./pages/KYCVerification'));
+const BiometricVerification = lazy(() => import('./pages/BiometricVerification'));
+const DocumentVerification = lazy(() => import('./pages/DocumentVerification'));
+const Screening = lazy(() => import('./pages/Screening'));
+const RiskAssessment = lazy(() => import('./pages/RiskAssessment'));
 
 function App() {
   return (
@@ -65,14 +67,16 @@ function App() {
 
         {/* Main Content */}
         <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
-          <Routes>
-            <Route path="/" element={<Home />} />
-            <Route path="/kyc" element={<KYCVerification />} />
-            <Route path="/biometric" element={<BiometricVerification />} />
-            <Route path="/document" element={<DocumentVerification />} />
-            <Route path="/screening" element={<Screening />} />
-            <Route path="/risk" element={<RiskAssessment />} />
-          </Routes>
+          <Suspense fallback={<p role="status" aria-live="polite" className="text-gray-500">Loading…</p>}>
+            <Routes>
+              <Route path="/" element={<Home />} />
+              <Route path="/kyc" element={<KYCVerification />} />
+              <Route path="/biometric" element={<BiometricVerification />} />
+              <Route path="/document" element={<DocumentVerification />} />
+              <Route path="/screening" element={<Screening />} />
+              <Route path="/risk" element={<RiskAssessment />} />
+            </Routes>
+          </Suspense>
         </main>
 
         {/* Footer */}

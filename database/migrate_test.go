@@ -5,15 +5,16 @@ import (
 	"testing"
 )
 
-// TestMigrationFilesEmbeddedAndOrdered verifies all 9 SQL migrations are
-// embedded and sort in application order.
+// TestMigrationFilesEmbeddedAndOrdered verifies all SQL migrations are
+// embedded and sort in application order. The count is a floor, not an
+// exact match: new dated migrations are added over time.
 func TestMigrationFilesEmbeddedAndOrdered(t *testing.T) {
 	names, err := MigrationFilenames()
 	if err != nil {
 		t.Fatalf("MigrationFilenames: %v", err)
 	}
-	if len(names) != 9 {
-		t.Fatalf("expected 9 embedded migrations, got %d: %v", len(names), names)
+	if len(names) < 9 {
+		t.Fatalf("expected at least 9 embedded migrations, got %d: %v", len(names), names)
 	}
 	if names[0] != "20260801_chargeback_fraud_schema.sql" {
 		t.Fatalf("base schema must sort first, got %s", names[0])

@@ -48,7 +48,10 @@ func NewClient(brokers []string, topic string) (*Client, error) {
 			Balancer:     &kafka.LeastBytes{},
 			RequiredAcks: kafka.RequireOne,
 			MaxAttempts:  3,
-			BatchTimeout: 50 * time.Millisecond,
+			// 10ms batch window: long enough to co-locate the journey
+			// lifecycle events in one produce request, short enough to stay
+			// inside the journey-execute latency budget.
+			BatchTimeout: 10 * time.Millisecond,
 			Async:        false,
 		},
 		dialer: &kafka.Dialer{Timeout: 5 * time.Second},
@@ -71,6 +74,32 @@ func (c *Client) PublishEvent(ctx context.Context, key string, event Event) erro
 		return c.writer.WriteMessages(ctx, msg)
 	}); err != nil {
 		return fmt.Errorf("publish kafka event %s (%s): %w", event.ID, event.Type, err)
+	}
+	return nil
+}
+
+// PublishEvents encodes and writes several events in a single WriteMessages
+// call, so they share one produce round trip within the writer's batch
+// window. The final error is returned (never fire-and-forget).
+func (c *Client) PublishEvents(ctx context.Context, key string, events ...Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	messages := make([]kafka.Message, 0, len(events))
+	for _, event := range events {
+		if event.ID == "" || event.Type == "" {
+			return fmt.Errorf("kafka event ID and type are required")
+		}
+		payload, err := json.Marshal(event)
+		if err != nil {
+			return fmt.Errorf("encode kafka event: %w", err)
+		}
+		messages = append(messages, kafka.Message{Key: []byte(key), Value: payload, Time: time.Now()})
+	}
+	if err := backoff.Do(ctx, backoff.Default(), func() error {
+		return c.writer.WriteMessages(ctx, messages...)
+	}); err != nil {
+		return fmt.Errorf("publish %d kafka events for key %s: %w", len(events), key, err)
 	}
 	return nil
 }

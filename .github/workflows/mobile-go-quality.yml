@@ -60,6 +60,7 @@ jobs:
           cache-dependency-path: |
             services/go/**/go.sum
             orchestrator/go/**/go.sum
+            database/go.sum
             observability/release-gate-metrics/go.sum
       - name: Test each declared Go module with race detection
         shell: bash
@@ -68,7 +69,7 @@ jobs:
           while IFS= read -r module; do
             echo "Testing $module"
             (cd "$module" && go test -race ./...)
-          done < <({ find services/go orchestrator/go -name go.mod -printf '%h\n' 2>/dev/null; printf '%s\n' observability/release-gate-metrics; } | sort -u)
+          done < <({ find services/go orchestrator/go database -name go.mod -printf '%h\n' 2>/dev/null; printf '%s\n' observability/release-gate-metrics; } | sort -u)
 
   dependency-security:
     runs-on: ubuntu-24.04
@@ -90,6 +91,7 @@ jobs:
           cache-dependency-path: |
             services/go/**/go.sum
             orchestrator/go/**/go.sum
+            database/go.sum
             observability/release-gate-metrics/go.sum
       - name: Scan reachable Go vulnerabilities
         shell: bash
@@ -97,7 +99,7 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           while IFS= read -r module; do
             (cd "$module" && govulncheck ./...)
-          done < <({ find services/go orchestrator/go -name go.mod -printf '%h\n' 2>/dev/null; printf '%s\n' observability/release-gate-metrics; } | sort -u)
+          done < <({ find services/go orchestrator/go database -name go.mod -printf '%h\n' 2>/dev/null; printf '%s\n' observability/release-gate-metrics; } | sort -u)
 
 
   ledger_postgres:

@@ -24,11 +24,13 @@ import {
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
-async function fetchApi<T>(path: string): Promise<T> {
+async function fetchApi<T>(path: string, signal?: AbortSignal): Promise<T> {
   const token = localStorage.getItem('auth_token');
   const response = await fetch(`${API_BASE_URL}${path}`, {
     headers: token ? { Authorization: `Bearer ${token}`, Accept: 'application/json' } : { Accept: 'application/json' },
     credentials: 'same-origin',
+    // 10s client-side timeout; also aborts when the caller (unmounted view) cancels.
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
   });
   if (!response.ok) {
     throw new Error(`Journey API request failed with status ${response.status}.`);
@@ -77,28 +79,37 @@ const JourneyDashboard: React.FC = () => {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
-    void loadDashboard();
+    const controller = new AbortController();
+    void loadDashboard(controller.signal);
+    // Cancel in-flight requests when the dashboard unmounts.
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loadDashboard = async () => {
+  const loadDashboard = async (signal?: AbortSignal) => {
     setLoading(true);
     setLoadError(null);
     try {
       const [journeyData, executionData, analyticsData] = await Promise.all([
-        fetchApi<{ journeys: Journey[] }>('/api/v1/journeys'),
-        fetchApi<{ executions: JourneyExecution[] }>('/api/v1/journeys/executions?status=active'),
-        fetchApi<{ analytics: JourneyAnalytics[] }>('/api/v1/journeys/analytics'),
+        fetchApi<{ journeys: Journey[] }>('/api/v1/journeys', signal),
+        fetchApi<{ executions: JourneyExecution[] }>('/api/v1/journeys/executions?status=active', signal),
+        fetchApi<{ analytics: JourneyAnalytics[] }>('/api/v1/journeys/analytics', signal),
       ]);
       setJourneys(journeyData.journeys);
       setExecutions(executionData.executions);
       setAnalytics(Object.fromEntries(analyticsData.analytics.map((item) => [item.journey_id, item])));
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return; // Unmounted or superseded load; leave state untouched.
+      }
       setJourneys([]);
       setExecutions([]);
       setAnalytics({});
       setLoadError(error instanceof Error ? error.message : 'Unable to load journey data.');
     } finally {
-      setLoading(false);
+      if (!signal?.aborted) {
+        setLoading(false);
+      }
     }
   };
 

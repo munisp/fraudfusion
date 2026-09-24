@@ -1,6 +1,6 @@
 # FraudFusion
 
-FraudFusion is a multi-service fraud prevention platform containing Go, Python, Rust, TypeScript, and React Native components.
+FraudFusion is a multi-service fraud prevention platform containing Go, Python, TypeScript, and React Native components.
 
 ## Security and Quality Controls
 

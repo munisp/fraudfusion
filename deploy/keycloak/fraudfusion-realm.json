@@ -8,7 +8,9 @@
       {"name": "compliance_officer", "description": "Compliance: SAR management, sanctions screening, regulatory filings"},
       {"name": "auditor", "description": "Read-only audit reporting access"},
       {"name": "admin", "description": "Platform administrator"},
-      {"name": "viewer", "description": "Read-only access"}
+      {"name": "viewer", "description": "Read-only access"},
+      {"name": "onboarding_admin", "description": "Onboarding staff: review/approve/reject tenant API key requests (dual control)"},
+      {"name": "fraud_operator", "description": "Fraud operator: operational fraud tooling access"}
     ]
   },
   "clients": [
@@ -97,6 +99,33 @@
       "enabled": true,
       "publicClient": false,
       "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "onboarding-service",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "account-takeover-detector",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "identity-theft-detector",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "directAccessGrantsEnabled": false,
       "standardFlowEnabled": false,
       "protocol": "openid-connect"
     }

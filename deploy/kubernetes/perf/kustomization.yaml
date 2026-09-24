@@ -1,0 +1,15 @@
+# Performance overlay (Lane B2): resource requests/limits, HPAs, pgbouncer.
+# Apply on top of the base manifests:
+#   kubectl apply -k deploy/kubernetes/perf/
+# or reference from an overlay kustomization that also includes the base dir.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - pgbouncer.yaml
+  - hpa.yaml
+
+patches:
+  - path: resources-patch.yaml
+    target:
+      kind: Deployment

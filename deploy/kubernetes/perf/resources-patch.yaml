@@ -1,0 +1,123 @@
+# Strategic-merge patch adding resource requests/limits to all service
+# Deployments in the base manifests (detectors, ledger-command, orchestrator).
+# Requests are sized from the latency budgets in perf/LATENCY_BUDGET.md:
+# scoring pods need CPU headroom for rule evaluation + Redis/DB round trips.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crypto-fraud-detector
+spec:
+  template:
+    spec:
+      containers:
+        - name: crypto-fraud-detector
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: investment-fraud-detector
+spec:
+  template:
+    spec:
+      containers:
+        - name: investment-fraud-detector
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sim-swap-detector
+spec:
+  template:
+    spec:
+      containers:
+        - name: sim-swap-detector
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: advance-fee-fraud-detector
+spec:
+  template:
+    spec:
+      containers:
+        - name: advance-fee-fraud-detector
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aml-monitor
+spec:
+  template:
+    spec:
+      containers:
+        - name: aml-monitor
+          resources:
+            requests: { cpu: 150m, memory: 192Mi }
+            limits:   { cpu: 750m, memory: 768Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chargeback-fraud-detector
+spec:
+  template:
+    spec:
+      containers:
+        - name: chargeback-fraud-detector
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: insider-fraud-detector
+spec:
+  template:
+    spec:
+      containers:
+        - name: insider-fraud-detector
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ledger-command
+spec:
+  template:
+    spec:
+      containers:
+        - name: ledger-command
+          env:
+            - name: DB_MAX_CONNS
+              value: "20"
+          resources:
+            requests: { cpu: 150m, memory: 192Mi }
+            limits:   { cpu: "1", memory: 768Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+spec:
+  template:
+    spec:
+      containers:
+        - name: orchestrator
+          resources:
+            requests: { cpu: 150m, memory: 192Mi }
+            limits:   { cpu: "1", memory: 768Mi }

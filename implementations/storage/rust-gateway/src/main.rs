@@ -13,10 +13,12 @@
 
 mod auth;
 mod config;
+mod deletion;
 mod error;
 mod handlers;
 mod models;
 mod storage;
+mod worm;
 
 use axum::{
     http::{header::{AUTHORIZATION, CONTENT_TYPE}, HeaderValue, Method},
@@ -60,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("RustFS endpoint: {}", config.rustfs_endpoint);
 
     let storage = StorageClient::new(&config).await?;
+
+    // Anti-wipe boot assertion (fail closed): versioning + object lock on all
+    // regulated buckets before serving traffic.
+    worm::enforce_on_boot(&storage, &config).await?;
+
     let auth = KeycloakClient::from_config(&config)?;
     let state = Arc::new(AppState { storage, config: config.clone(), auth });
     let allowed_origins = config

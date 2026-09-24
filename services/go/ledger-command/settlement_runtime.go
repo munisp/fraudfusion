@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -303,7 +304,25 @@ func (s *service) providerCallback(c *gin.Context) {
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), requestTimeout)
 	defer cancel()
-	result, err := s.dispatcher.applyCallback(ctx, callback, rawBody, occurredAt.UTC())
+	// Bounded, jittered retry on serialization failures so a transient 40001
+	// does not surface as a spurious 503 to the settlement provider.
+	var result callbackResult
+	for attempt := 0; attempt < 3; attempt++ {
+		result, err = s.dispatcher.applyCallback(ctx, callback, rawBody, occurredAt.UTC())
+		if err == nil || !isSerializationFailure(err) || ctx.Err() != nil {
+			break
+		}
+		delay := time.Duration(25*(1<<attempt))*time.Millisecond + time.Duration(mrand.Intn(50))*time.Millisecond
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-time.After(delay):
+		}
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			break
+		}
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, errCallbackHashMismatch):
@@ -328,7 +347,11 @@ var (
 func (d *settlementDispatcher) applyCallback(ctx context.Context, callback providerCallback, rawPayload []byte, occurredAt time.Time) (callbackResult, error) {
 	hash := sha256.Sum256(rawPayload)
 	payloadHash := hex.EncodeToString(hash[:])
-	tx, err := d.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// READ COMMITTED matches the dispatcher (line ~216): idempotency is
+	// enforced by UNIQUE(tenant_id,provider,provider_event_id) + ON CONFLICT
+	// and the FOR KEY SHARE re-read; SERIALIZABLE only added predicate-lock
+	// overhead and spurious 40001s under concurrent callbacks.
+	tx, err := d.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return callbackResult{}, err
 	}

@@ -1,0 +1,81 @@
+# Temporal server (dev auto-setup) + temporal-orchestrator worker.
+# The worker (services/go/temporal-orchestrator) executes the journey
+# workflows that orchestrator submits via TEMPORAL_HOST/TEMPORAL_TASK_QUEUE.
+# NOTE: temporalio/auto-setup is a DEV image (embedded SQLite). For
+# production, run a helm-deployed Temporal cluster with Postgres persistence
+# and point both this worker and orchestrator at it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fraudfusion-data
+  labels:
+    kubernetes.io/metadata.name: fraudfusion-data
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal
+  namespace: fraudfusion-data
+  labels:
+    app.kubernetes.io/name: temporal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: temporal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: temporal
+    spec:
+      containers:
+        - name: temporal
+          image: temporalio/auto-setup:1.25.2
+          ports:
+            - name: grpc
+              containerPort: 7233
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal
+  namespace: fraudfusion-data
+  labels:
+    app.kubernetes.io/name: temporal
+spec:
+  selector:
+    app.kubernetes.io/name: temporal
+  ports:
+    - name: grpc
+      port: 7233
+      targetPort: grpc
+---
+# The worker has no HTTP listener (pure Temporal worker), so no probes:
+# liveness is the container process itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-orchestrator
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: temporal-orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: temporal-orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: temporal-orchestrator
+    spec:
+      containers:
+        - name: temporal-orchestrator
+          image: ghcr.io/munisp/fraudfusion/temporal-orchestrator:latest
+          env:
+            - name: TEMPORAL_HOST
+              value: temporal.fraudfusion-data.svc.cluster.local:7233
+            # Downstream activity endpoints invoked by journey workflows
+            # (SERVICE_<NAME>_URL convention in main.go).
+            - name: SERVICE_LAND_VERIFICATION_SERVICE_URL
+              value: http://land-verification-service.fraudfusion-services.svc.cluster.local:8002

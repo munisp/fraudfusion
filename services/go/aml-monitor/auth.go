@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // JWT authentication against Keycloak, FAIL-CLOSED.
@@ -76,6 +78,27 @@ func fetchJWKS(keycloakURL, realm string) (map[string]*rsa.PublicKey, error) {
 	}
 	keyCache.mu.RUnlock()
 
+	// Deduplicate concurrent refetches: a burst of tokens with an unknown
+	// (rotated) kid must trigger one JWKS download, not a thundering herd.
+	result, err, _ := jwksGroup.Do("jwks", func() (interface{}, error) {
+		// Re-check inside the flight: a concurrent fetch may have landed.
+		keyCache.mu.RLock()
+		if time.Since(keyCache.fetchedAt) < keyCache.ttl && len(keyCache.keys) > 0 {
+			defer keyCache.mu.RUnlock()
+			return keyCache.keys, nil
+		}
+		keyCache.mu.RUnlock()
+		return fetchJWKSUncached(keycloakURL, realm)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.(map[string]*rsa.PublicKey), nil
+}
+
+var jwksGroup singleflight.Group
+
+func fetchJWKSUncached(keycloakURL, realm string) (map[string]*rsa.PublicKey, error) {
 	jwksURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/certs", keycloakURL, realm)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

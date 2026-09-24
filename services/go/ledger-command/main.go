@@ -11,17 +11,22 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	mrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -31,7 +36,10 @@ const (
 	maxRequestBytes = 1 << 20
 )
 
-var sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var (
+	sha256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	amountPattern = regexp.MustCompile(`^[0-9]+(\.[0-9]{1,6})?$`)
+)
 
 type principal struct {
 	TenantID string
@@ -44,6 +52,33 @@ type keycloakClient struct {
 	clientID         string
 	clientSecret     string
 	httpClient       *http.Client
+
+	cacheMu  sync.Mutex
+	cache    map[string]*introspectCacheEntry
+	inflight map[string]*introspectCall
+}
+
+const (
+	// introspectCacheTTL takes the Keycloak round trip (10-40ms) off the
+	// hottest financial path; revocation lag is bounded by the TTL.
+	introspectCacheTTL = 45 * time.Second
+	// introspectNegTTL bounds reuse of failed/inactive results.
+	introspectNegTTL      = 5 * time.Second
+	introspectCacheMaxLen = 10000
+)
+
+type introspectCacheEntry struct {
+	principal principal
+	err       error
+	expiresAt time.Time
+}
+
+// introspectCall deduplicates concurrent introspection misses for the same
+// token (singleflight): followers wait on done and share the leader's result.
+type introspectCall struct {
+	done      chan struct{}
+	principal principal
+	err       error
 }
 
 type service struct {
@@ -161,7 +196,7 @@ func (s *service) createJournal(c *gin.Context) {
 	principal := requestPrincipal(c)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), requestTimeout)
 	defer cancel()
-	response, err := s.postJournal(ctx, principal, request)
+	response, err := s.postJournalWithRetry(ctx, principal, request)
 	if err != nil {
 		switch {
 		case errors.Is(err, errIdempotencyConflict):
@@ -203,6 +238,32 @@ var (
 	errForeignKey          = errors.New("foreign key")
 )
 
+// postJournalWithRetry retries serialization failures (SQLSTATE 40001) with
+// bounded, jittered backoff. At READ COMMITTED these are rare, but settlement
+// and reconciliation transactions can still surface them.
+func (s *service) postJournalWithRetry(ctx context.Context, principal principal, request journalRequest) (journalResponse, error) {
+	var response journalResponse
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		response, err = s.postJournal(ctx, principal, request)
+		if err == nil || !isSerializationFailure(err) || ctx.Err() != nil {
+			return response, err
+		}
+		delay := time.Duration(25*(1<<attempt))*time.Millisecond + time.Duration(mrand.Intn(50))*time.Millisecond
+		select {
+		case <-ctx.Done():
+			return journalResponse{}, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return response, err
+}
+
+func isSerializationFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "40001"
+}
+
 func (s *service) postJournal(ctx context.Context, principal principal, request journalRequest) (journalResponse, error) {
 	canonical, err := json.Marshal(struct {
 		JournalType string                 `json:"journal_type"`
@@ -219,7 +280,12 @@ func (s *service) postJournal(ctx context.Context, principal principal, request 
 	hash := sha256.Sum256(canonical)
 	commandHash := hex.EncodeToString(hash[:])
 
-	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	// READ COMMITTED is sufficient: idempotency is enforced by the
+	// UNIQUE(tenant_id, idempotency_key) constraint + ON CONFLICT DO NOTHING,
+	// and the conflict path re-reads FOR KEY SHARE. SERIALIZABLE added
+	// predicate-lock overhead and spurious 40001s (returned to clients as
+	// 503) without protecting any additional invariant.
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return journalResponse{}, err
 	}
@@ -308,7 +374,26 @@ func newKeycloakClient() (*keycloakClient, error) {
 	}
 	clientID := requiredEnv("KEYCLOAK_CLIENT_ID")
 	secret := requiredEnv("KEYCLOAK_CLIENT_SECRET")
-	return &keycloakClient{introspectionURL: url, clientID: clientID, clientSecret: secret, httpClient: &http.Client{Timeout: 5 * time.Second}}, nil
+	return &keycloakClient{
+		introspectionURL: url,
+		clientID:         clientID,
+		clientSecret:     secret,
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   3 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 32,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
+		cache:    make(map[string]*introspectCacheEntry),
+		inflight: make(map[string]*introspectCall),
+	}, nil
 }
 
 func newProductionPool(ctx context.Context) (*pgxpool.Pool, error) {
@@ -320,7 +405,18 @@ func newProductionPool(ctx context.Context) (*pgxpool.Pool, error) {
 	if parsed.Query().Get("sslmode") != "verify-full" {
 		return nil, errors.New("DATABASE_URL must use sslmode=verify-full")
 	}
-	return pgxpool.New(ctx, databaseURL)
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse DATABASE_URL: %w", err)
+	}
+	// Tune the pool: the pgx default (max(4, NumCPU)) queues concurrent
+	// journal writes on pool acquisition under load.
+	config.MaxConns = int32(envIntOr("DB_MAX_CONNS", 20))
+	config.MinConns = int32(envIntOr("DB_MIN_CONNS", 2))
+	config.MaxConnLifetime = 30 * time.Minute
+	config.MaxConnIdleTime = 5 * time.Minute
+	config.HealthCheckPeriod = 30 * time.Second
+	return pgxpool.NewWithConfig(ctx, config)
 }
 
 func requiredHTTPSURL(key string) (string, error) {
@@ -332,7 +428,57 @@ func requiredHTTPSURL(key string) (string, error) {
 	return value, nil
 }
 
+// introspect validates the token through a bounded TTL cache keyed by the
+// token hash (the raw token is never a map key) with singleflight dedup on
+// misses. Only a cold cache reaches Keycloak.
 func (k *keycloakClient) introspect(ctx context.Context, token string) (principal, error) {
+	sum := sha256.Sum256([]byte(token))
+	key := hex.EncodeToString(sum[:])
+
+	k.cacheMu.Lock()
+	if entry, ok := k.cache[key]; ok && time.Now().Before(entry.expiresAt) {
+		k.cacheMu.Unlock()
+		return entry.principal, entry.err
+	}
+	if call, ok := k.inflight[key]; ok {
+		k.cacheMu.Unlock()
+		select {
+		case <-call.done:
+			return call.principal, call.err
+		case <-ctx.Done():
+			return principal{}, ctx.Err()
+		}
+	}
+	call := &introspectCall{done: make(chan struct{})}
+	k.inflight[key] = call
+	k.cacheMu.Unlock()
+
+	p, err := k.introspectUncached(ctx, token)
+	ttl := introspectCacheTTL
+	if err != nil {
+		ttl = introspectNegTTL
+	}
+
+	k.cacheMu.Lock()
+	if len(k.cache) >= introspectCacheMaxLen {
+		now := time.Now()
+		for ck, e := range k.cache {
+			if now.After(e.expiresAt) {
+				delete(k.cache, ck)
+			}
+		}
+	}
+	if len(k.cache) < introspectCacheMaxLen {
+		k.cache[key] = &introspectCacheEntry{principal: p, err: err, expiresAt: time.Now().Add(ttl)}
+	}
+	delete(k.inflight, key)
+	call.principal, call.err = p, err
+	close(call.done)
+	k.cacheMu.Unlock()
+	return p, err
+}
+
+func (k *keycloakClient) introspectUncached(ctx context.Context, token string) (principal, error) {
 	form := url.Values{"token": {token}, "client_id": {k.clientID}, "client_secret": {k.clientSecret}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, k.introspectionURL, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -391,8 +537,16 @@ func envOr(key, fallback string) string {
 	}
 	return fallback
 }
+func envIntOr(key string, fallback int) int {
+	if value := os.Getenv(key); value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
 func validAmount(value string) bool {
-	if !regexp.MustCompile(`^[0-9]+(\.[0-9]{1,6})?$`).MatchString(value) {
+	if !amountPattern.MatchString(value) {
 		return false
 	}
 	rat, ok := new(big.Rat).SetString(value)
