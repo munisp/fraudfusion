@@ -1,0 +1,14 @@
+# Champion/challenger experiment consumed by mlops/serving/model_router.py.
+# Arms point at aml_service instances serving different model versions.
+experiment_id: fraud_net_v1_vs_v2
+champion:
+  name: champion
+  model_name: fraud_net
+  model_version: v1
+  url: http://localhost:8100/v1/aml/score
+challenger:
+  name: challenger
+  model_name: fraud_net
+  model_version: v2
+  url: http://localhost:8101/v1/aml/score
+challenger_traffic_pct: 10.0

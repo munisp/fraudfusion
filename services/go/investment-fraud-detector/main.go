@@ -44,23 +44,23 @@ type InvestmentAnalysis struct {
 }
 
 type InvestorVerification struct {
-	InvestorID      string  `json:"investor_id"`
-	SchemeID        string  `json:"scheme_id"`
-	InvestmentAmount float64 `json:"investment_amount"`
-	Verified        bool    `json:"verified"`
-	RiskScore       int     `json:"risk_score"`
-	Warnings        []string `json:"warnings"`
+	InvestorID       string   `json:"investor_id"`
+	SchemeID         string   `json:"scheme_id"`
+	InvestmentAmount float64  `json:"investment_amount"`
+	Verified         bool     `json:"verified"`
+	RiskScore        int      `json:"risk_score"`
+	Warnings         []string `json:"warnings"`
 }
 
 type PonziIndicators struct {
-	SchemeID              string  `json:"scheme_id"`
-	UnrealisticReturns    bool    `json:"unrealistic_returns"`
-	PyramidStructure      bool    `json:"pyramid_structure"`
-	LackOfTransparency    bool    `json:"lack_of_transparency"`
-	PressureToRecruit     bool    `json:"pressure_to_recruit"`
-	NoSECRegistration     bool    `json:"no_sec_registration"`
-	SuspiciousPayments    bool    `json:"suspicious_payments"`
-	PonziProbability      float64 `json:"ponzi_probability"`
+	SchemeID           string  `json:"scheme_id"`
+	UnrealisticReturns bool    `json:"unrealistic_returns"`
+	PyramidStructure   bool    `json:"pyramid_structure"`
+	LackOfTransparency bool    `json:"lack_of_transparency"`
+	PressureToRecruit  bool    `json:"pressure_to_recruit"`
+	NoSECRegistration  bool    `json:"no_sec_registration"`
+	SuspiciousPayments bool    `json:"suspicious_payments"`
+	PonziProbability   float64 `json:"ponzi_probability"`
 }
 
 func main() {
@@ -94,7 +94,7 @@ func main() {
 
 		// Investor protection
 		api.POST("/investors/verify", verifyInvestor)
-		api.POST("/investors/warn", warnInvestor)
+		api.POST("/investors/warn", requireRole("fraud_analyst", "admin"), warnInvestor)
 		api.GET("/investors/:id/investments", getInvestorPortfolio)
 
 		// Securities fraud
@@ -108,7 +108,7 @@ func main() {
 
 		// Regulatory compliance
 		api.POST("/sec/check-compliance", checkSECCompliance)
-		api.POST("/sec/file-report", fileSECReport)
+		api.POST("/sec/file-report", requireRole("compliance_officer", "admin"), fileSECReport)
 
 		// Reporting
 		api.GET("/reports/daily", getDailyReport)
@@ -627,13 +627,13 @@ func getTrendingScams(c *gin.Context) {
 			"name":        "Forex trading scams",
 			"description": "Unregulated forex trading platforms",
 			"victims":     180,
-			"total_loss":   95000000,
+			"total_loss":  95000000,
 		},
 		{
 			"name":        "Real estate Ponzi",
 			"description": "Fake property investment schemes",
 			"victims":     120,
-			"total_loss":   200000000,
+			"total_loss":  200000000,
 		},
 	}
 
@@ -682,10 +682,10 @@ func checkSECCompliance(c *gin.Context) {
 	}
 
 	compliance := map[string]bool{
-		"sec_registered":     false,
-		"license_valid":      false,
+		"sec_registered":      false,
+		"license_valid":       false,
 		"annual_report_filed": false,
-		"audit_completed":    false,
+		"audit_completed":     false,
 	}
 
 	// Check compliance items
@@ -749,9 +749,9 @@ func getInvestorPortfolio(c *gin.Context) {
 
 func getDailyReport(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"date":            time.Now().Format("2006-01-02"),
+		"date":             time.Now().Format("2006-01-02"),
 		"schemes_analyzed": 0,
-		"ponzi_detected":  0,
+		"ponzi_detected":   0,
 	})
 }
 
@@ -793,12 +793,17 @@ func healthCheck(c *gin.Context) {
 // Helper functions
 
 func initDB() {
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+	sslMode := getEnv("DB_SSLMODE", "require")
+	if sslMode == "disable" && !strings.EqualFold(os.Getenv("DB_ALLOW_INSECURE"), "true") {
+		log.Fatal("DB_SSLMODE=disable requires DB_ALLOW_INSECURE=true (local development only)")
+	}
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		getEnv("DB_HOST", "localhost"),
 		getEnv("DB_PORT", "5432"),
 		getEnv("DB_USER", "postgres"),
 		getEnv("DB_PASSWORD", ""),
-		getEnv("DB_NAME", "fraudfusion"))
+		getEnv("DB_NAME", "fraudfusion"),
+		sslMode)
 
 	var err error
 	db, err = sql.Open("postgres", connStr)
@@ -806,7 +811,7 @@ func initDB() {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
-	if err := db.Ping(); err != nil {
+	if err := withBackoff(func() error { return db.Ping() }); err != nil {
 		log.Fatal("Failed to ping database:", err)
 	}
 
@@ -820,18 +825,31 @@ func initRedis() {
 		DB:       0,
 	})
 
-	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+	if err := withBackoff(func() error { return redisClient.Ping(context.Background()).Err() }); err != nil {
 		log.Fatal("Failed to connect to Redis:", err)
 	}
 
 	log.Println("Redis connection established")
 }
 
+// corsMiddleware applies a configurable origin allowlist (CORS_ALLOWED_ORIGINS,
+// comma-separated). When unset, no cross-origin access is permitted; the
+// previous wildcard ("*") policy was removed.
 func corsMiddleware() gin.HandlerFunc {
+	allowed := map[string]struct{}{}
+	for _, origin := range strings.Split(os.Getenv("CORS_ALLOWED_ORIGINS"), ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			allowed[origin] = struct{}{}
+		}
+	}
 	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		origin := c.GetHeader("Origin")
+		if _, ok := allowed[origin]; ok {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+			c.Writer.Header().Set("Vary", "Origin")
+			c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
 
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -842,18 +860,7 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
-func authMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		token := c.GetHeader("Authorization")
-		if token == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
-			c.Abort()
-			return
-		}
-
-		c.Next()
-	}
-}
+// authMiddleware is implemented in auth.go (Keycloak token introspection, fail-closed).
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {

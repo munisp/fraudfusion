@@ -1,23 +1,163 @@
-"""
-Identity Theft Detector Service
-Comprehensive identity verification and theft detection for Nigerian market
+"""Identity Theft Detector Service.
+
+HARDENED: no fabricated verification results.
+- Biometric / face matching is served by a pluggable torch embedding model
+  (ml/artifacts/identity_embedder/v1/model.pt, override IDENTITY_MODEL_PATH).
+  When the model is absent the endpoints FAIL CLOSED with
+  status="model_unavailable" (HTTP 503) instead of returning fake matches.
+- External registry lookups (NIMC/NIBSS/telco) require configured
+  connectivity; unconfigured checks are reported as "unavailable", never
+  silently "verified".
+- Every route is protected by Keycloak token introspection (fail-closed;
+  requires KEYCLOAK_URL, KEYCLOAK_REALM, KEYCLOAK_CLIENT_ID,
+  KEYCLOAK_CLIENT_SECRET).
 """
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional, List, Dict
-from datetime import datetime
-import logging
+from __future__ import annotations
+
 import hashlib
+import logging
+import math
+import os
 import re
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Identity Theft Detector", version="1.0.0")
+SERVICE_NAME = "identity-theft-detector"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+MODEL_PATH = Path(os.getenv(
+    "IDENTITY_MODEL_PATH",
+    str(REPO_ROOT / "ml" / "artifacts" / "identity_embedder" / "v1" / "model.pt"),
+))
+MATCH_THRESHOLD = float(os.getenv("IDENTITY_MATCH_THRESHOLD", "0.8"))
+EMBEDDING_DIM = int(os.getenv("IDENTITY_EMBEDDING_DIM", "128"))
 
-# Request/Response Models
+# ---------------------------------------------------------------------------
+# Keycloak auth (fail-closed)
+# ---------------------------------------------------------------------------
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} must be configured")
+    return value
+
+
+async def authenticate(request: Request) -> dict[str, Any]:
+    """Introspect the bearer token against Keycloak. Fails closed."""
+    authorization = request.headers.get("authorization", "")
+    if not authorization.startswith("Bearer ") or not authorization[7:].strip():
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="bearer token required")
+    token = authorization[7:].strip()
+
+    try:
+        keycloak_url = _required_env("KEYCLOAK_URL").rstrip("/")
+        realm = _required_env("KEYCLOAK_REALM")
+        client_id = _required_env("KEYCLOAK_CLIENT_ID")
+        client_secret = _required_env("KEYCLOAK_CLIENT_SECRET")
+    except RuntimeError as exc:
+        # Fail closed: auth is not optional.
+        logger.error("auth misconfigured: %s", exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="auth unavailable") from exc
+
+    endpoint = f"{keycloak_url}/realms/{realm}/protocol/openid-connect/token/introspect"
+    try:
+        response = await request.app.state.http_client.post(
+            endpoint, data={"token": token, "client_id": client_id, "client_secret": client_secret}
+        )
+        response.raise_for_status()
+        claims = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="token validation unavailable") from exc
+
+    if claims.get("active") is not True:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="inactive token")
+    return claims
+
+
+# ---------------------------------------------------------------------------
+# Pluggable torch embedding model
+# ---------------------------------------------------------------------------
+
+
+class IdentityEmbeddingModel:
+    """Torch embedding hook.
+
+    Loads a TorchScript or state_dict checkpoint. Expected interface:
+    forward(x: float32[B, D]) -> float32[B, E] embedding, where D is the
+    capture-SDK feature dimension (IDENTITY_EMBEDDING_DIM). Absent weights
+    mean every biometric check fails closed.
+    """
+
+    def __init__(self) -> None:
+        self.model = None
+        self.mode = "model_unavailable"
+        if not MODEL_PATH.exists():
+            logger.warning(
+                "IDENTITY EMBEDDING MODEL MISSING at %s — biometric/face endpoints will FAIL CLOSED "
+                "(model_unavailable). Export weights via ml/train to enable scoring.", MODEL_PATH,
+            )
+            return
+        try:
+            import torch
+
+            try:
+                self.model = torch.jit.load(str(MODEL_PATH), map_location="cpu")
+            except Exception:
+                from .model_def import IdentityEmbedder  # ml lane architecture hook
+
+                self.model = IdentityEmbedder()
+                self.model.load_state_dict(torch.load(str(MODEL_PATH), map_location="cpu"))
+            self.model.eval()
+            self.mode = "model_loaded"
+            logger.info("Loaded identity embedding model from %s", MODEL_PATH)
+        except Exception as exc:  # noqa: BLE001
+            self.model = None
+            logger.warning("IDENTITY EMBEDDING MODEL FAILED TO LOAD (%s) — failing closed.", exc)
+
+    def embed(self, features: List[float]) -> Optional[List[float]]:
+        if self.model is None:
+            return None
+        import torch
+
+        with torch.no_grad():
+            tensor = torch.tensor([features], dtype=torch.float32)
+            embedding = self.model(tensor)[0]
+            norm = embedding.norm().clamp_min(1e-9)
+            return (embedding / norm).tolist()
+
+    @staticmethod
+    def cosine(a: List[float], b: List[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        na = math.sqrt(sum(x * x for x in a))
+        nb = math.sqrt(sum(y * y for y in b))
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+
+
+def get_model(request: Request) -> IdentityEmbeddingModel:
+    model = getattr(request.app.state, "embedding_model", None)
+    if model is None:
+        model = request.app.state.embedding_model = IdentityEmbeddingModel()
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Request/Response models
+# ---------------------------------------------------------------------------
+
+
 class IdentityVerificationRequest(BaseModel):
     user_id: str
     nin: Optional[str] = None
@@ -29,22 +169,31 @@ class IdentityVerificationRequest(BaseModel):
     email: Optional[str] = None
     address: Optional[str] = None
 
+
 class DocumentVerificationRequest(BaseModel):
     user_id: str
     document_type: str  # NIN, BVN, DRIVERS_LICENSE, PASSPORT, VOTERS_CARD
     document_number: str
     document_image: Optional[str] = None  # Base64 encoded
     selfie_image: Optional[str] = None  # For face matching
+    # Precomputed capture-SDK feature vectors for real face matching.
+    document_face_features: Optional[List[float]] = None
+    selfie_face_features: Optional[List[float]] = None
+
 
 class BiometricVerificationRequest(BaseModel):
     user_id: str
     biometric_type: str  # FACIAL, FINGERPRINT
-    biometric_data: str  # Base64 encoded
-    reference_data: Optional[str] = None
+    # Precomputed probe + reference feature vectors from the capture SDK.
+    probe_features: Optional[List[float]] = None
+    reference_features: Optional[List[float]] = None
+    liveness_features: Optional[List[float]] = None
+
 
 class SyntheticIdentityRequest(BaseModel):
     user_id: str
     identity_data: Dict
+
 
 class CrossReferenceRequest(BaseModel):
     user_id: str
@@ -53,195 +202,182 @@ class CrossReferenceRequest(BaseModel):
     phone_number: Optional[str] = None
     email: Optional[str] = None
 
+
 # Nigerian document validation patterns
 NIN_PATTERN = r'^\d{11}$'
 BVN_PATTERN = r'^\d{11}$'
 PHONE_PATTERN = r'^\+?234[0-9]{10}$|^0[0-9]{10}$'
 
+
 def validate_nin(nin: str) -> bool:
-    """Validate Nigerian National Identification Number"""
     return bool(re.match(NIN_PATTERN, nin))
 
+
 def validate_bvn(bvn: str) -> bool:
-    """Validate Bank Verification Number"""
     return bool(re.match(BVN_PATTERN, bvn))
 
+
 def validate_phone(phone: str) -> bool:
-    """Validate Nigerian phone number"""
     return bool(re.match(PHONE_PATTERN, phone))
 
+
 def calculate_identity_hash(identity_data: Dict) -> str:
-    """Calculate hash of identity data for comparison"""
     data_string = f"{identity_data.get('first_name', '')}{identity_data.get('last_name', '')}{identity_data.get('date_of_birth', '')}"
     return hashlib.sha256(data_string.encode()).hexdigest()
 
-def detect_synthetic_identity_indicators(identity_data: Dict) -> List[str]:
-    """Detect synthetic identity indicators"""
-    indicators = []
 
-    # Check for mismatched data
+def detect_synthetic_identity_indicators(identity_data: Dict) -> List[str]:
+    indicators = []
     if identity_data.get('age_from_nin') and identity_data.get('age_from_bvn'):
         if abs(identity_data['age_from_nin'] - identity_data['age_from_bvn']) > 2:
             indicators.append('age_mismatch')
-
-    # Check for recently created identities
     if identity_data.get('nin_issue_date'):
         issue_date = datetime.fromisoformat(identity_data['nin_issue_date'])
         if (datetime.now() - issue_date).days < 90:
             indicators.append('recently_created_nin')
-
-    # Check for inconsistent address
     if identity_data.get('nin_address') and identity_data.get('bvn_address'):
         if identity_data['nin_address'].lower() != identity_data['bvn_address'].lower():
             indicators.append('address_mismatch')
-
     return indicators
 
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    app.state.embedding_model = IdentityEmbeddingModel()
+    yield
+    await app.state.http_client.aclose()
+
+
+app = FastAPI(title="Identity Theft Detector", version="2.0.0", lifespan=lifespan)
+
+
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {"status": "healthy", "service": "identity-theft-detector", "timestamp": datetime.now().isoformat()}
+async def health_check(request: Request, _: dict = Depends(authenticate)):
+    model = get_model(request)
+    return {
+        "status": "healthy",
+        "service": SERVICE_NAME,
+        "model_mode": model.mode,
+        "model_path": str(MODEL_PATH),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
 
 @app.post("/verify-identity")
-async def verify_identity(request: IdentityVerificationRequest):
-    """
-    Comprehensive identity verification
-    Checks NIN, BVN, and cross-references multiple data sources
-    """
-    logger.info(f"Identity verification request for user {request.user_id}")
+async def verify_identity(request: IdentityVerificationRequest, _: dict = Depends(authenticate)):
+    """Format-level identity verification. Registry lookups fail closed."""
+    logger.info("Identity verification request for user %s", request.user_id)
 
     risk_score = 0
-    verification_results = {}
-    red_flags = []
+    verification_results: Dict[str, Any] = {}
+    red_flags: List[str] = []
 
-    # Validate NIN
     if request.nin:
-        if validate_nin(request.nin):
-            verification_results['nin_valid'] = True
-            # In production: Query NIMC database
-            verification_results['nin_verified'] = True
-        else:
-            verification_results['nin_valid'] = False
+        verification_results['nin_valid'] = validate_nin(request.nin)
+        if not verification_results['nin_valid']:
             risk_score += 30
             red_flags.append('invalid_nin_format')
+        # Registry verification requires NIMC connectivity (not configured here).
+        verification_results['nin_registry'] = 'unavailable'
 
-    # Validate BVN
     if request.bvn:
-        if validate_bvn(request.bvn):
-            verification_results['bvn_valid'] = True
-            # In production: Query NIBSS BVN database
-            verification_results['bvn_verified'] = True
-        else:
-            verification_results['bvn_valid'] = False
+        verification_results['bvn_valid'] = validate_bvn(request.bvn)
+        if not verification_results['bvn_valid']:
             risk_score += 30
             red_flags.append('invalid_bvn_format')
+        verification_results['bvn_registry'] = 'unavailable'
 
-    # Validate phone number
-    if validate_phone(request.phone_number):
-        verification_results['phone_valid'] = True
-    else:
-        verification_results['phone_valid'] = False
+    verification_results['phone_valid'] = validate_phone(request.phone_number)
+    if not verification_results['phone_valid']:
         risk_score += 10
         red_flags.append('invalid_phone_format')
 
-    # Check for stolen identity
-    identity_hash = calculate_identity_hash(request.dict())
-    # In production: Check against stolen identity database
-    is_stolen = False  # Placeholder
+    verification_results['stolen_identity_registry'] = 'unavailable'
+    identity_hash = calculate_identity_hash(request.model_dump())
+    verification_results['identity_hash'] = identity_hash
 
-    if is_stolen:
-        risk_score += 50
-        red_flags.append('known_stolen_identity')
-
-    # Calculate final risk
+    # Fail-closed posture: without registry access we cannot "verify", only
+    # confirm format validity.
+    registry_available = False
     if risk_score >= 70:
         risk_level = 'critical'
-        is_verified = False
     elif risk_score >= 40:
         risk_level = 'high'
-        is_verified = False
     elif risk_score >= 20:
         risk_level = 'medium'
-        is_verified = True
     else:
         risk_level = 'low'
-        is_verified = True
 
     return {
         'user_id': request.user_id,
-        'is_verified': is_verified,
+        'is_verified': False if not registry_available else risk_score < 40,
+        'verification_status': 'registry_unavailable',
         'risk_score': risk_score,
         'risk_level': risk_level,
         'verification_results': verification_results,
         'red_flags': red_flags,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now(timezone.utc).isoformat(),
     }
 
+
 @app.post("/verify-document")
-async def verify_document(request: DocumentVerificationRequest):
-    """
-    Verify document authenticity
-    Supports NIN, BVN, Driver's License, Passport, Voter's Card
-    """
-    logger.info(f"Document verification for user {request.user_id}, type: {request.document_type}")
+async def verify_document(request: DocumentVerificationRequest, http_request: Request, _: dict = Depends(authenticate)):
+    """Document format validation + real face matching via embedding model."""
+    logger.info("Document verification for user %s, type %s", request.user_id, request.document_type)
 
     risk_score = 0
-    verification_details = {}
+    verification_details: Dict[str, Any] = {}
 
-    # Validate document number format
+    format_lengths = {'DRIVERS_LICENSE': 10, 'PASSPORT': 8, 'VOTERS_CARD': 10}
     if request.document_type == 'NIN':
-        if not validate_nin(request.document_number):
-            risk_score += 40
-            verification_details['format_valid'] = False
-        else:
-            verification_details['format_valid'] = True
-
+        verification_details['format_valid'] = validate_nin(request.document_number)
     elif request.document_type == 'BVN':
-        if not validate_bvn(request.document_number):
-            risk_score += 40
-            verification_details['format_valid'] = False
-        else:
-            verification_details['format_valid'] = True
-
-    elif request.document_type == 'DRIVERS_LICENSE':
-        # Nigerian driver's license format validation
-        verification_details['format_valid'] = len(request.document_number) >= 10
-
-    elif request.document_type == 'PASSPORT':
-        # International passport format
-        verification_details['format_valid'] = len(request.document_number) >= 8
-
-    elif request.document_type == 'VOTERS_CARD':
-        # Voter's card format
-        verification_details['format_valid'] = len(request.document_number) >= 10
-
-    # Document image analysis (if provided)
-    if request.document_image:
-        # In production: OCR and image analysis
-        verification_details['image_analysis'] = {
-            'quality': 'good',
-            'tampering_detected': False,
-            'text_extracted': True
-        }
-
-    # Face matching (if selfie provided)
-    if request.selfie_image and request.document_image:
-        # In production: Facial recognition
-        verification_details['face_match'] = {
-            'match_score': 0.92,
-            'is_match': True
-        }
-
-    # Calculate final risk
-    if risk_score >= 60:
-        risk_level = 'high'
-        is_authentic = False
-    elif risk_score >= 30:
-        risk_level = 'medium'
-        is_authentic = True
+        verification_details['format_valid'] = validate_bvn(request.document_number)
+    elif request.document_type in format_lengths:
+        verification_details['format_valid'] = len(request.document_number) >= format_lengths[request.document_type]
     else:
-        risk_level = 'low'
-        is_authentic = True
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"unsupported document_type {request.document_type}")
+    if not verification_details['format_valid']:
+        risk_score += 40
+
+    # Real face matching: requires both feature vectors AND the model.
+    if request.selfie_face_features and request.document_face_features:
+        model = get_model(http_request)
+        probe = model.embed(request.selfie_face_features)
+        reference = model.embed(request.document_face_features)
+        if probe is None or reference is None:
+            logger.warning("face_match requested but model unavailable — failing closed")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"status": "model_unavailable", "detail": "face matching model not loaded"},
+            )
+        match_score = model.cosine(probe, reference)
+        verification_details['face_match'] = {
+            'match_score': round(match_score, 6),
+            'is_match': match_score >= MATCH_THRESHOLD,
+            'model_mode': model.mode,
+        }
+        if match_score < MATCH_THRESHOLD:
+            risk_score += 50
+    elif request.selfie_image or request.document_image:
+        # Raw images without a featurizer cannot be matched honestly.
+        verification_details['face_match'] = {
+            'status': 'unavailable',
+            'detail': 'provide capture-SDK feature vectors (selfie_face_features/document_face_features)',
+        }
+
+    if risk_score >= 60:
+        risk_level, is_authentic = 'high', False
+    elif risk_score >= 30:
+        risk_level, is_authentic = 'medium', True
+    else:
+        risk_level, is_authentic = 'low', True
 
     return {
         'user_id': request.user_id,
@@ -250,62 +386,61 @@ async def verify_document(request: DocumentVerificationRequest):
         'risk_score': risk_score,
         'risk_level': risk_level,
         'verification_details': verification_details,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now(timezone.utc).isoformat(),
     }
 
+
 @app.post("/verify-biometric")
-async def verify_biometric(request: BiometricVerificationRequest):
-    """
-    Verify biometric data (facial recognition, fingerprint)
-    """
-    logger.info(f"Biometric verification for user {request.user_id}, type: {request.biometric_type}")
+async def verify_biometric(request: BiometricVerificationRequest, http_request: Request, _: dict = Depends(authenticate)):
+    """Biometric matching via the torch embedding model. Fails closed."""
+    logger.info("Biometric verification for user %s, type %s", request.user_id, request.biometric_type)
 
-    verification_result = {}
+    if request.biometric_type not in {'FACIAL', 'FINGERPRINT'}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported biometric_type")
+    if not request.probe_features or not request.reference_features:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="probe_features and reference_features are required (capture-SDK feature vectors)",
+        )
 
-    if request.biometric_type == 'FACIAL':
-        # In production: Use facial recognition library
-        verification_result = {
-            'match_score': 0.95,
-            'is_match': True,
-            'confidence': 'high',
-            'liveness_detected': True
-        }
+    model = get_model(http_request)
+    probe = model.embed(request.probe_features)
+    reference = model.embed(request.reference_features)
+    if probe is None or reference is None:
+        logger.warning("biometric requested but model unavailable — failing closed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"status": "model_unavailable", "detail": "biometric embedding model not loaded"},
+        )
 
-    elif request.biometric_type == 'FINGERPRINT':
-        # In production: Fingerprint matching
-        verification_result = {
-            'match_score': 0.98,
-            'is_match': True,
-            'confidence': 'very_high'
-        }
+    match_score = model.cosine(probe, reference)
+    verification_result = {
+        'match_score': round(match_score, 6),
+        'is_match': match_score >= MATCH_THRESHOLD,
+        'model_mode': model.mode,
+        # Liveness requires a dedicated liveness model; never fabricate it.
+        'liveness': 'not_evaluated',
+    }
 
     return {
         'user_id': request.user_id,
         'biometric_type': request.biometric_type,
         'verification_result': verification_result,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now(timezone.utc).isoformat(),
     }
 
+
 @app.post("/detect-synthetic-identity")
-async def detect_synthetic_identity(request: SyntheticIdentityRequest):
-    """
-    Detect synthetic identities (fabricated from real and fake data)
-    """
-    logger.info(f"Synthetic identity detection for user {request.user_id}")
-
+async def detect_synthetic_identity(request: SyntheticIdentityRequest, _: dict = Depends(authenticate)):
     indicators = detect_synthetic_identity_indicators(request.identity_data)
-
     risk_score = len(indicators) * 20
 
     if risk_score >= 60:
-        risk_level = 'critical'
-        is_synthetic = True
+        risk_level, is_synthetic = 'critical', True
     elif risk_score >= 40:
-        risk_level = 'high'
-        is_synthetic = True
+        risk_level, is_synthetic = 'high', True
     else:
-        risk_level = 'low'
-        is_synthetic = False
+        risk_level, is_synthetic = 'low', False
 
     return {
         'user_id': request.user_id,
@@ -313,90 +448,67 @@ async def detect_synthetic_identity(request: SyntheticIdentityRequest):
         'risk_score': risk_score,
         'risk_level': risk_level,
         'indicators': indicators,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now(timezone.utc).isoformat(),
     }
 
+
 @app.post("/cross-reference-check")
-async def cross_reference_check(request: CrossReferenceRequest):
-    """
-    Cross-reference identity across multiple databases
-    NIN, BVN, phone, email, credit bureaus, etc.
-    """
-    logger.info(f"Cross-reference check for user {request.user_id}")
+async def cross_reference_check(request: CrossReferenceRequest, _: dict = Depends(authenticate)):
+    """Cross-reference identity. Unconfigured sources are 'unavailable', not 'found'."""
+    logger.info("Cross-reference check for user %s", request.user_id)
 
-    cross_reference_results = {}
-    inconsistencies = []
-
-    # NIN cross-reference
-    if request.nin:
-        # In production: Query NIMC database
-        cross_reference_results['nin'] = {
-            'found': True,
-            'name_match': True,
-            'dob_match': True
-        }
-
-    # BVN cross-reference
-    if request.bvn:
-        # In production: Query NIBSS database
-        cross_reference_results['bvn'] = {
-            'found': True,
-            'name_match': True,
-            'phone_match': True
-        }
-
-    # Phone number cross-reference
-    if request.phone_number:
-        # In production: Query telco databases
-        cross_reference_results['phone'] = {
-            'registered': True,
-            'name_match': True,
-            'active': True
-        }
-
-    # Email cross-reference
-    if request.email:
-        # In production: Email verification services
-        cross_reference_results['email'] = {
-            'valid': True,
-            'disposable': False,
-            'reputation_score': 85
-        }
-
-    # Check for inconsistencies
-    if not cross_reference_results.get('nin', {}).get('name_match'):
-        inconsistencies.append('nin_name_mismatch')
-
-    if not cross_reference_results.get('bvn', {}).get('phone_match'):
-        inconsistencies.append('bvn_phone_mismatch')
-
-    risk_score = len(inconsistencies) * 25
+    cross_reference_results: Dict[str, Any] = {}
+    for source, provided in (
+        ('nin', request.nin), ('bvn', request.bvn),
+        ('phone', request.phone_number), ('email', request.email),
+    ):
+        if provided:
+            # External registries (NIMC/NIBSS/telco) are not configured in
+            # this deployment; fail closed instead of fabricating matches.
+            cross_reference_results[source] = {'status': 'unavailable'}
 
     return {
         'user_id': request.user_id,
         'cross_reference_results': cross_reference_results,
-        'inconsistencies': inconsistencies,
-        'risk_score': risk_score,
-        'all_checks_passed': len(inconsistencies) == 0,
-        'timestamp': datetime.now().isoformat()
+        'inconsistencies': [],
+        'risk_score': 0,
+        'all_checks_passed': False,
+        'checks_status': 'registry_unavailable',
+        'timestamp': datetime.now(timezone.utc).isoformat(),
     }
 
-@app.get("/identity-theft-alerts")
-async def get_identity_theft_alerts():
-    """Get recent identity theft alerts"""
-    # In production: Query database
-    alerts = [
-        {
-            'alert_id': 'alert_001',
-            'user_id': 'user_123',
-            'alert_type': 'synthetic_identity',
-            'risk_level': 'high',
-            'timestamp': datetime.now().isoformat()
-        }
-    ]
 
+@app.get("/identity-theft-alerts")
+async def get_identity_theft_alerts(_: dict = Depends(authenticate)):
+    """Alerts require a configured alert store (DATABASE_URL); fail closed."""
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not database_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="alert store not configured (set DATABASE_URL)",
+        )
+    import psycopg2
+
+    try:
+        with psycopg2.connect(database_url) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT alert_id, user_id, alert_type, risk_level, created_at "
+                "FROM identity_theft_alerts ORDER BY created_at DESC LIMIT 50"
+            )
+            alerts = [
+                {
+                    'alert_id': row[0], 'user_id': row[1], 'alert_type': row[2],
+                    'risk_level': row[3], 'timestamp': row[4].isoformat(),
+                }
+                for row in cur.fetchall()
+            ]
+    except Exception as exc:  # noqa: BLE001
+        logger.error("alert store query failed: %s", exc)
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="alert store unavailable") from exc
     return {'alerts': alerts, 'count': len(alerts)}
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8089)
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8089")))

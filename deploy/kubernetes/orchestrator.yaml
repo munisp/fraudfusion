@@ -1,0 +1,115 @@
+# FraudFusion Go orchestrator (journey execution engine).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fraudfusion-services
+  labels:
+    kubernetes.io/metadata.name: fraudfusion-services
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orchestrator
+  namespace: fraudfusion-services
+type: Opaque
+stringData:
+  # Override before deploying; placeholders, not working defaults. The
+  # orchestrator fails fast at startup if any of these are missing.
+  keycloak-client-secret: CHANGE_ME
+  permify-api-key: CHANGE_ME
+  apisix-api-key: CHANGE_ME
+  redis-password: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: orchestrator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: orchestrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: orchestrator
+    spec:
+      containers:
+        - name: orchestrator
+          image: ghcr.io/munisp/fraudfusion/orchestrator:latest
+          env:
+            - name: PORT
+              value: "8000"
+            - name: KAFKA_BROKERS
+              value: kafka.fraudfusion-data.svc.cluster.local:9092
+            - name: KAFKA_TOPIC
+              value: fraudfusion-events
+            - name: DAPR_URL
+              value: http://localhost:3500
+            - name: DAPR_APP_ID
+              value: fraudfusion-orchestrator
+            - name: TEMPORAL_HOST
+              value: temporal.fraudfusion-data.svc.cluster.local:7233
+            - name: TEMPORAL_NAMESPACE
+              value: default
+            - name: TEMPORAL_TASK_QUEUE
+              value: fraudfusion-journeys
+            - name: KEYCLOAK_URL
+              value: http://keycloak.fraudfusion-identity.svc.cluster.local:8080
+            - name: KEYCLOAK_REALM
+              value: fraudfusion
+            - name: KEYCLOAK_CLIENT_ID
+              value: orchestrator
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: orchestrator, key: keycloak-client-secret}
+            - name: PERMIFY_URL
+              value: http://permify.fraudfusion-identity.svc.cluster.local:3476
+            - name: PERMIFY_API_KEY
+              valueFrom:
+                secretKeyRef: {name: orchestrator, key: permify-api-key}
+            - name: PERMIFY_BOOTSTRAP_TENANT
+              value: t1
+            - name: REDIS_ADDR
+              value: redis.fraudfusion-data.svc.cluster.local:6379
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: orchestrator, key: redis-password}
+            - name: REDIS_TLS
+              value: "true"
+            - name: APISIX_ADMIN_URL
+              value: http://apisix-admin.fraudfusion-gateway.svc.cluster.local:9180
+            - name: APISIX_API_KEY
+              valueFrom:
+                secretKeyRef: {name: orchestrator, key: apisix-api-key}
+            - name: TIGERBEETLE_ADDRESSES
+              value: tigerbeetle.fraudfusion-data.svc.cluster.local:3000
+            - name: LAKEHOUSE_URL
+              value: http://lakehouse.fraudfusion-data.svc.cluster.local:8090
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: orchestrator
+spec:
+  selector:
+    app.kubernetes.io/name: orchestrator
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

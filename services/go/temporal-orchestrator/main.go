@@ -17,6 +17,8 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
+
+	"github.com/munisp/fraudfusion/services/go/temporal-orchestrator/workflows"
 )
 
 // JourneyWorkflow orchestrates user journeys with Temporal
@@ -326,6 +328,10 @@ func main() {
 
 	// Register workflows
 	w.RegisterWorkflow(ExecuteJourneyWorkflow)
+
+	// Register the journey-specific workflows and their activities.
+	workflows.RegisterJourney34Workflow(w)
+	workflows.RegisterJourney37Workflow(w)
 
 	// Register activities
 	landVerificationActivities := &LandVerificationActivities{}

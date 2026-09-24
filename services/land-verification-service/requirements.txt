@@ -1,0 +1,10 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.5
+python-multipart>=0.0.9
+httpx>=0.27
+# PDF report generation (the report generator falls back to a built-in
+# minimal PDF writer when reportlab is not installed)
+reportlab>=4.0
+# PostgreSQL persistence driver; required only when DATABASE_URL points at postgres
+# psycopg[binary]>=3.1

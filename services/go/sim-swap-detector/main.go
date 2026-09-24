@@ -33,8 +33,8 @@ type telcoVerificationClient struct {
 }
 
 type telcoVerificationResponse struct {
-	Verified bool   `json:"verified"`
-	Status   string `json:"status"`
+	Verified  bool   `json:"verified"`
+	Status    string `json:"status"`
 	Reference string `json:"reference"`
 }
 
@@ -52,27 +52,27 @@ type SIMSwapEvent struct {
 
 // DeviceInfo represents device fingerprint information
 type DeviceInfo struct {
-	DeviceID       string    `json:"device_id"`
-	UserID         string    `json:"user_id"`
-	DeviceModel    string    `json:"device_model"`
-	OS             string    `json:"os"`
-	OSVersion      string    `json:"os_version"`
-	IPAddress      string    `json:"ip_address"`
-	Location       string    `json:"location"`
-	FirstSeenAt    time.Time `json:"first_seen_at"`
-	LastSeenAt     time.Time `json:"last_seen_at"`
+	DeviceID    string    `json:"device_id"`
+	UserID      string    `json:"user_id"`
+	DeviceModel string    `json:"device_model"`
+	OS          string    `json:"os"`
+	OSVersion   string    `json:"os_version"`
+	IPAddress   string    `json:"ip_address"`
+	Location    string    `json:"location"`
+	FirstSeenAt time.Time `json:"first_seen_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
 }
 
 // AccountAccessLog represents account access attempt
 type AccountAccessLog struct {
-	AccessID      string    `json:"access_id"`
-	UserID        string    `json:"user_id"`
-	DeviceID      string    `json:"device_id"`
-	AccessType    string    `json:"access_type"` // login, otp_request, settings_change, transfer
-	Success       bool      `json:"success"`
-	IPAddress     string    `json:"ip_address"`
-	Location      string    `json:"location"`
-	Timestamp     time.Time `json:"timestamp"`
+	AccessID   string    `json:"access_id"`
+	UserID     string    `json:"user_id"`
+	DeviceID   string    `json:"device_id"`
+	AccessType string    `json:"access_type"` // login, otp_request, settings_change, transfer
+	Success    bool      `json:"success"`
+	IPAddress  string    `json:"ip_address"`
+	Location   string    `json:"location"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 // RiskAnalysis represents SIM swap fraud risk analysis
@@ -102,6 +102,10 @@ func main() {
 	// Setup Gin router
 	router := gin.Default()
 
+	// All routes require a valid Keycloak token (fail-closed introspection);
+	// destructive actions additionally require fraud_analyst/admin.
+	router.Use(authMiddleware())
+
 	// API routes
 	v1 := router.Group("/api/v1/sim-swap")
 	{
@@ -113,7 +117,7 @@ func main() {
 		v1.GET("/risk/:user_id", getUserRisk)
 		v1.GET("/alerts", getAlerts)
 		v1.GET("/reports/daily", getDailyReport)
-		v1.POST("/block-account", blockAccount)
+		v1.POST("/block-account", requireRole("fraud_analyst", "admin"), blockAccount)
 		v1.GET("/health", healthCheck)
 	}
 
@@ -128,13 +132,18 @@ func main() {
 }
 
 func initDB() {
+	sslMode := getEnv("DB_SSLMODE", "require")
+	if sslMode == "disable" && !strings.EqualFold(os.Getenv("DB_ALLOW_INSECURE"), "true") {
+		log.Fatal("DB_SSLMODE=disable requires DB_ALLOW_INSECURE=true (local development only)")
+	}
 	connStr := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		getEnv("DB_HOST", "localhost"),
 		getEnv("DB_PORT", "5432"),
 		getEnv("DB_USER", "postgres"),
 		getEnv("DB_PASSWORD", ""),
 		getEnv("DB_NAME", "fraudfusion"),
+		sslMode,
 	)
 
 	var err error
@@ -143,7 +152,7 @@ func initDB() {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
-	if err = db.Ping(); err != nil {
+	if err = withBackoff(func() error { return db.Ping() }); err != nil {
 		log.Fatal("Failed to ping database:", err)
 	}
 
@@ -157,7 +166,7 @@ func initRedis() {
 		DB:       0,
 	})
 
-	if err := redisClient.Ping(ctx).Err(); err != nil {
+	if err := withBackoff(func() error { return redisClient.Ping(ctx).Err() }); err != nil {
 		log.Fatal("Failed to connect to Redis:", err)
 	}
 
@@ -559,7 +568,7 @@ func verifySIMChange(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"event_id": event.EventID,
 		"verified": verified,
-		"telco": event.Telco,
+		"telco":    event.Telco,
 		"recommendation": func() string {
 			if !verified {
 				return "SIM swap not verified by telco - potential fraud"
@@ -583,8 +592,8 @@ func analyzeDevice(c *gin.Context) {
 	isSuspicious := isSuspiciousDevice(device)
 
 	c.JSON(http.StatusOK, gin.H{
-		"device_id": device.DeviceID,
-		"is_known": isKnown,
+		"device_id":     device.DeviceID,
+		"is_known":      isKnown,
 		"is_suspicious": isSuspicious,
 		"recommendation": func() string {
 			if !isKnown && isSuspicious {
@@ -635,8 +644,8 @@ func checkLocationAnomaly(c *gin.Context) {
 	hasAnomaly := hasLocationAnomaly(req.UserID, req.Location)
 
 	c.JSON(http.StatusOK, gin.H{
-		"user_id": req.UserID,
-		"location": req.Location,
+		"user_id":    req.UserID,
+		"location":   req.Location,
 		"is_anomaly": hasAnomaly,
 		"recommendation": func() string {
 			if hasAnomaly {
@@ -661,7 +670,7 @@ func monitorAccountAccess(c *gin.Context) {
 	isSuspicious := isAccessSuspicious(accessLog)
 
 	c.JSON(http.StatusOK, gin.H{
-		"access_id": accessLog.AccessID,
+		"access_id":     accessLog.AccessID,
 		"is_suspicious": isSuspicious,
 		"recommendation": func() string {
 			if isSuspicious {
@@ -733,12 +742,12 @@ func getUserRisk(c *gin.Context) {
 	json.Unmarshal(redFlagsJSON, &redFlags)
 
 	c.JSON(http.StatusOK, gin.H{
-		"user_id": userID,
-		"event_id": eventID,
+		"user_id":    userID,
+		"event_id":   eventID,
 		"risk_score": riskScore,
 		"risk_level": riskLevel,
-		"is_fraud": isFraud,
-		"red_flags": redFlags,
+		"is_fraud":   isFraud,
+		"red_flags":  redFlags,
 	})
 }
 
@@ -767,8 +776,8 @@ func getAlerts(c *gin.Context) {
 		rows.Scan(&userID, &eventID, &riskScore, &riskLevel, &createdAt)
 
 		alerts = append(alerts, gin.H{
-			"user_id": userID,
-			"event_id": eventID,
+			"user_id":    userID,
+			"event_id":   eventID,
 			"risk_score": riskScore,
 			"risk_level": riskLevel,
 			"created_at": createdAt,
@@ -777,7 +786,7 @@ func getAlerts(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"alerts": alerts,
-		"count": len(alerts),
+		"count":  len(alerts),
 	})
 }
 
@@ -801,8 +810,8 @@ func getDailyReport(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"date": time.Now().Format("2006-01-02"),
-		"total_events": totalEvents,
+		"date":           time.Now().Format("2006-01-02"),
+		"total_events":   totalEvents,
 		"fraud_detected": fraudDetected,
 		"avg_risk_score": avgRiskScore,
 	})
@@ -824,7 +833,7 @@ func blockAccount(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"user_id": req.UserID,
 		"blocked": true,
-		"reason": req.Reason,
+		"reason":  req.Reason,
 	})
 }
 

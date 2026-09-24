@@ -1,0 +1,10 @@
+{
+  "auc_pr": 0.2607689132809578,
+  "auc_roc": 0.6927592157932525,
+  "f1": 0.09317478416680242,
+  "base_rate": 0.038891906572514935,
+  "recall_at_fpr_0.01": 0.2541899441340782,
+  "epochs_trained": 11,
+  "seed": 42,
+  "note": "trained on legitimate transactions only; score=MSE recon error"
+}

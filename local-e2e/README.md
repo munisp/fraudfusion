@@ -1,6 +1,23 @@
 # Local Mobile-to-Go Contract Environment
 
-This directory provides a **local contract-test simulator**, not a production stack. It runs PostgreSQL and a small Go HTTP service that implements the subset of mobile endpoints used by the screen-level tests.
+This directory provides a **local contract-test simulator**, not a production stack.
+
+## Services
+
+| Service | Port(s) | Purpose |
+| --- | --- | --- |
+| postgres | 54329 | Contract-test database |
+| go-mobile-mock | 8088 | Go mock of the mobile/KYC API under contract test |
+| redis | 6380 | Cache/queue seam used by services |
+| keycloak | 8180 | OIDC issuer (start-dev); realm import wired for `deploy/keycloak/fraudfusion-realm.json` — **that file does not exist yet**, so the container starts with the default `master` realm until it is added (see commented volume in `docker-compose.yml`) |
+| permify | 3476/3478 | Authorization service (in-memory schema) |
+| mlflow (+ mlflow-db) | 5000 | Model registry, mirrors `mlops/mlflow/docker-compose.yml` |
+| aml-ml-service | 8100 | AML scorer from `mlops/serving`; starts in documented rule-fallback mode without the ONNX artifact |
+
+All services carry healthchecks except `go-mobile-mock` (distroless image with no
+shell or curl); the contract script polls its `/healthz` with retries instead.
+Permify's image is distroless too, so its healthcheck is process-level
+(`permify version`).
 
 ## Start
 

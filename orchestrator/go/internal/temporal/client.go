@@ -87,6 +87,14 @@ func (c *Client) GetWorkflowResult(ctx context.Context, workflowID, runID string
 	return &result, nil
 }
 
+// Health performs a real Temporal server health check via the SDK.
+func (c *Client) Health(ctx context.Context) error {
+	if _, err := c.client.CheckHealth(ctx, &temporalsdk.CheckHealthRequest{}); err != nil {
+		return fmt.Errorf("temporal health check: %w", err)
+	}
+	return nil
+}
+
 // Close releases the Temporal SDK connection.
 func (c *Client) Close() {
 	if c.client != nil {

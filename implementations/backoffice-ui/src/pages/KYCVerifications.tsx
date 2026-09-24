@@ -1,5 +1,7 @@
 import React, { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { api } from '../services/api';
+import type { KYCVerification as ApiKYCVerification } from '../types';
 import {
   Search,
   Filter,
@@ -44,6 +46,12 @@ interface KYCVerification {
   }[];
 }
 
+/**
+ * Built-in sample verifications, used only as a documented offline fallback when
+ * the backoffice API (`GET /backoffice/kyc/verifications`) is unreachable.
+ * Approve/Reject decisions against the fallback are applied locally and are not
+ * persisted.
+ */
 const mockVerifications: KYCVerification[] = [
   {
     id: 'kyc-001',
@@ -183,6 +191,41 @@ const StepIndicator: React.FC<{ status: 'pending' | 'verified' | 'failed'; label
   );
 };
 
+/** Map the API verification record onto the richer view model used by this page. */
+function mapApiVerification(v: ApiKYCVerification): KYCVerification {
+  const data = v.verificationData ?? {};
+  const step = (key: string): 'pending' | 'verified' | 'failed' => {
+    const value = data[key];
+    return value === 'verified' || value === 'failed' ? value : 'pending';
+  };
+  const statusMap: Record<ApiKYCVerification['status'], KYCVerification['status']> = {
+    pending: 'pending',
+    verified: 'approved',
+    failed: 'rejected',
+    manual_review: 'requires_review',
+  };
+  return {
+    id: v.id,
+    customerId: v.customerId,
+    customerName: v.customerName,
+    email: typeof data.email === 'string' ? data.email : '',
+    phone: typeof data.phone === 'string' ? data.phone : '',
+    status: statusMap[v.status],
+    submittedAt: v.submittedAt,
+    completedAt: v.completedAt,
+    verificationType: v.verificationType === 'employment' ? 'business' : 'individual',
+    riskScore: typeof v.matchScore === 'number' ? 1 - v.matchScore : 0.5,
+    verificationSteps: {
+      bvn: step('bvn'),
+      nin: step('nin'),
+      address: step('address'),
+      biometric: step('biometric'),
+      document: step('document'),
+    },
+    documents: Array.isArray(data.documents) ? data.documents : [],
+  };
+}
+
 const KYCVerifications: React.FC = () => {
   const [selectedVerification, setSelectedVerification] = useState<KYCVerification | null>(null);
   const [showFilters, setShowFilters] = useState(false);
@@ -190,8 +233,72 @@ const KYCVerifications: React.FC = () => {
   const [typeFilter, setTypeFilter] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
   const [page, setPage] = useState(1);
+  const [decisionError, setDecisionError] = useState<string | null>(null);
+  const [decisionPending, setDecisionPending] = useState(false);
+  // Local overrides hold optimistic updates and fallback-mode decisions.
+  const [localVerifications, setLocalVerifications] = useState<KYCVerification[] | null>(null);
 
-  const filteredVerifications = mockVerifications.filter((v) => {
+  const {
+    data: apiVerifications,
+    isError: apiUnreachable,
+    refetch,
+    isFetching,
+  } = useQuery({
+    queryKey: ['kycVerifications'],
+    queryFn: async () => {
+      const response = await api.getKYCVerifications({}, { page: 1, pageSize: 100 });
+      return response.data.map(mapApiVerification);
+    },
+    retry: false,
+  });
+
+  // Live API data wins; documented mock fallback when the API is unreachable.
+  const verifications = localVerifications ?? apiVerifications ?? mockVerifications;
+
+  const submitDecision = async (
+    verification: KYCVerification,
+    decision: 'approved' | 'rejected',
+    reason: string,
+  ) => {
+    setDecisionError(null);
+    setDecisionPending(true);
+    const previous = verifications;
+    const optimistic = previous.map((v) =>
+      v.id === verification.id
+        ? { ...v, status: decision, completedAt: new Date().toISOString() }
+        : v,
+    );
+    setLocalVerifications(optimistic);
+    setSelectedVerification((current) =>
+      current && current.id === verification.id
+        ? { ...current, status: decision, completedAt: new Date().toISOString() }
+        : current,
+    );
+    try {
+      await api.overrideKYCDecision(
+        verification.id,
+        decision,
+        reason || `Back-office ${decision === 'approved' ? 'approval' : 'rejection'}`,
+      );
+    } catch (cause) {
+      if (apiUnreachable) {
+        setDecisionError(
+          'Backoffice API unreachable — decision applied to local sample data only and will not persist.',
+        );
+      } else {
+        // Roll back the optimistic update.
+        setLocalVerifications(previous);
+        setSelectedVerification(verification);
+        setDecisionError(
+          cause instanceof Error ? cause.message : 'Failed to submit the decision.',
+        );
+      }
+    } finally {
+      setDecisionPending(false);
+    }
+  };
+
+  const filteredVerifications = verifications.filter((v) => {
     if (statusFilter && v.status !== statusFilter) return false;
     if (typeFilter && v.verificationType !== typeFilter) return false;
     if (searchQuery) {
@@ -207,11 +314,24 @@ const KYCVerifications: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      {apiUnreachable && (
+        <div className="rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-800">
+          Backoffice API unreachable — showing built-in sample data. Decisions will be applied
+          locally only.
+        </div>
+      )}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-900">KYC Verifications</h1>
         <div className="flex items-center space-x-3">
-          <button className="flex items-center px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">
-            <RefreshCw className="w-4 h-4 mr-2" />
+          <button
+            onClick={() => {
+              setLocalVerifications(null);
+              void refetch();
+            }}
+            disabled={isFetching}
+            className="flex items-center px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+          >
+            <RefreshCw className={`w-4 h-4 mr-2 ${isFetching ? 'animate-spin' : ''}`} />
             Refresh
           </button>
           <button
@@ -280,7 +400,7 @@ const KYCVerifications: React.FC = () => {
           <div className="flex items-center justify-between">
             <div>
               <p className="text-sm text-gray-500">Total Verifications</p>
-              <p className="text-2xl font-bold text-gray-900">{mockVerifications.length}</p>
+              <p className="text-2xl font-bold text-gray-900">{verifications.length}</p>
             </div>
             <div className="p-3 bg-blue-100 rounded-lg">
               <User className="w-6 h-6 text-blue-600" />
@@ -292,7 +412,7 @@ const KYCVerifications: React.FC = () => {
             <div>
               <p className="text-sm text-gray-500">Pending Review</p>
               <p className="text-2xl font-bold text-yellow-600">
-                {mockVerifications.filter((v) => v.status === 'pending' || v.status === 'requires_review').length}
+                {verifications.filter((v) => v.status === 'pending' || v.status === 'requires_review').length}
               </p>
             </div>
             <div className="p-3 bg-yellow-100 rounded-lg">
@@ -305,7 +425,7 @@ const KYCVerifications: React.FC = () => {
             <div>
               <p className="text-sm text-gray-500">Approved</p>
               <p className="text-2xl font-bold text-green-600">
-                {mockVerifications.filter((v) => v.status === 'approved').length}
+                {verifications.filter((v) => v.status === 'approved').length}
               </p>
             </div>
             <div className="p-3 bg-green-100 rounded-lg">
@@ -318,7 +438,7 @@ const KYCVerifications: React.FC = () => {
             <div>
               <p className="text-sm text-gray-500">High Risk</p>
               <p className="text-2xl font-bold text-red-600">
-                {mockVerifications.filter((v) => v.riskScore > 0.7).length}
+                {verifications.filter((v) => v.riskScore > 0.7).length}
               </p>
             </div>
             <div className="p-3 bg-red-100 rounded-lg">
@@ -449,7 +569,7 @@ const KYCVerifications: React.FC = () => {
 
       <div className="flex items-center justify-between">
         <p className="text-sm text-gray-500">
-          Showing {filteredVerifications.length} of {mockVerifications.length} verifications
+          Showing {filteredVerifications.length} of {verifications.length} verifications
         </p>
         <div className="flex items-center space-x-2">
           <button
@@ -473,7 +593,13 @@ const KYCVerifications: React.FC = () => {
       {selectedVerification && (
         <KYCDetailModal
           verification={selectedVerification}
-          onClose={() => setSelectedVerification(null)}
+          pending={decisionPending}
+          error={decisionError}
+          onDecision={(decision, reason) => void submitDecision(selectedVerification, decision, reason)}
+          onClose={() => {
+            setSelectedVerification(null);
+            setDecisionError(null);
+          }}
         />
       )}
     </div>
@@ -482,10 +608,21 @@ const KYCVerifications: React.FC = () => {
 
 interface KYCDetailModalProps {
   verification: KYCVerification;
+  pending: boolean;
+  error: string | null;
+  onDecision: (decision: 'approved' | 'rejected', reason: string) => void;
   onClose: () => void;
 }
 
-const KYCDetailModal: React.FC<KYCDetailModalProps> = ({ verification, onClose }) => {
+const KYCDetailModal: React.FC<KYCDetailModalProps> = ({
+  verification,
+  pending,
+  error,
+  onDecision,
+  onClose,
+}) => {
+  const [reason, setReason] = useState('');
+  const decided = verification.status === 'approved' || verification.status === 'rejected';
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
       <div className="bg-white rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] overflow-hidden">
@@ -615,19 +752,46 @@ const KYCDetailModal: React.FC<KYCDetailModalProps> = ({ verification, onClose }
           </div>
         </div>
 
-        <div className="flex items-center justify-end space-x-3 p-4 border-t border-gray-200">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
-          >
-            Close
-          </button>
-          <button className="px-4 py-2 text-sm font-medium text-white bg-green-600 rounded-lg hover:bg-green-700">
-            Approve
-          </button>
-          <button className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg hover:bg-red-700">
-            Reject
-          </button>
+        <div className="p-4 border-t border-gray-200 space-y-3">
+          {error && (
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">
+              {error}
+            </div>
+          )}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Decision reason (optional)
+            </label>
+            <input
+              type="text"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              placeholder="e.g. Documents match BVN record"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div className="flex items-center justify-end space-x-3">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
+            >
+              Close
+            </button>
+            <button
+              onClick={() => onDecision('approved', reason)}
+              disabled={pending || decided}
+              className="px-4 py-2 text-sm font-medium text-white bg-green-600 rounded-lg hover:bg-green-700 disabled:opacity-50"
+            >
+              {pending ? 'Submitting...' : 'Approve'}
+            </button>
+            <button
+              onClick={() => onDecision('rejected', reason)}
+              disabled={pending || decided}
+              className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50"
+            >
+              {pending ? 'Submitting...' : 'Reject'}
+            </button>
+          </div>
         </div>
       </div>
     </div>

@@ -1,0 +1,54 @@
+# Ray cluster config for fraud_net distributed training.
+# Launch: ray up mlops/ray/ray_cluster.yaml
+# Submit: ray job submit --address http://<head>:8265 -- \
+#           python mlops/ray/ray_train.py --num-workers 4 --epochs 10
+cluster_name: fraudfusion-ml
+
+max_workers: 4
+upscaling_speed: 1.0
+idle_timeout_minutes: 10
+
+provider:
+  type: aws
+  region: us-east-1
+  availability_zone: us-east-1a
+  cache_stopped_nodes: false
+
+auth:
+  ssh_user: ubuntu
+
+available_node_types:
+  ray.head.default:
+    node_config:
+      InstanceType: m5.2xlarge
+    resources: {"CPU": 8}
+    max_workers: 0
+  ray.worker.cpu:
+    node_config:
+      InstanceType: m5.2xlarge
+      InstanceMarketOptions:
+        MarketType: spot
+    resources: {"CPU": 8}
+    min_workers: 1
+    max_workers: 4
+
+head_node_type: ray.head.default
+
+setup_commands:
+  - pip install "ray[train]==2.40.0" torch==2.8.0 pyarrow pandas numpy
+
+file_mounts:
+  {
+    "~/fraudfusion/mlops": "./mlops",
+    "~/fraudfusion/ml": "./ml"
+  }
+
+head_setup_commands: []
+worker_setup_commands: []
+
+head_start_ray_commands:
+  - ray stop
+  - ray start --head --port=6379 --dashboard-host=0.0.0.0
+worker_start_ray_commands:
+  - ray stop
+  - ray start --address=$RAY_HEAD_IP:6379

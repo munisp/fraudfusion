@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PRIMARY_DB="${LEDGER_DR_PRIMARY_DB:-fraudfusion_ledger_primary_dr}"
 ISOLATED_DB="${LEDGER_DR_ISOLATED_DB:-fraudfusion_ledger_isolated_dr}"
-BASE_SCHEMA="$ROOT/database/chargeback_fraud_schema.sql"
+BASE_SCHEMA="$ROOT/database/20260801_chargeback_fraud_schema.sql"
 CHARGEBACK_HARDENING="$ROOT/database/20260820_chargeback_persistence_hardening.sql"
 CHARGEBACK_INTEGRITY="$ROOT/database/20260822_chargeback_funds_flow_integrity.sql"
 LEDGER_SCHEMA="$ROOT/database/20260822_double_entry_ledger_settlement_reconciliation.sql"

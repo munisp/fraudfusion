@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/backoff"
 )
 
 // Client manages routes through the APISIX Admin API.
@@ -55,7 +57,7 @@ func (c *Client) CreateRoute(ctx context.Context, route Route) error {
 		"uri":     route.URI,
 		"methods": route.Methods,
 		"upstream": map[string]interface{}{
-			"type": "roundrobin",
+			"type":  "roundrobin",
 			"nodes": map[string]int{upstream.Host: 1},
 		},
 	}
@@ -65,24 +67,45 @@ func (c *Client) CreateRoute(ctx context.Context, route Route) error {
 	}
 
 	endpoint := fmt.Sprintf("%s/apisix/admin/routes/%s", c.adminURL, url.PathEscape(route.ID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create APISIX route request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-KEY", c.apiKey)
+	return backoff.Do(ctx, backoff.Default(), func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create APISIX route request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-KEY", c.apiKey)
 
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("call APISIX Admin API: %w", err)
+		}
+		defer resp.Body.Close()
+		responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return fmt.Errorf("read APISIX route response: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+			return fmt.Errorf("APISIX route upsert returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+		}
+		return nil
+	})
+}
+
+// Health performs a real authenticated read against the Admin API so /health
+// reflects actual APISIX availability.
+func (c *Client) Health(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.adminURL+"/apisix/admin/routes?page_size=1", nil)
+	if err != nil {
+		return fmt.Errorf("create APISIX health request: %w", err)
+	}
+	req.Header.Set("X-API-KEY", c.apiKey)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("call APISIX Admin API: %w", err)
 	}
 	defer resp.Body.Close()
-	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return fmt.Errorf("read APISIX route response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("APISIX route upsert returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("APISIX Admin API unhealthy: status %d", resp.StatusCode)
 	}
 	return nil
 }

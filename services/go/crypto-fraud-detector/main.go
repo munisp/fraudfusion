@@ -47,25 +47,25 @@ type CryptoRiskAnalysis struct {
 }
 
 type WalletVerification struct {
-	WalletAddress string  `json:"wallet_address"`
-	Verified      bool    `json:"verified"`
-	RiskScore     int     `json:"risk_score"`
-	Blacklisted   bool    `json:"blacklisted"`
-	Exchanges     []string `json:"exchanges"`
+	WalletAddress string    `json:"wallet_address"`
+	Verified      bool      `json:"verified"`
+	RiskScore     int       `json:"risk_score"`
+	Blacklisted   bool      `json:"blacklisted"`
+	Exchanges     []string  `json:"exchanges"`
 	FirstSeen     time.Time `json:"first_seen"`
 	LastActivity  time.Time `json:"last_activity"`
 }
 
 type P2PTradingAlert struct {
-	TradeID       string    `json:"trade_id"`
-	SellerID      string    `json:"seller_id"`
-	BuyerID       string    `json:"buyer_id"`
-	Amount        float64   `json:"amount"`
-	Currency      string    `json:"currency"`
-	AlertType     string    `json:"alert_type"`
-	Severity      string    `json:"severity"`
-	Description   string    `json:"description"`
-	DetectedAt    time.Time `json:"detected_at"`
+	TradeID     string    `json:"trade_id"`
+	SellerID    string    `json:"seller_id"`
+	BuyerID     string    `json:"buyer_id"`
+	Amount      float64   `json:"amount"`
+	Currency    string    `json:"currency"`
+	AlertType   string    `json:"alert_type"`
+	Severity    string    `json:"severity"`
+	Description string    `json:"description"`
+	DetectedAt  time.Time `json:"detected_at"`
 }
 
 func main() {
@@ -95,7 +95,7 @@ func main() {
 		// Wallet verification
 		api.POST("/wallets/verify", verifyWallet)
 		api.GET("/wallets/:address/risk", getWalletRisk)
-		api.POST("/wallets/blacklist", blacklistWallet)
+		api.POST("/wallets/blacklist", requireRole("fraud_analyst", "admin"), blacklistWallet)
 
 		// P2P trading fraud detection
 		api.POST("/p2p/analyze", analyzeP2PTrade)
@@ -236,7 +236,9 @@ func checkWalletReputation(address string) int {
 	db.QueryRow("SELECT EXISTS(SELECT 1 FROM crypto_blacklist WHERE wallet_address = $1)", address).Scan(&blacklisted)
 
 	if blacklisted {
-		redisClient.Set(ctx, cacheKey, "100", 24*time.Hour)
+		if err := redisClient.Set(ctx, cacheKey, "100", 24*time.Hour).Err(); err != nil {
+			log.Printf("redis cache write failed for %s: %v", cacheKey, err)
+		}
 		return 100
 	}
 
@@ -262,7 +264,9 @@ func checkWalletReputation(address string) int {
 	}
 
 	// Cache result
-	redisClient.Set(ctx, cacheKey, fmt.Sprintf("%d", riskScore), 1*time.Hour)
+	if err := redisClient.Set(ctx, cacheKey, fmt.Sprintf("%d", riskScore), 1*time.Hour).Err(); err != nil {
+		log.Printf("redis cache write failed for %s: %v", cacheKey, err)
+	}
 
 	return riskScore
 }
@@ -270,14 +274,14 @@ func checkWalletReputation(address string) int {
 func isLegitimateExchange(platform string) bool {
 	// List of legitimate Nigerian crypto exchanges
 	legitimateExchanges := map[string]bool{
-		"binance":   true,
-		"luno":      true,
-		"quidax":    true,
-		"buycoin":   true,
+		"binance":     true,
+		"luno":        true,
+		"quidax":      true,
+		"buycoin":     true,
 		"yellow card": true,
-		"coinbase":  true,
-		"kraken":    true,
-		"paxful":    true,
+		"coinbase":    true,
+		"kraken":      true,
+		"paxful":      true,
 	}
 
 	platformLower := strings.ToLower(platform)
@@ -528,9 +532,9 @@ func detectP2PFraud(trade *p2pTradeRequest) []*P2PTradingAlert {
 			alerts = append(alerts, &P2PTradingAlert{
 				TradeID: trade.TradeID, SellerID: trade.SellerID, BuyerID: trade.BuyerID,
 				Amount: trade.Amount, Currency: trade.Currency, AlertType: "price_deviation",
-				Severity: severity,
+				Severity:    severity,
 				Description: fmt.Sprintf("P2P price %.8f deviates %.1f%% from 24-hour market average %.8f", trade.PricePerUnit, deviation*100, avgPrice),
-				DetectedAt: time.Now(),
+				DetectedAt:  time.Now(),
 			})
 		}
 	}
@@ -648,7 +652,9 @@ func blacklistWallet(c *gin.Context) {
 
 	// Invalidate cache
 	ctx := context.Background()
-	redisClient.Del(ctx, fmt.Sprintf("wallet:risk:%s", req.WalletAddress))
+	if err := redisClient.Del(ctx, fmt.Sprintf("wallet:risk:%s", req.WalletAddress)).Err(); err != nil {
+		log.Printf("redis cache invalidate failed for wallet %s: %v", req.WalletAddress, err)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"wallet_address": req.WalletAddress,
@@ -689,11 +695,11 @@ func getExchangeStats(c *gin.Context) {
 	`, exchange).Scan(&totalTxns, &totalVolume, &flaggedCount)
 
 	c.JSON(http.StatusOK, gin.H{
-		"exchange":       exchange,
+		"exchange":           exchange,
 		"total_transactions": totalTxns,
-		"total_volume":   totalVolume,
-		"flagged_count":  flaggedCount,
-		"fraud_rate":     float64(flaggedCount) / float64(max(totalTxns, 1)),
+		"total_volume":       totalVolume,
+		"flagged_count":      flaggedCount,
+		"fraud_rate":         float64(flaggedCount) / float64(max(totalTxns, 1)),
 	})
 }
 
@@ -818,11 +824,11 @@ func getDailyReport(c *gin.Context) {
 	`, date).Scan(&totalTxns, &flaggedTxns, &totalVolume)
 
 	c.JSON(http.StatusOK, gin.H{
-		"date":              date.Format("2006-01-02"),
-		"total_transactions": totalTxns,
+		"date":                 date.Format("2006-01-02"),
+		"total_transactions":   totalTxns,
 		"flagged_transactions": flaggedTxns,
-		"total_volume":      totalVolume,
-		"fraud_rate":        float64(flaggedTxns) / float64(max(totalTxns, 1)),
+		"total_volume":         totalVolume,
+		"fraud_rate":           float64(flaggedTxns) / float64(max(totalTxns, 1)),
 	})
 }
 
@@ -846,12 +852,12 @@ func getFlaggedTransactions(c *gin.Context) {
 
 		rows.Scan(&id, &userID, &amount, &crypto, &riskScore, &timestamp)
 		transactions = append(transactions, gin.H{
-			"id":          id,
-			"user_id":     userID,
-			"amount":      amount,
+			"id":             id,
+			"user_id":        userID,
+			"amount":         amount,
 			"cryptocurrency": crypto,
-			"risk_score":  riskScore,
-			"timestamp":   timestamp,
+			"risk_score":     riskScore,
+			"timestamp":      timestamp,
 		})
 	}
 
@@ -878,9 +884,9 @@ func healthCheck(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"status":   status,
-		"database": dbHealthy,
-		"redis":    redisHealthy,
+		"status":    status,
+		"database":  dbHealthy,
+		"redis":     redisHealthy,
 		"timestamp": time.Now().Unix(),
 	})
 }
@@ -888,12 +894,17 @@ func healthCheck(c *gin.Context) {
 // Helper functions
 
 func initDB() {
-	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+	sslMode := getEnv("DB_SSLMODE", "require")
+	if sslMode == "disable" && !strings.EqualFold(os.Getenv("DB_ALLOW_INSECURE"), "true") {
+		log.Fatal("DB_SSLMODE=disable requires DB_ALLOW_INSECURE=true (local development only)")
+	}
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		getEnv("DB_HOST", "localhost"),
 		getEnv("DB_PORT", "5432"),
 		getEnv("DB_USER", "postgres"),
 		getEnv("DB_PASSWORD", ""),
-		getEnv("DB_NAME", "fraudfusion"))
+		getEnv("DB_NAME", "fraudfusion"),
+		sslMode)
 
 	var err error
 	db, err = sql.Open("postgres", connStr)
@@ -901,7 +912,7 @@ func initDB() {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
-	if err := db.Ping(); err != nil {
+	if err := withBackoff(func() error { return db.Ping() }); err != nil {
 		log.Fatal("Failed to ping database:", err)
 	}
 
@@ -915,18 +926,31 @@ func initRedis() {
 		DB:       0,
 	})
 
-	if err := redisClient.Ping(context.Background()).Err(); err != nil {
+	if err := withBackoff(func() error { return redisClient.Ping(context.Background()).Err() }); err != nil {
 		log.Fatal("Failed to connect to Redis:", err)
 	}
 
 	log.Println("Redis connection established")
 }
 
+// corsMiddleware applies a configurable origin allowlist (CORS_ALLOWED_ORIGINS,
+// comma-separated). When unset, no cross-origin access is permitted; the
+// previous wildcard ("*") policy was removed.
 func corsMiddleware() gin.HandlerFunc {
+	allowed := map[string]struct{}{}
+	for _, origin := range strings.Split(os.Getenv("CORS_ALLOWED_ORIGINS"), ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			allowed[origin] = struct{}{}
+		}
+	}
 	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		origin := c.GetHeader("Origin")
+		if _, ok := allowed[origin]; ok {
+			c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+			c.Writer.Header().Set("Vary", "Origin")
+			c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		}
 
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -937,18 +961,7 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 }
 
-func authMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		token := c.GetHeader("Authorization")
-		if token == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
-			c.Abort()
-			return
-		}
-
-		c.Next()
-	}
-}
+// authMiddleware is implemented in auth.go (Keycloak token introspection, fail-closed).
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {

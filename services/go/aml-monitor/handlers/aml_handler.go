@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,21 +13,37 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"aml-monitor/models"
-	pb "aml-monitor/proto"
-	"aml-monitor/repository"
+	"github.com/munisp/fraudfusion/services/go/aml-monitor/mlclient"
+	"github.com/munisp/fraudfusion/services/go/aml-monitor/models"
+	"github.com/munisp/fraudfusion/services/go/aml-monitor/repository"
 )
 
 type AMLHandler struct {
-	repo       *repository.AMLRepository
-	grpcClient pb.AMLServiceClient
+	repo *repository.AMLRepository
+	ml   *mlclient.Client
 }
 
-func NewAMLHandler(repo *repository.AMLRepository, grpcClient pb.AMLServiceClient) *AMLHandler {
+func NewAMLHandler(repo *repository.AMLRepository, ml *mlclient.Client) *AMLHandler {
 	return &AMLHandler{
-		repo:       repo,
-		grpcClient: grpcClient,
+		repo: repo,
+		ml:   ml,
 	}
+}
+
+// manualReviewTransactionResponse fails closed: when the ML service is
+// unavailable the transaction is flagged and routed to manual review instead
+// of being waved through.
+func manualReviewTransactionResponse(c *gin.Context, transactionID string, mlErr error) {
+	log.Printf("ML scoring unavailable for %s, routing to manual review: %v", transactionID, mlErr)
+	c.JSON(http.StatusAccepted, gin.H{
+		"transaction_id": transactionID,
+		"risk_score":     100,
+		"risk_level":     "manual_review",
+		"flagged":        true,
+		"sar_required":   false,
+		"recommendation": "ML scoring unavailable - routed to manual review",
+		"analyzed_at":    time.Now().Unix(),
+	})
 }
 
 // AnalyzeTransaction handles single transaction analysis
@@ -44,13 +60,13 @@ func (h *AMLHandler) AnalyzeTransaction(c *gin.Context) {
 		return
 	}
 
-	// Call gRPC ML service
+	// Call the ML inference service over HTTP
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	grpcReq := &pb.TransactionRequest{
-		TransactionId:   req.TransactionID,
-		UserId:          req.UserID,
+	mlReq := &mlclient.TransactionRequest{
+		TransactionID:   req.TransactionID,
+		UserID:          req.UserID,
 		Amount:          req.Amount,
 		Currency:        req.Currency,
 		TransactionType: req.TransactionType,
@@ -58,9 +74,22 @@ func (h *AMLHandler) AnalyzeTransaction(c *gin.Context) {
 		Timestamp:       time.Now().Unix(),
 	}
 
-	resp, err := h.grpcClient.AnalyzeTransaction(ctx, grpcReq)
+	resp, err := h.ml.AnalyzeTransaction(ctx, mlReq)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to analyze transaction", "details": err.Error()})
+		// Fail closed to manual review; never allow unscored transactions.
+		analysis := &models.TransactionAnalysis{
+			TransactionID:  req.TransactionID,
+			UserID:         req.UserID,
+			RiskScore:      100,
+			RiskLevel:      "manual_review",
+			Flagged:        true,
+			Recommendation: "ML scoring unavailable - routed to manual review",
+			CreatedAt:      time.Now(),
+		}
+		if storeErr := h.repo.StoreTransactionAnalysis(analysis); storeErr != nil {
+			log.Printf("Failed to store manual-review analysis: %v", storeErr)
+		}
+		manualReviewTransactionResponse(c, req.TransactionID, err)
 		return
 	}
 
@@ -78,12 +107,12 @@ func (h *AMLHandler) AnalyzeTransaction(c *gin.Context) {
 	}
 
 	if err := h.repo.StoreTransactionAnalysis(analysis); err != nil {
-		// Log error but don't fail the request
-		fmt.Printf("Failed to store analysis: %v\n", err)
+		log.Printf("Failed to store analysis: %v", err)
 	}
+	h.repo.CacheRiskScore(req.TransactionID, int(resp.RiskScore))
 
 	c.JSON(http.StatusOK, gin.H{
-		"transaction_id":  resp.TransactionId,
+		"transaction_id":  resp.TransactionID,
 		"risk_score":      resp.RiskScore,
 		"risk_level":      resp.RiskLevel,
 		"risk_factors":    resp.RiskFactors,
@@ -121,9 +150,9 @@ func (h *AMLHandler) BatchAnalyzeTransactions(c *gin.Context) {
 	for _, txn := range req.Transactions {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
-		grpcReq := &pb.TransactionRequest{
-			TransactionId:   txn.TransactionID,
-			UserId:          txn.UserID,
+		mlReq := &mlclient.TransactionRequest{
+			TransactionID:   txn.TransactionID,
+			UserID:          txn.UserID,
 			Amount:          txn.Amount,
 			Currency:        txn.Currency,
 			TransactionType: txn.TransactionType,
@@ -131,13 +160,16 @@ func (h *AMLHandler) BatchAnalyzeTransactions(c *gin.Context) {
 			Timestamp:       time.Now().Unix(),
 		}
 
-		resp, err := h.grpcClient.AnalyzeTransaction(ctx, grpcReq)
+		resp, err := h.ml.AnalyzeTransaction(ctx, mlReq)
 		cancel()
 
 		if err != nil {
+			// Fail closed: unscored transactions are flagged for manual review.
 			results = append(results, map[string]interface{}{
 				"transaction_id": txn.TransactionID,
-				"error":          "Analysis failed",
+				"risk_level":     "manual_review",
+				"flagged":        true,
+				"error":          "Analysis unavailable - routed to manual review",
 			})
 			continue
 		}
@@ -150,7 +182,7 @@ func (h *AMLHandler) BatchAnalyzeTransactions(c *gin.Context) {
 		}
 
 		results = append(results, map[string]interface{}{
-			"transaction_id": resp.TransactionId,
+			"transaction_id": resp.TransactionID,
 			"risk_score":     resp.RiskScore,
 			"risk_level":     resp.RiskLevel,
 			"flagged":        resp.Flagged,
@@ -233,18 +265,18 @@ func (h *AMLHandler) DetectSuspiciousPatterns(c *gin.Context) {
 		req.DaysLookback = 30 // Default to 30 days
 	}
 
-	// Call gRPC ML service
+	// Call the ML inference service over HTTP
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	grpcReq := &pb.PatternRequest{
-		UserId:       req.UserID,
+	mlReq := &mlclient.PatternRequest{
+		UserID:       req.UserID,
 		DaysLookback: int32(req.DaysLookback),
 	}
 
-	resp, err := h.grpcClient.DetectSuspiciousPattern(ctx, grpcReq)
+	resp, err := h.ml.DetectSuspiciousPattern(ctx, mlReq)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Pattern detection failed", "details": err.Error()})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Pattern detection unavailable", "details": err.Error()})
 		return
 	}
 
@@ -255,7 +287,7 @@ func (h *AMLHandler) DetectSuspiciousPatterns(c *gin.Context) {
 			PatternType:    pattern.PatternType,
 			Description:    pattern.Description,
 			Confidence:     int(pattern.Confidence),
-			TransactionIDs: pattern.TransactionIds,
+			TransactionIDs: pattern.TransactionIDs,
 			TotalAmount:    pattern.TotalAmount,
 			DetectedAt:     time.Now(),
 		}
@@ -263,7 +295,7 @@ func (h *AMLHandler) DetectSuspiciousPatterns(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"user_id":            resp.UserId,
+		"user_id":            resp.UserID,
 		"patterns_detected":  len(resp.Patterns),
 		"patterns":           resp.Patterns,
 		"overall_risk_score": resp.OverallRiskScore,
@@ -308,27 +340,27 @@ func (h *AMLHandler) GenerateSAR(c *gin.Context) {
 		return
 	}
 
-	// Call gRPC ML service
+	// Call the ML inference service over HTTP
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	grpcReq := &pb.SARRequest{
-		UserId:                 req.UserID,
-		TransactionIds:         req.TransactionIDs,
+	mlReq := &mlclient.SARRequest{
+		UserID:                 req.UserID,
+		TransactionIDs:         req.TransactionIDs,
 		SuspiciousActivityType: req.ActivityType,
 		Narrative:              req.Narrative,
 	}
 
-	resp, err := h.grpcClient.GenerateSAR(ctx, grpcReq)
+	resp, err := h.ml.GenerateSAR(ctx, mlReq)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "SAR generation failed", "details": err.Error()})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "SAR generation unavailable", "details": err.Error()})
 		return
 	}
 
 	// Store SAR in database
 	sar := &models.SAR{
-		SARID:             resp.SarId,
-		UserID:            resp.UserId,
+		SARID:             resp.SarID,
+		UserID:            resp.UserID,
 		FilingInstitution: resp.FilingInstitution,
 		ActivityType:      resp.SuspiciousActivityType,
 		Narrative:         resp.Narrative,
@@ -344,8 +376,8 @@ func (h *AMLHandler) GenerateSAR(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"sar_id":             resp.SarId,
-		"user_id":            resp.UserId,
+		"sar_id":             resp.SarID,
+		"user_id":            resp.UserID,
 		"filing_institution": resp.FilingInstitution,
 		"activity_type":      resp.SuspiciousActivityType,
 		"status":             resp.Status,
@@ -466,18 +498,23 @@ func (h *AMLHandler) CheckSanctions(c *gin.Context) {
 		return
 	}
 
-	// Call gRPC ML service
+	// Call the ML inference service over HTTP
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	grpcReq := &pb.SanctionsRequest{
+	mlReq := &mlclient.SanctionsRequest{
 		EntityName: req.EntityName,
 		EntityType: req.EntityType,
 	}
 
-	resp, err := h.grpcClient.CheckSanctions(ctx, grpcReq)
+	resp, err := h.ml.CheckSanctions(ctx, mlReq)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Sanctions check failed", "details": err.Error()})
+		// Fail closed for sanctions: an unscreenable entity is escalated.
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":       "Sanctions screening unavailable",
+			"disposition": "manual_review",
+			"details":     err.Error(),
+		})
 		return
 	}
 
@@ -542,20 +579,20 @@ func (h *AMLHandler) VerifySourceOfFunds(c *gin.Context) {
 		return
 	}
 
-	// Call gRPC ML service
+	// Call the ML inference service over HTTP
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	grpcReq := &pb.SourceOfFundsRequest{
-		UserId:              req.UserID,
+	mlReq := &mlclient.SourceOfFundsRequest{
+		UserID:              req.UserID,
 		Amount:              req.Amount,
 		DeclaredSource:      req.DeclaredSource,
 		SupportingDocuments: req.SupportingDocuments,
 	}
 
-	resp, err := h.grpcClient.VerifySourceOfFunds(ctx, grpcReq)
+	resp, err := h.ml.VerifySourceOfFunds(ctx, mlReq)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Source of funds verification failed", "details": err.Error()})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Source of funds verification unavailable", "details": err.Error()})
 		return
 	}
 
@@ -670,7 +707,10 @@ func (h *AMLHandler) fileWithRegulator(sar *models.SAR, authority string) *model
 		return &models.FilingResult{Success: false, FiledAt: time.Now(), Error: "regulatory filing request failed"}
 	}
 	defer resp.Body.Close()
-	var result struct { ReferenceNumber string `json:"reference_number"`; Message string `json:"message"` }
+	var result struct {
+		ReferenceNumber string `json:"reference_number"`
+		Message         string `json:"message"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return &models.FilingResult{Success: false, FiledAt: time.Now(), Error: "invalid regulatory filing response"}
 	}

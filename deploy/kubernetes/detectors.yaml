@@ -1,0 +1,400 @@
+# Fraud detector services. All require Keycloak token introspection
+# (fail-closed) and TLS-enabled Postgres (sslmode=verify-full).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: detector-db
+  namespace: fraudfusion-services
+type: Opaque
+stringData:
+  # Override before deploying; placeholders, not working defaults.
+  password: CHANGE_ME
+  redis-password: ""
+  keycloak-client-secret: CHANGE_ME
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aml-monitor
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: aml-monitor
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aml-monitor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aml-monitor
+    spec:
+      containers:
+        - name: aml-monitor
+          image: ghcr.io/munisp/fraudfusion/aml-monitor:latest
+          env:
+            - name: PORT
+              value: "8081"
+            - name: DB_HOST
+              value: postgresql.fraudfusion-data.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: aml_monitor
+            - name: DB_NAME
+              value: fraudfusion
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: password}
+            - name: DB_SSLMODE
+              value: verify-full
+            - name: REDIS_HOST
+              value: redis.fraudfusion-data.svc.cluster.local
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: redis-password}
+            - name: KEYCLOAK_URL
+              value: https://keycloak.fraudfusion-identity.svc.cluster.local:8443
+            - name: KEYCLOAK_REALM
+              value: fraudfusion
+            - name: KEYCLOAK_CLIENT_ID
+              value: aml-monitor
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: keycloak-client-secret}
+            - name: AML_ML_SERVICE_URL
+              value: http://aml-ml-service.fraudfusion-services.svc.cluster.local:8100
+          ports:
+            - name: http
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /api/v1/aml/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aml-monitor
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: aml-monitor
+spec:
+  selector:
+    app.kubernetes.io/name: aml-monitor
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crypto-fraud-detector
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: crypto-fraud-detector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: crypto-fraud-detector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: crypto-fraud-detector
+    spec:
+      containers:
+        - name: crypto-fraud-detector
+          image: ghcr.io/munisp/fraudfusion/crypto-fraud-detector:latest
+          env:
+            - name: PORT
+              value: "8082"
+            - name: DB_HOST
+              value: postgresql.fraudfusion-data.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: crypto_fraud_detector
+            - name: DB_NAME
+              value: fraudfusion
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: password}
+            - name: DB_SSLMODE
+              value: verify-full
+            - name: REDIS_HOST
+              value: redis.fraudfusion-data.svc.cluster.local
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: redis-password}
+            - name: KEYCLOAK_URL
+              value: https://keycloak.fraudfusion-identity.svc.cluster.local:8443
+            - name: KEYCLOAK_REALM
+              value: fraudfusion
+            - name: KEYCLOAK_CLIENT_ID
+              value: crypto-fraud-detector
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: keycloak-client-secret}
+          ports:
+            - name: http
+              containerPort: 8082
+          readinessProbe:
+            httpGet:
+              path: /api/v1/crypto-fraud/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crypto-fraud-detector
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: crypto-fraud-detector
+spec:
+  selector:
+    app.kubernetes.io/name: crypto-fraud-detector
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: investment-fraud-detector
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: investment-fraud-detector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: investment-fraud-detector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: investment-fraud-detector
+    spec:
+      containers:
+        - name: investment-fraud-detector
+          image: ghcr.io/munisp/fraudfusion/investment-fraud-detector:latest
+          env:
+            - name: PORT
+              value: "8083"
+            - name: DB_HOST
+              value: postgresql.fraudfusion-data.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: investment_fraud_detector
+            - name: DB_NAME
+              value: fraudfusion
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: password}
+            - name: DB_SSLMODE
+              value: verify-full
+            - name: REDIS_HOST
+              value: redis.fraudfusion-data.svc.cluster.local
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: redis-password}
+            - name: KEYCLOAK_URL
+              value: https://keycloak.fraudfusion-identity.svc.cluster.local:8443
+            - name: KEYCLOAK_REALM
+              value: fraudfusion
+            - name: KEYCLOAK_CLIENT_ID
+              value: investment-fraud-detector
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: keycloak-client-secret}
+          ports:
+            - name: http
+              containerPort: 8083
+          readinessProbe:
+            httpGet:
+              path: /api/v1/investment-fraud/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: investment-fraud-detector
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: investment-fraud-detector
+spec:
+  selector:
+    app.kubernetes.io/name: investment-fraud-detector
+  ports:
+    - name: http
+      port: 8083
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sim-swap-detector
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: sim-swap-detector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sim-swap-detector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sim-swap-detector
+    spec:
+      containers:
+        - name: sim-swap-detector
+          image: ghcr.io/munisp/fraudfusion/sim-swap-detector:latest
+          env:
+            - name: PORT
+              value: "8088"
+            - name: DB_HOST
+              value: postgresql.fraudfusion-data.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: sim_swap_detector
+            - name: DB_NAME
+              value: fraudfusion
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: password}
+            - name: DB_SSLMODE
+              value: verify-full
+            - name: REDIS_HOST
+              value: redis.fraudfusion-data.svc.cluster.local
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: redis-password}
+            - name: KEYCLOAK_URL
+              value: https://keycloak.fraudfusion-identity.svc.cluster.local:8443
+            - name: KEYCLOAK_REALM
+              value: fraudfusion
+            - name: KEYCLOAK_CLIENT_ID
+              value: sim-swap-detector
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: keycloak-client-secret}
+          ports:
+            - name: http
+              containerPort: 8088
+          readinessProbe:
+            httpGet:
+              path: /api/v1/sim-swap/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sim-swap-detector
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: sim-swap-detector
+spec:
+  selector:
+    app.kubernetes.io/name: sim-swap-detector
+  ports:
+    - name: http
+      port: 8088
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: advance-fee-fraud-detector
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: advance-fee-fraud-detector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: advance-fee-fraud-detector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: advance-fee-fraud-detector
+    spec:
+      containers:
+        - name: advance-fee-fraud-detector
+          image: ghcr.io/munisp/fraudfusion/advance-fee-fraud-detector:latest
+          env:
+            - name: PORT
+              value: "8087"
+            - name: DB_HOST
+              value: postgresql.fraudfusion-data.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: advance_fee_fraud_detector
+            - name: DB_NAME
+              value: fraudfusion
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: password}
+            - name: DB_SSLMODE
+              value: verify-full
+            - name: REDIS_HOST
+              value: redis.fraudfusion-data.svc.cluster.local
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: redis-password}
+            - name: KEYCLOAK_URL
+              value: https://keycloak.fraudfusion-identity.svc.cluster.local:8443
+            - name: KEYCLOAK_REALM
+              value: fraudfusion
+            - name: KEYCLOAK_CLIENT_ID
+              value: advance-fee-fraud-detector
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: detector-db, key: keycloak-client-secret}
+          ports:
+            - name: http
+              containerPort: 8087
+          readinessProbe:
+            httpGet:
+              path: /api/v1/advance-fee-fraud/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: advance-fee-fraud-detector
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: advance-fee-fraud-detector
+spec:
+  selector:
+    app.kubernetes.io/name: advance-fee-fraud-detector
+  ports:
+    - name: http
+      port: 8087
+      targetPort: http

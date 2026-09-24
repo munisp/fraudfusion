@@ -47,11 +47,11 @@ type RiskAnalysis struct {
 
 // FeeRequest represents a detected fee request
 type FeeRequest struct {
-	MessageID   string    `json:"message_id"`
-	Amount      float64   `json:"amount"`
-	Currency    string    `json:"currency"`
-	Purpose     string    `json:"purpose"`
-	DetectedAt  time.Time `json:"detected_at"`
+	MessageID  string    `json:"message_id"`
+	Amount     float64   `json:"amount"`
+	Currency   string    `json:"currency"`
+	Purpose    string    `json:"purpose"`
+	DetectedAt time.Time `json:"detected_at"`
 }
 
 func main() {
@@ -66,15 +66,19 @@ func main() {
 	// Setup Gin router
 	router := gin.Default()
 
+	// All routes require a valid Keycloak token (fail-closed introspection);
+	// mutating actions additionally require fraud_analyst/admin.
+	router.Use(authMiddleware())
+
 	// API routes
 	v1 := router.Group("/api/v1/advance-fee-fraud")
 	{
-		v1.POST("/analyze-message", analyzeMessage)
-		v1.POST("/detect-419", detect419)
-		v1.POST("/detect-inheritance-scam", detectInheritanceScam)
-		v1.POST("/detect-lottery-scam", detectLotteryScam)
+		v1.POST("/analyze-message", requireRole("fraud_analyst", "admin"), analyzeMessage)
+		v1.POST("/detect-419", requireRole("fraud_analyst", "admin"), detect419)
+		v1.POST("/detect-inheritance-scam", requireRole("fraud_analyst", "admin"), detectInheritanceScam)
+		v1.POST("/detect-lottery-scam", requireRole("fraud_analyst", "admin"), detectLotteryScam)
 		v1.POST("/verify-sender", verifySender)
-		v1.POST("/track-fee-requests", trackFeeRequests)
+		v1.POST("/track-fee-requests", requireRole("fraud_analyst", "admin"), trackFeeRequests)
 		v1.GET("/risk/:message_id", getMessageRisk)
 		v1.GET("/known-patterns", getKnownPatterns)
 		v1.GET("/reports/daily", getDailyReport)
@@ -92,13 +96,18 @@ func main() {
 }
 
 func initDB() {
+	sslMode := getEnv("DB_SSLMODE", "require")
+	if sslMode == "disable" && !strings.EqualFold(os.Getenv("DB_ALLOW_INSECURE"), "true") {
+		log.Fatal("DB_SSLMODE=disable requires DB_ALLOW_INSECURE=true (local development only)")
+	}
 	connStr := fmt.Sprintf(
-		"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
 		getEnv("DB_HOST", "localhost"),
 		getEnv("DB_PORT", "5432"),
 		getEnv("DB_USER", "postgres"),
 		getEnv("DB_PASSWORD", ""),
 		getEnv("DB_NAME", "fraudfusion"),
+		sslMode,
 	)
 
 	var err error
@@ -107,7 +116,7 @@ func initDB() {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
-	if err = db.Ping(); err != nil {
+	if err = withBackoff(func() error { return db.Ping() }); err != nil {
 		log.Fatal("Failed to ping database:", err)
 	}
 
@@ -121,7 +130,7 @@ func initRedis() {
 		DB:       0,
 	})
 
-	if err := redisClient.Ping(ctx).Err(); err != nil {
+	if err := withBackoff(func() error { return redisClient.Ping(ctx).Err() }); err != nil {
 		log.Fatal("Failed to connect to Redis:", err)
 	}
 
@@ -492,9 +501,9 @@ func detect419(c *gin.Context) {
 	is419, flags := detect419Pattern(combinedText)
 
 	c.JSON(http.StatusOK, gin.H{
-		"message_id": message.ID,
+		"message_id":  message.ID,
 		"is_419_scam": is419,
-		"red_flags": flags,
+		"red_flags":   flags,
 		"recommendation": func() string {
 			if is419 {
 				return "BLOCK - Nigerian 419 scam detected"
@@ -515,9 +524,9 @@ func detectInheritanceScam(c *gin.Context) {
 	isInheritance, flags := detectInheritancePattern(combinedText)
 
 	c.JSON(http.StatusOK, gin.H{
-		"message_id": message.ID,
+		"message_id":          message.ID,
 		"is_inheritance_scam": isInheritance,
-		"red_flags": flags,
+		"red_flags":           flags,
 		"recommendation": func() string {
 			if isInheritance {
 				return "BLOCK - Inheritance scam detected"
@@ -538,9 +547,9 @@ func detectLotteryScam(c *gin.Context) {
 	isLottery, flags := detectLotteryPattern(combinedText)
 
 	c.JSON(http.StatusOK, gin.H{
-		"message_id": message.ID,
+		"message_id":      message.ID,
 		"is_lottery_scam": isLottery,
-		"red_flags": flags,
+		"red_flags":       flags,
 		"recommendation": func() string {
 			if isLottery {
 				return "BLOCK - Lottery scam detected"
@@ -564,7 +573,7 @@ func verifySender(c *gin.Context) {
 	isLegit := verifySenderLegitimacy(req.SenderEmail)
 
 	c.JSON(http.StatusOK, gin.H{
-		"sender_email": req.SenderEmail,
+		"sender_email":  req.SenderEmail,
 		"is_legitimate": isLegit,
 		"recommendation": func() string {
 			if !isLegit {
@@ -586,10 +595,10 @@ func trackFeeRequests(c *gin.Context) {
 	feeRequests := detectFeeRequests(combinedText)
 
 	c.JSON(http.StatusOK, gin.H{
-		"message_id": message.ID,
+		"message_id":            message.ID,
 		"fee_requests_detected": len(feeRequests) > 0,
-		"request_count": len(feeRequests),
-		"requests": feeRequests,
+		"request_count":         len(feeRequests),
+		"requests":              feeRequests,
 		"recommendation": func() string {
 			if len(feeRequests) > 0 {
 				return "WARNING - Upfront fee request detected. Do not send money."
@@ -646,7 +655,7 @@ func getKnownPatterns(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"patterns": patterns,
-		"count": len(patterns),
+		"count":    len(patterns),
 	})
 }
 
@@ -670,7 +679,7 @@ func getDailyReport(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"date": time.Now().Format("2006-01-02"),
+		"date":           time.Now().Format("2006-01-02"),
 		"total_analyzed": totalAnalyzed,
 		"scams_detected": scamsDetected,
 		"avg_risk_score": avgRiskScore,

@@ -1,0 +1,17 @@
+{
+  "champion_auc_pr": 0.716411596610609,
+  "champion_auc_roc": 0.8942686681104943,
+  "champion_f1": 0.6468085106382979,
+  "champion_base_rate": 0.06081081181764603,
+  "champion_recall_at_fpr_0.01": 0.6470588235294118,
+  "finetuned_auc_pr": 0.7374303029949433,
+  "finetuned_auc_roc": 0.8862418715546594,
+  "finetuned_f1": 0.68,
+  "finetuned_base_rate": 0.06081081181764603,
+  "finetuned_recall_at_fpr_0.01": 0.6862745098039216,
+  "base_version": "v1",
+  "out_version": "v2",
+  "drift_slice_size": 12579,
+  "seed": 42,
+  "improved": true
+}

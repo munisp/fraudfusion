@@ -1,0 +1,22 @@
+{
+  "ts": "2026-09-24T04:49:38.693545+00:00",
+  "model": "fraud_net",
+  "champion_version": "v1",
+  "challenger_version": "v3",
+  "champion_metrics": {
+    "auc_pr": 0.9082148785312865,
+    "auc_roc": 0.9433102592032983,
+    "f1": 0.7172995780590717,
+    "base_rate": 0.20637118816375732,
+    "recall_at_fpr_0.01": 0.8120805369127517
+  },
+  "challenger_metrics": {
+    "auc_pr": 0.903835030432781,
+    "auc_roc": 0.94026494254893,
+    "f1": 0.7063829787234043,
+    "base_rate": 0.20637118816375732,
+    "recall_at_fpr_0.01": 0.8053691275167785
+  },
+  "promoted": false,
+  "reason": "challenger below champion; keep champion"
+}

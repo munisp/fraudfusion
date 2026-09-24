@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${ROOT}/../FRAUD_FUSION_COMPLETE_UNIFIED"
+PROJECT_ROOT="$(cd "${ROOT}/.." && pwd)"
 REPORTER="${PROJECT_ROOT}/observability/release-gate-metrics/report-e2e-result.sh"
 REQUEST_ID="mobile-e2e-$(date +%s)"
 TOKEN="local-contract-token"

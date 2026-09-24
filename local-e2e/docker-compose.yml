@@ -1,3 +1,15 @@
+# Local contract-test / integration environment (not production).
+# Base stack: postgres + go-mobile-mock (the contract API under test).
+# Extended stack: redis, keycloak, permify, mlflow, aml-ml-service so local
+# journeys exercise the same infrastructure seams as staging.
+#
+# Notes:
+#   - Keycloak realm import: mount deploy/keycloak/fraudfusion-realm.json into
+#     /opt/keycloak/data/import when that file is added (it does not exist yet);
+#     the import volume below is wired and simply inert until then.
+#   - MLflow mirrors mlops/mlflow/docker-compose.yml on the shared e2e network.
+#   - aml-ml-service builds from the repo root (mlops/serving/Dockerfile) and
+#     falls back to its rule-based scorer when the ONNX artifact is absent.
 services:
   postgres:
     image: postgres:16-alpine
@@ -16,11 +28,122 @@ services:
       - postgres_e2e_data:/var/lib/postgresql/data
     networks: [fraudfusion-e2e]
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "6380:6379"
+    networks: [fraudfusion-e2e]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: local_e2e_only
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+    # When deploy/keycloak/fraudfusion-realm.json exists, uncomment:
+    # volumes:
+    #   - ../deploy/keycloak/fraudfusion-realm.json:/opt/keycloak/data/import/fraudfusion-realm.json:ro
+    healthcheck:
+      # ubi9-minimal ships curl-minimal; management port 9000 exposes health.
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    ports:
+      - "8180:8080"
+    networks: [fraudfusion-e2e]
+
+  permify:
+    image: permify/permify:v1.2.9
+    command: ["serve"]
+    environment:
+      PERMIFY_DATABASE_ENGINE: memory
+    healthcheck:
+      # The Permify image is distroless (no shell/curl); this is a
+      # process-level check. Port-level readiness is covered by the
+      # contract script retries.
+      test: ["CMD", "/app/permify", "version"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    ports:
+      - "3476:3476"
+      - "3478:3478"
+    networks: [fraudfusion-e2e]
+
+  mlflow-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: ${MLFLOW_DB_PASSWORD:-mlflow_local_e2e}
+      POSTGRES_DB: mlflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - mlflow_db_e2e_data:/var/lib/postgresql/data
+    networks: [fraudfusion-e2e]
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.20.2
+    depends_on:
+      mlflow-db:
+        condition: service_healthy
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://mlflow:${MLFLOW_DB_PASSWORD:-mlflow_local_e2e}@mlflow-db:5432/mlflow
+    command: >
+      mlflow server
+      --host 0.0.0.0 --port 5000
+      --backend-store-uri postgresql://mlflow:${MLFLOW_DB_PASSWORD:-mlflow_local_e2e}@mlflow-db:5432/mlflow
+      --default-artifact-root /mlflow/artifacts
+    volumes:
+      - mlflow_artifacts_e2e:/mlflow/artifacts
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "5000:5000"
+    networks: [fraudfusion-e2e]
+
+  aml-ml-service:
+    build:
+      context: ..
+      dockerfile: mlops/serving/Dockerfile
+    environment:
+      PORT: "8100"
+      # No ONNX artifact is mounted in the local stack; the service starts in
+      # its documented rule-fallback mode and reports model_mode=rule_fallback.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8100/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "8100:8100"
+    networks: [fraudfusion-e2e]
+
   go-mobile-mock:
     build:
       context: ./go-mobile-mock
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://fraudfusion:local_e2e_only@postgres:5432/fraudfusion_e2e?sslmode=disable
@@ -35,3 +158,5 @@ networks:
 
 volumes:
   postgres_e2e_data:
+  mlflow_db_e2e_data:
+  mlflow_artifacts_e2e:

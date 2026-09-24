@@ -1,0 +1,100 @@
+{
+  "runs": [
+    {
+      "model_name": "fraud_net",
+      "artifact_dir": "ml/artifacts/fraud_net/v1",
+      "params": {
+        "lane": "F2",
+        "version": "v1"
+      },
+      "metrics": {
+        "auc_pr": 0.4211383451199595,
+        "auc_roc": 0.7147064971050376,
+        "f1": 0.4900398406374502,
+        "base_rate": 0.038891907781362534,
+        "recall_at_fpr_0.01": 0.41620111731843573,
+        "val_auc_pr": 0.44618472425927397,
+        "temperature": 0.45427664779743315,
+        "epochs_trained": 15,
+        "seed": 42,
+        "backend": "torch",
+        "n_train": 42891,
+        "n_test": 9205
+      },
+      "tags": {},
+      "run_id": "local-1790225632157",
+      "registered_at": "2026-09-24T04:53:52.157247+00:00",
+      "backend": "local_file"
+    },
+    {
+      "model_name": "credit_net",
+      "artifact_dir": "ml/artifacts/credit_net/v1",
+      "params": {
+        "lane": "F2",
+        "version": "v1"
+      },
+      "metrics": {
+        "auc_pr": 0.6493796655824126,
+        "auc_roc": 0.7503215064098225,
+        "f1": 0.5646437994722955,
+        "base_rate": 0.28833332657814026,
+        "recall_at_fpr_0.01": 0.21965317919075145,
+        "epochs_trained": 16,
+        "seed": 42,
+        "score_example": 495.9,
+        "bust_out_capture_at_20pct_review": 0.0
+      },
+      "tags": {},
+      "run_id": "local-1790225632261",
+      "registered_at": "2026-09-24T04:53:52.261450+00:00",
+      "backend": "local_file"
+    },
+    {
+      "model_name": "gnn_mule",
+      "artifact_dir": "ml/artifacts/gnn_mule/v1",
+      "params": {
+        "lane": "F2",
+        "version": "v1"
+      },
+      "metrics": {
+        "auc_pr": 0.994376124585858,
+        "auc_roc": 0.9999269347673603,
+        "f1": 0.9043478260869565,
+        "base_rate": 0.013000000268220901,
+        "recall_at_fpr_0.01": 1.0,
+        "backend": "torch_geometric.SAGEConv",
+        "epochs_trained": 56,
+        "seed": 42,
+        "n_nodes": 4000,
+        "n_edges": 61220,
+        "mule_prevalence": 0.013000000268220901
+      },
+      "tags": {},
+      "run_id": "local-1790225632330",
+      "registered_at": "2026-09-24T04:53:52.330152+00:00",
+      "backend": "local_file"
+    },
+    {
+      "model_name": "autoencoder",
+      "artifact_dir": "ml/artifacts/autoencoder/v1",
+      "params": {
+        "lane": "F2",
+        "version": "v1"
+      },
+      "metrics": {
+        "auc_pr": 0.2607689132809578,
+        "auc_roc": 0.6927592157932525,
+        "f1": 0.09317478416680242,
+        "base_rate": 0.038891906572514935,
+        "recall_at_fpr_0.01": 0.2541899441340782,
+        "epochs_trained": 11,
+        "seed": 42,
+        "note": "trained on legitimate transactions only; score=MSE recon error"
+      },
+      "tags": {},
+      "run_id": "local-1790225632386",
+      "registered_at": "2026-09-24T04:53:52.386195+00:00",
+      "backend": "local_file"
+    }
+  ]
+}

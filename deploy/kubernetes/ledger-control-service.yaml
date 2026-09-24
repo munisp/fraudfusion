@@ -219,6 +219,11 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: fraudfusion-financial
+        # The ingress controller itself must reach the pods it routes to;
+        # without this the NetworkPolicy black-holes its own ingress traffic.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
       ports:
         - protocol: TCP
           port: 8098

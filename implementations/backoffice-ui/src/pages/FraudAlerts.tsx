@@ -1,4 +1,7 @@
 import React, { useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { api } from '../services/api';
+import type { FraudAlert, FraudAlertAction } from '../types';
 import {
   Search,
   Filter,
@@ -20,24 +23,11 @@ import {
   TrendingUp,
 } from 'lucide-react';
 
-interface FraudAlert {
-  id: string;
-  alertType: 'transaction' | 'identity' | 'account_takeover' | 'document_fraud' | 'money_laundering';
-  severity: 'critical' | 'high' | 'medium' | 'low';
-  status: 'open' | 'investigating' | 'resolved' | 'false_positive';
-  customerId: string;
-  customerName: string;
-  description: string;
-  amount?: number;
-  currency?: string;
-  location?: string;
-  detectedAt: string;
-  assignedTo?: string;
-  riskScore: number;
-  indicators: string[];
-  relatedTransactions?: number;
-}
-
+/**
+ * Built-in sample alerts, used only as a documented offline fallback when the
+ * backoffice API (`GET /backoffice/fraud/alerts`) is unreachable. Status actions
+ * taken against the fallback are applied locally and are not persisted.
+ */
 const mockAlerts: FraudAlert[] = [
   {
     id: 'alert-001',
@@ -169,6 +159,12 @@ const AlertTypeIcon: React.FC<{ type: FraudAlert['alertType'] }> = ({ type }) =>
   return <div className={`p-2 rounded-lg ${colors[type]}`}>{icons[type]}</div>;
 };
 
+const ACTION_STATUS: Record<FraudAlertAction, FraudAlert['status']> = {
+  investigate: 'investigating',
+  resolve: 'resolved',
+  false_positive: 'false_positive',
+};
+
 const FraudAlerts: React.FC = () => {
   const [selectedAlert, setSelectedAlert] = useState<FraudAlert | null>(null);
   const [showFilters, setShowFilters] = useState(false);
@@ -177,8 +173,64 @@ const FraudAlerts: React.FC = () => {
   const [typeFilter, setTypeFilter] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
   const [page, setPage] = useState(1);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionPending, setActionPending] = useState(false);
+  // Local overrides hold optimistic updates and fallback-mode edits.
+  const [localAlerts, setLocalAlerts] = useState<FraudAlert[] | null>(null);
 
-  const filteredAlerts = mockAlerts.filter((alert) => {
+  const {
+    data: apiAlerts,
+    isError: apiUnreachable,
+    refetch,
+    isFetching,
+  } = useQuery({
+    queryKey: ['fraudAlerts'],
+    queryFn: () => api.getFraudAlerts(),
+    retry: false,
+  });
+
+  // Live API data wins; documented mock fallback when the API is unreachable.
+  const alerts = localAlerts ?? apiAlerts ?? mockAlerts;
+
+  const applyAction = async (alert: FraudAlert, action: FraudAlertAction) => {
+    setActionError(null);
+    setActionPending(true);
+    const previous = alerts;
+    const optimistic = previous.map((a) =>
+      a.id === alert.id ? { ...a, status: ACTION_STATUS[action] } : a,
+    );
+    setLocalAlerts(optimistic);
+    setSelectedAlert((current) =>
+      current && current.id === alert.id
+        ? { ...current, status: ACTION_STATUS[action] }
+        : current,
+    );
+    try {
+      const updated = await api.updateFraudAlertStatus(alert.id, { action });
+      setLocalAlerts(optimistic.map((a) => (a.id === alert.id ? { ...a, ...updated } : a)));
+      setSelectedAlert((current) =>
+        current && current.id === alert.id ? { ...current, ...updated } : current,
+      );
+    } catch (cause) {
+      // Roll back the optimistic update.
+      if (apiUnreachable) {
+        // Fallback mode: keep the local edit, it is the best we can do offline.
+        setActionError(
+          'Backoffice API unreachable — status change applied to local sample data only and will not persist.',
+        );
+      } else {
+        setLocalAlerts(previous);
+        setSelectedAlert(alert);
+        setActionError(
+          cause instanceof Error ? cause.message : 'Failed to update the alert status.',
+        );
+      }
+    } finally {
+      setActionPending(false);
+    }
+  };
+
+  const filteredAlerts = alerts.filter((alert) => {
     if (severityFilter && alert.severity !== severityFilter) return false;
     if (statusFilter && alert.status !== statusFilter) return false;
     if (typeFilter && alert.alertType !== typeFilter) return false;
@@ -194,19 +246,37 @@ const FraudAlerts: React.FC = () => {
   });
 
   const stats = {
-    total: mockAlerts.length,
-    critical: mockAlerts.filter((a) => a.severity === 'critical').length,
-    open: mockAlerts.filter((a) => a.status === 'open').length,
-    resolved: mockAlerts.filter((a) => a.status === 'resolved').length,
+    total: alerts.length,
+    critical: alerts.filter((a) => a.severity === 'critical').length,
+    open: alerts.filter((a) => a.status === 'open').length,
+    resolved: alerts.filter((a) => a.status === 'resolved').length,
   };
 
   return (
     <div className="space-y-6">
+      {apiUnreachable && (
+        <div className="rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-800">
+          Backoffice API unreachable — showing built-in sample data. Status changes will be applied
+          locally only.
+        </div>
+      )}
+      {actionError && (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">
+          {actionError}
+        </div>
+      )}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-900">Fraud Alerts</h1>
         <div className="flex items-center space-x-3">
-          <button className="flex items-center px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">
-            <RefreshCw className="w-4 h-4 mr-2" />
+          <button
+            onClick={() => {
+              setLocalAlerts(null);
+              void refetch();
+            }}
+            disabled={isFetching}
+            className="flex items-center px-3 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+          >
+            <RefreshCw className={`w-4 h-4 mr-2 ${isFetching ? 'animate-spin' : ''}`} />
             Refresh
           </button>
           <button
@@ -420,7 +490,7 @@ const FraudAlerts: React.FC = () => {
 
       <div className="flex items-center justify-between">
         <p className="text-sm text-gray-500">
-          Showing {filteredAlerts.length} of {mockAlerts.length} alerts
+          Showing {filteredAlerts.length} of {alerts.length} alerts
         </p>
         <div className="flex items-center space-x-2">
           <button
@@ -442,7 +512,12 @@ const FraudAlerts: React.FC = () => {
       </div>
 
       {selectedAlert && (
-        <AlertDetailModal alert={selectedAlert} onClose={() => setSelectedAlert(null)} />
+        <AlertDetailModal
+          alert={selectedAlert}
+          pending={actionPending}
+          onAction={(action) => void applyAction(selectedAlert, action)}
+          onClose={() => setSelectedAlert(null)}
+        />
       )}
     </div>
   );
@@ -450,10 +525,12 @@ const FraudAlerts: React.FC = () => {
 
 interface AlertDetailModalProps {
   alert: FraudAlert;
+  pending: boolean;
+  onAction: (action: FraudAlertAction) => void;
   onClose: () => void;
 }
 
-const AlertDetailModal: React.FC<AlertDetailModalProps> = ({ alert, onClose }) => {
+const AlertDetailModal: React.FC<AlertDetailModalProps> = ({ alert, pending, onAction, onClose }) => {
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
       <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[90vh] overflow-hidden">
@@ -580,13 +657,25 @@ const AlertDetailModal: React.FC<AlertDetailModalProps> = ({ alert, onClose }) =
           >
             Close
           </button>
-          <button className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">
+          <button
+            onClick={() => onAction('investigate')}
+            disabled={pending || alert.status === 'investigating'}
+            className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50"
+          >
             Investigate
           </button>
-          <button className="px-4 py-2 text-sm font-medium text-white bg-green-600 rounded-lg hover:bg-green-700">
+          <button
+            onClick={() => onAction('resolve')}
+            disabled={pending || alert.status === 'resolved'}
+            className="px-4 py-2 text-sm font-medium text-white bg-green-600 rounded-lg hover:bg-green-700 disabled:opacity-50"
+          >
             Mark Resolved
           </button>
-          <button className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200">
+          <button
+            onClick={() => onAction('false_positive')}
+            disabled={pending || alert.status === 'false_positive'}
+            className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 disabled:opacity-50"
+          >
             False Positive
           </button>
         </div>

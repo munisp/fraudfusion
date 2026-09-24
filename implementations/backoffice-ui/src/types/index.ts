@@ -92,6 +92,31 @@ export interface KYCVerification {
   notes?: string;
 }
 
+export interface FraudAlert {
+  id: string;
+  alertType: 'transaction' | 'identity' | 'account_takeover' | 'document_fraud' | 'money_laundering';
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  status: 'open' | 'investigating' | 'resolved' | 'false_positive';
+  customerId: string;
+  customerName: string;
+  description: string;
+  amount?: number;
+  currency?: string;
+  location?: string;
+  detectedAt: string;
+  assignedTo?: string;
+  riskScore: number;
+  indicators: string[];
+  relatedTransactions?: number;
+}
+
+export type FraudAlertAction = 'investigate' | 'resolve' | 'false_positive';
+
+export interface FraudAlertUpdate {
+  action: FraudAlertAction;
+  note?: string;
+}
+
 export interface JourneyExecution {
   id: string;
   journeyId: number;

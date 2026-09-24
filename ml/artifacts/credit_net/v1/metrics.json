@@ -1,0 +1,11 @@
+{
+  "auc_pr": 0.6493796655824126,
+  "auc_roc": 0.7503215064098225,
+  "f1": 0.5646437994722955,
+  "base_rate": 0.28833332657814026,
+  "recall_at_fpr_0.01": 0.21965317919075145,
+  "epochs_trained": 16,
+  "seed": 42,
+  "score_example": 495.9,
+  "bust_out_capture_at_20pct_review": 0.0
+}

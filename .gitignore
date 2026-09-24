@@ -22,3 +22,18 @@ artifacts/
 
 # Local contract-test build output
 local-e2e/go-mobile-mock/go-mobile-mock
+
+# ML model artifacts ARE committed (trained weights ship with repo)
+!ml/artifacts/
+!ml/artifacts/**
+
+# Compiled Go service binaries must not be committed
+services/go/advance-fee-fraud-detector/advance-fee-fraud-detector
+services/go/crypto-fraud-detector/crypto-fraud-detector
+services/go/investment-fraud-detector/investment-fraud-detector
+services/go/sim-swap-detector/sim-swap-detector
+services/go/insider-fraud-detector/insider-fraud-detector
+services/go/aml-monitor/aml-monitor
+services/go/temporal-orchestrator/temporal-orchestrator
+orchestrator/go/cmd/orchestrator/orchestrator
+database/cmd/migrate/migrate

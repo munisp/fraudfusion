@@ -40,9 +40,9 @@ type unusualActivityRequest struct {
 }
 
 type dataExfiltrationRequest struct {
-	TenantID   string `json:"tenant_id" binding:"required"`
-	EmployeeID string `json:"employee_id" binding:"required"`
-	DataVolume int64  `json:"data_volume" binding:"gte=0"`
+	TenantID    string `json:"tenant_id" binding:"required"`
+	EmployeeID  string `json:"employee_id" binding:"required"`
+	DataVolume  int64  `json:"data_volume" binding:"gte=0"`
 	Destination string `json:"destination" binding:"required"`
 }
 
@@ -53,8 +53,8 @@ type collusionRequest struct {
 
 type keycloakClient struct {
 	serverURL, realm, clientID, clientSecret string
-	httpClient                                *http.Client
-	roles                                     map[string]struct{}
+	httpClient                               *http.Client
+	roles                                    map[string]struct{}
 }
 
 type app struct {
@@ -409,46 +409,188 @@ func (k *keycloakClient) introspect(ctx context.Context, token string) (map[stri
 	form := url.Values{"token": {token}, "client_id": {k.clientID}, "client_secret": {k.clientSecret}}
 	endpoint := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/token/introspect", k.serverURL, url.PathEscape(k.realm))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString(form.Encode()))
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := k.httpClient.Do(req)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil { return nil, err }
-	if resp.StatusCode != http.StatusOK { return nil, fmt.Errorf("introspection status %d", resp.StatusCode) }
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("introspection status %d", resp.StatusCode)
+	}
 	claims := map[string]interface{}{}
-	if err := json.Unmarshal(body, &claims); err != nil { return nil, err }
-	if active, ok := claims["active"].(bool); !ok || !active { return nil, fmt.Errorf("inactive token") }
+	if err := json.Unmarshal(body, &claims); err != nil {
+		return nil, err
+	}
+	if active, ok := claims["active"].(bool); !ok || !active {
+		return nil, fmt.Errorf("inactive token")
+	}
 	return claims, nil
 }
 
 func (k *keycloakClient) authorized(claims map[string]interface{}) bool {
 	readRoles := func(value interface{}) []string {
 		output := []string{}
-		if values, ok := value.([]interface{}); ok { for _, item := range values { if role, ok := item.(string); ok { output = append(output, role) } } }
-		if values, ok := value.([]string); ok { output = append(output, values...) }
+		if values, ok := value.([]interface{}); ok {
+			for _, item := range values {
+				if role, ok := item.(string); ok {
+					output = append(output, role)
+				}
+			}
+		}
+		if values, ok := value.([]string); ok {
+			output = append(output, values...)
+		}
 		return output
 	}
-	for _, role := range readRoles(claims["roles"]) { if _, ok := k.roles[role]; ok { return true } }
-	if realm, ok := claims["realm_access"].(map[string]interface{}); ok { for _, role := range readRoles(realm["roles"]) { if _, ok := k.roles[role]; ok { return true } } }
+	for _, role := range readRoles(claims["roles"]) {
+		if _, ok := k.roles[role]; ok {
+			return true
+		}
+	}
+	if realm, ok := claims["realm_access"].(map[string]interface{}); ok {
+		for _, role := range readRoles(realm["roles"]) {
+			if _, ok := k.roles[role]; ok {
+				return true
+			}
+		}
+	}
 	return false
 }
 
-func maxBody(limit int64) gin.HandlerFunc { return func(c *gin.Context) { c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit); c.Next() } }
-func bindJSON(c *gin.Context, target interface{}) bool { if err := c.ShouldBindJSON(target); err != nil { c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request", "detail": err.Error()}); return false }; return true }
-func tenantFromHeader(c *gin.Context) (string, bool) { tenant := strings.TrimSpace(c.GetHeader("X-Tenant-ID")); if tenant == "" { c.JSON(http.StatusBadRequest, gin.H{"error": "X-Tenant-ID header required"}); return "", false }; return tenant, true }
-func tenantMatches(c *gin.Context, tenantID string) bool { tenant, ok := tenantFromHeader(c); if !ok { return false }; if tenant != tenantID { c.JSON(http.StatusForbidden, gin.H{"error": "tenant ID does not match request context"}); return false }; return true }
-func actor(c *gin.Context) string { value, _ := c.Get("subject"); subject, _ := value.(string); return subject }
-func riskLevel(score int) string { if score >= 70 { return "critical" }; if score >= 50 { return "high" }; if score >= 30 { return "medium" }; return "low" }
-func accessRisk(event accessEvent, history history) (int, []string) { score := 0; flags := []string{}; if event.Timestamp.Hour() < 6 || event.Timestamp.Hour() > 22 { score += 20; flags = append(flags, "after_hours_access") }; if isPrivileged(event.Resource) { score += 20; flags = append(flags, "privileged_resource_access") }; if history.total >= 20 { score += 25; flags = append(flags, "high_access_velocity") }; if history.privileged >= 10 { score += 20; flags = append(flags, "repeated_privileged_access") }; return min(100, score), flags }
-func isPrivileged(resource string) bool { switch resource { case "customer_database", "financial_records", "ledger", "kyc_documents": return true }; return false }
-func isExternalDestination(destination string) bool { return destination == "external" || destination == "personal_email" || strings.HasPrefix(destination, "http://") || strings.HasPrefix(destination, "https://") }
+func maxBody(limit int64) gin.HandlerFunc {
+	return func(c *gin.Context) { c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit); c.Next() }
+}
+func bindJSON(c *gin.Context, target interface{}) bool {
+	if err := c.ShouldBindJSON(target); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request", "detail": err.Error()})
+		return false
+	}
+	return true
+}
+func tenantFromHeader(c *gin.Context) (string, bool) {
+	tenant := strings.TrimSpace(c.GetHeader("X-Tenant-ID"))
+	if tenant == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "X-Tenant-ID header required"})
+		return "", false
+	}
+	return tenant, true
+}
+func tenantMatches(c *gin.Context, tenantID string) bool {
+	tenant, ok := tenantFromHeader(c)
+	if !ok {
+		return false
+	}
+	if tenant != tenantID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "tenant ID does not match request context"})
+		return false
+	}
+	return true
+}
+func actor(c *gin.Context) string {
+	value, _ := c.Get("subject")
+	subject, _ := value.(string)
+	return subject
+}
+func riskLevel(score int) string {
+	if score >= 70 {
+		return "critical"
+	}
+	if score >= 50 {
+		return "high"
+	}
+	if score >= 30 {
+		return "medium"
+	}
+	return "low"
+}
+func accessRisk(event accessEvent, history history) (int, []string) {
+	score := 0
+	flags := []string{}
+	if event.Timestamp.Hour() < 6 || event.Timestamp.Hour() > 22 {
+		score += 20
+		flags = append(flags, "after_hours_access")
+	}
+	if isPrivileged(event.Resource) {
+		score += 20
+		flags = append(flags, "privileged_resource_access")
+	}
+	if history.total >= 20 {
+		score += 25
+		flags = append(flags, "high_access_velocity")
+	}
+	if history.privileged >= 10 {
+		score += 20
+		flags = append(flags, "repeated_privileged_access")
+	}
+	return min(100, score), flags
+}
+func isPrivileged(resource string) bool {
+	switch resource {
+	case "customer_database", "financial_records", "ledger", "kyc_documents":
+		return true
+	}
+	return false
+}
+func isExternalDestination(destination string) bool {
+	return destination == "external" || destination == "personal_email" || strings.HasPrefix(destination, "http://") || strings.HasPrefix(destination, "https://")
+}
 func unusualAccessThreshold(hours int) int { return max(10, hours*3) }
-func boundedQueryInt(c *gin.Context, key string, fallback, lower, upper int) int { value := c.Query(key); if value == "" { return fallback }; parsed, err := strconv.Atoi(value); if err != nil || parsed < lower || parsed > upper { return fallback }; return parsed }
-func internalError(c *gin.Context, err error) { log.Printf("%s internal error: %v", serviceName, err); c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"}) }
-func requiredEnv(key string) string { value := strings.TrimSpace(os.Getenv(key)); if value == "" { log.Fatalf("%s must be configured", key) }; return value }
-func envOr(key, fallback string) string { if value := strings.TrimSpace(os.Getenv(key)); value != "" { return value }; return fallback }
-func intEnv(key string, fallback int) int { value := strings.TrimSpace(os.Getenv(key)); if value == "" { return fallback }; parsed, err := strconv.Atoi(value); if err != nil || parsed < 1 { log.Fatalf("%s must be a positive integer", key) }; return parsed }
-func min(a, b int) int { if a < b { return a }; return b }
-func max(a, b int) int { if a > b { return a }; return b }
+func boundedQueryInt(c *gin.Context, key string, fallback, lower, upper int) int {
+	value := c.Query(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < lower || parsed > upper {
+		return fallback
+	}
+	return parsed
+}
+func internalError(c *gin.Context, err error) {
+	log.Printf("%s internal error: %v", serviceName, err)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
+}
+func requiredEnv(key string) string {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		log.Fatalf("%s must be configured", key)
+	}
+	return value
+}
+func envOr(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
+}
+func intEnv(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 {
+		log.Fatalf("%s must be a positive integer", key)
+	}
+	return parsed
+}
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

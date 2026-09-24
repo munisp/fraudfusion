@@ -1,7 +1,9 @@
-import axios, { AxiosInstance, AxiosRequestConfig } from 'axios';
+import axios, { AxiosInstance } from 'axios';
 import {
   DocumentReview,
   KYCVerification,
+  FraudAlert,
+  FraudAlertUpdate,
   JourneyExecution,
   AuditLogEntry,
   DashboardStats,
@@ -108,6 +110,16 @@ class ApiService {
       decision,
       reason,
     });
+    return response.data;
+  }
+
+  async getFraudAlerts(): Promise<FraudAlert[]> {
+    const response = await this.client.get('/backoffice/fraud/alerts');
+    return response.data;
+  }
+
+  async updateFraudAlertStatus(alertId: string, update: FraudAlertUpdate): Promise<FraudAlert> {
+    const response = await this.client.post(`/backoffice/fraud/alerts/${alertId}/status`, update);
     return response.data;
   }
 

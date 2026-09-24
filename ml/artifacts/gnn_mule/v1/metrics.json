@@ -1,0 +1,13 @@
+{
+  "auc_pr": 0.994376124585858,
+  "auc_roc": 0.9999269347673603,
+  "f1": 0.9043478260869565,
+  "base_rate": 0.013000000268220901,
+  "recall_at_fpr_0.01": 1.0,
+  "backend": "torch_geometric.SAGEConv",
+  "epochs_trained": 56,
+  "seed": 42,
+  "n_nodes": 4000,
+  "n_edges": 61220,
+  "mule_prevalence": 0.013000000268220901
+}

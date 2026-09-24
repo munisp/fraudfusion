@@ -13,7 +13,7 @@ import (
 // Journey34Input represents the input for Journey 34: Double Allocation Detection
 type Journey34Input struct {
 	UserID          string                 `json:"user_id"`
-	DocumentFile    string                 `json:"document_file"`     // Base64 encoded
+	DocumentFile    string                 `json:"document_file"` // Base64 encoded
 	PropertyAddress string                 `json:"property_address"`
 	State           string                 `json:"state"`
 	Context         map[string]interface{} `json:"context"`
@@ -21,18 +21,18 @@ type Journey34Input struct {
 
 // Journey34Output represents the output for Journey 34
 type Journey34Output struct {
-	JourneyID           string                   `json:"journey_id"`
-	Status              string                   `json:"status"`
-	FraudDetected       bool                     `json:"fraud_detected"`
-	RiskScore           float64                  `json:"risk_score"`
-	Indicators          []FraudIndicator         `json:"indicators"`
-	OwnershipHistory    []OwnershipRecord        `json:"ownership_history"`
-	Claimants           []Claimant               `json:"claimants"`
-	CourtDisputes       []CourtDispute           `json:"court_disputes"`
-	Recommendation      string                   `json:"recommendation"`
-	ProfessionalHelp    *ProfessionalRecommendation `json:"professional_help,omitempty"`
-	ExecutionTime       float64                  `json:"execution_time"`
-	Timestamp           time.Time                `json:"timestamp"`
+	JourneyID        string                      `json:"journey_id"`
+	Status           string                      `json:"status"`
+	FraudDetected    bool                        `json:"fraud_detected"`
+	RiskScore        float64                     `json:"risk_score"`
+	Indicators       []FraudIndicator            `json:"indicators"`
+	OwnershipHistory []OwnershipRecord           `json:"ownership_history"`
+	Claimants        []Claimant                  `json:"claimants"`
+	CourtDisputes    []CourtDispute              `json:"court_disputes"`
+	Recommendation   string                      `json:"recommendation"`
+	ProfessionalHelp *ProfessionalRecommendation `json:"professional_help,omitempty"`
+	ExecutionTime    float64                     `json:"execution_time"`
+	Timestamp        time.Time                   `json:"timestamp"`
 }
 
 // FraudIndicator represents a detected fraud indicator
@@ -47,22 +47,22 @@ type FraudIndicator struct {
 
 // OwnershipRecord represents a historical ownership record
 type OwnershipRecord struct {
-	Owner         string    `json:"owner"`
-	StartDate     time.Time `json:"start_date"`
-	EndDate       *time.Time `json:"end_date,omitempty"`
-	TransferType  string    `json:"transfer_type"`
-	DocumentRef   string    `json:"document_ref"`
-	Verified      bool      `json:"verified"`
+	Owner        string     `json:"owner"`
+	StartDate    time.Time  `json:"start_date"`
+	EndDate      *time.Time `json:"end_date,omitempty"`
+	TransferType string     `json:"transfer_type"`
+	DocumentRef  string     `json:"document_ref"`
+	Verified     bool       `json:"verified"`
 }
 
 // Claimant represents someone claiming ownership
 type Claimant struct {
-	Name          string    `json:"name"`
-	ClaimDate     time.Time `json:"claim_date"`
-	DocumentType  string    `json:"document_type"`
-	DocumentRef   string    `json:"document_ref"`
-	Verified      bool      `json:"verified"`
-	Conflicting   bool      `json:"conflicting"`
+	Name         string    `json:"name"`
+	ClaimDate    time.Time `json:"claim_date"`
+	DocumentType string    `json:"document_type"`
+	DocumentRef  string    `json:"document_ref"`
+	Verified     bool      `json:"verified"`
+	Conflicting  bool      `json:"conflicting"`
 }
 
 // CourtDispute represents a court case related to the property
@@ -77,8 +77,8 @@ type CourtDispute struct {
 
 // ProfessionalRecommendation recommends a professional for help
 type ProfessionalRecommendation struct {
-	Type          string  `json:"type"`
-	Urgency       string  `json:"urgency"`
+	Type          string         `json:"type"`
+	Urgency       string         `json:"urgency"`
 	Professionals []Professional `json:"professionals"`
 }
 
@@ -153,8 +153,8 @@ func Journey34DoubleAllocationWorkflow(ctx workflow.Context, input Journey34Inpu
 	logger.Info("Step 3: Detecting multiple claimants")
 	var claimants []Claimant
 	claimantsInput := map[string]interface{}{
-		"property_address": input.PropertyAddress,
-		"state":            input.State,
+		"property_address":   input.PropertyAddress,
+		"state":              input.State,
 		"certificate_number": extractedData["certificate_number"],
 	}
 	err = workflow.ExecuteActivity(ctx, DetectMultipleClaimantsActivity, claimantsInput).Get(ctx, &claimants)
@@ -478,8 +478,8 @@ func CalculateRiskScoreActivity(ctx context.Context, input map[string]interface{
 	}
 
 	return map[string]interface{}{
-		"risk_score":     riskScore,
-		"risk_level":     getRiskLevel(riskScore),
+		"risk_score":      riskScore,
+		"risk_level":      getRiskLevel(riskScore),
 		"indicator_count": len(indicators),
 	}, nil
 }

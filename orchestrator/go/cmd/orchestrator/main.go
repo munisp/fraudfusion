@@ -8,24 +8,24 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"fraudfusion/orchestrator/internal/apisix"
-	"fraudfusion/orchestrator/internal/dapr"
-	"fraudfusion/orchestrator/internal/fluvio"
-	"fraudfusion/orchestrator/internal/kafka"
-	"fraudfusion/orchestrator/internal/keycloak"
-	"fraudfusion/orchestrator/internal/permify"
-	"fraudfusion/orchestrator/internal/redis"
-	"fraudfusion/orchestrator/internal/temporal"
-	"fraudfusion/orchestrator/internal/tigerbeetle"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/apisix"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/dapr"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/kafka"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/keycloak"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/permify"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/redis"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/temporal"
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/tigerbeetle"
 )
 
-// Orchestrator manages all middleware clients
+// Orchestrator manages all middleware clients. The event bus is Kafka; the
+// legacy Fluvio integration was removed (see internal/fluvio doc comment).
 type Orchestrator struct {
 	kafka        *kafka.Client
 	dapr         *dapr.Client
-	fluvio       *fluvio.Client
 	temporal     *temporal.Client
 	keycloak     *keycloak.Client
 	permify      *permify.Client
@@ -37,10 +37,10 @@ type Orchestrator struct {
 
 // JourneyRequest represents a journey execution request
 type JourneyRequest struct {
-	JourneyID   string                 `json:"journey_id"`
-	UserID      string                 `json:"user_id"`
-	TenantID    string                 `json:"tenant_id"`
-	Data        map[string]interface{} `json:"data"`
+	JourneyID string                 `json:"journey_id"`
+	UserID    string                 `json:"user_id"`
+	TenantID  string                 `json:"tenant_id"`
+	Data      map[string]interface{} `json:"data"`
 }
 
 // JourneyResponse represents a journey execution response
@@ -55,14 +55,16 @@ type JourneyResponse struct {
 	Error       string                 `json:"error,omitempty"`
 }
 
-// NewOrchestrator creates a new orchestrator with all middleware
-func NewOrchestrator() (*Orchestrator, error) {
+// NewOrchestrator creates a new orchestrator with all middleware.
+// Secrets are REQUIRED from the environment — there are no insecure defaults
+// such as "secret" or "api-key".
+func NewOrchestrator(ctx context.Context) (*Orchestrator, error) {
 	log.Println("🚀 Initializing FraudFusion GO Orchestrator...")
 
-	// 1. Kafka
+	// 1. Kafka (the platform event bus)
 	log.Println("1️⃣  Initializing Kafka client...")
 	kafkaClient, err := kafka.NewClient(
-		[]string{getEnv("KAFKA_BROKERS", "localhost:9092")},
+		strings.Split(getEnv("KAFKA_BROKERS", "localhost:9092"), ","),
 		getEnv("KAFKA_TOPIC", "fraudfusion-events"),
 	)
 	if err != nil {
@@ -79,15 +81,8 @@ func NewOrchestrator() (*Orchestrator, error) {
 		return nil, fmt.Errorf("failed to create Dapr client: %w", err)
 	}
 
-	// 3. Fluvio
-	log.Println("3️⃣  Initializing Fluvio client...")
-	fluvioClient, err := fluvio.NewClient(getEnv("FLUVIO_ENDPOINT", "localhost:9003"))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Fluvio client: %w", err)
-	}
-
-	// 4. Temporal
-	log.Println("4️⃣  Initializing Temporal client...")
+	// 3. Temporal
+	log.Println("3️⃣  Initializing Temporal client...")
 	temporalClient, err := temporal.NewClient(
 		getEnv("TEMPORAL_HOST", "localhost:7233"),
 		getEnv("TEMPORAL_NAMESPACE", "default"),
@@ -96,30 +91,30 @@ func NewOrchestrator() (*Orchestrator, error) {
 		return nil, fmt.Errorf("failed to create Temporal client: %w", err)
 	}
 
-	// 5. Keycloak
-	log.Println("5️⃣  Initializing Keycloak client...")
+	// 4. Keycloak — client secret is mandatory, fail fast if missing.
+	log.Println("4️⃣  Initializing Keycloak client...")
 	keycloakClient, err := keycloak.NewClient(
 		getEnv("KEYCLOAK_URL", "http://localhost:8080"),
 		getEnv("KEYCLOAK_REALM", "fraudfusion"),
 		getEnv("KEYCLOAK_CLIENT_ID", "orchestrator"),
-		getEnv("KEYCLOAK_CLIENT_SECRET", "secret"),
+		requiredEnv("KEYCLOAK_CLIENT_SECRET"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Keycloak client: %w", err)
 	}
 
-	// 6. Permify
-	log.Println("6️⃣  Initializing Permify client...")
+	// 5. Permify — API key is mandatory, fail fast if missing.
+	log.Println("5️⃣  Initializing Permify client...")
 	permifyClient, err := permify.NewClient(
 		getEnv("PERMIFY_URL", "http://localhost:3476"),
-		getEnv("PERMIFY_API_KEY", "api-key"),
+		requiredEnv("PERMIFY_API_KEY"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Permify client: %w", err)
 	}
 
-	// 7. Redis
-	log.Println("7️⃣  Initializing Redis client...")
+	// 6. Redis
+	log.Println("6️⃣  Initializing Redis client...")
 	redisClient, err := redis.NewClient(
 		getEnv("REDIS_ADDR", "localhost:6379"),
 		getEnv("REDIS_PASSWORD", ""),
@@ -130,36 +125,54 @@ func NewOrchestrator() (*Orchestrator, error) {
 		return nil, fmt.Errorf("failed to create Redis client: %w", err)
 	}
 
-	// 8. APISIX
-	log.Println("8️⃣  Initializing APISIX client...")
+	// 7. APISIX — admin API key is mandatory, fail fast if missing.
+	log.Println("7️⃣  Initializing APISIX client...")
 	apisixClient, err := apisix.NewClient(
 		getEnv("APISIX_ADMIN_URL", "http://localhost:9180"),
-		getEnv("APISIX_API_KEY", "admin-api-key"),
+		requiredEnv("APISIX_API_KEY"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create APISIX client: %w", err)
 	}
 
-	// 9. TigerBeetle
-	log.Println("9️⃣  Initializing TigerBeetle client...")
+	// 8. TigerBeetle
+	log.Println("8️⃣  Initializing TigerBeetle client...")
 	tigerbeetleClient, err := tigerbeetle.NewClient(
-		[]string{getEnv("TIGERBEETLE_ADDRESSES", "localhost:3000")},
+		strings.Split(getEnv("TIGERBEETLE_ADDRESSES", "localhost:3000"), ","),
 		1,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TigerBeetle client: %w", err)
 	}
 
+	// 9. Permify bootstrap: write schema + seed relationships so permission
+	// checks can actually allow. Fails fast when a bootstrap tenant is
+	// configured but bootstrap fails; otherwise warns honestly that
+	// authorization will deny every journey.
+	if tenant := strings.TrimSpace(os.Getenv("PERMIFY_BOOTSTRAP_TENANT")); tenant != "" {
+		bootCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		var journeys []string
+		if seeds := strings.TrimSpace(os.Getenv("PERMIFY_SEED_JOURNEYS")); seeds != "" {
+			journeys = strings.Split(seeds, ",")
+		}
+		if err := permifyClient.Bootstrap(bootCtx, tenant, strings.TrimSpace(os.Getenv("PERMIFY_BOOTSTRAP_ADMIN")), journeys); err != nil {
+			return nil, fmt.Errorf("failed to bootstrap Permify: %w", err)
+		}
+		log.Printf("✅ Permify bootstrapped for tenant %s", tenant)
+	} else {
+		log.Println("⚠️  PERMIFY_BOOTSTRAP_TENANT unset: journey authorization will deny until Permify is provisioned")
+	}
+
 	// 10. Lakehouse URL
 	lakehouseURL := getEnv("LAKEHOUSE_URL", "http://localhost:8090")
 	log.Println("🔟 Lakehouse URL configured:", lakehouseURL)
 
-	log.Println("✅ All 10 middleware components initialized successfully!")
+	log.Println("✅ All middleware components initialized successfully!")
 
 	return &Orchestrator{
 		kafka:        kafkaClient,
 		dapr:         daprClient,
-		fluvio:       fluvioClient,
 		temporal:     temporalClient,
 		keycloak:     keycloakClient,
 		permify:      permifyClient,
@@ -170,10 +183,13 @@ func NewOrchestrator() (*Orchestrator, error) {
 	}, nil
 }
 
-// ExecuteJourney executes a journey with all 10 middleware integrations
+// ExecuteJourney executes a journey with the middleware integrations.
+// Event-bus publishes propagate errors; auxiliary integrations (APISIX route
+// registration, Dapr invocation, TigerBeetle ledger, cache writes) record
+// explicit warnings in the response instead of being silently dropped.
 func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) (*JourneyResponse, error) {
 	startTime := time.Now()
-	executionID := fmt.Sprintf("%s-%d", req.JourneyID, time.Now().Unix())
+	executionID := fmt.Sprintf("%s-%d", req.JourneyID, time.Now().UnixNano())
 
 	log.Printf("🎯 Executing Journey: %s (User: %s)", req.JourneyID, req.UserID)
 
@@ -183,6 +199,12 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 		ExecutionID: executionID,
 		Data:        make(map[string]interface{}),
 	}
+	warnings := []string{}
+	warn := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		log.Println("⚠️  " + msg)
+		warnings = append(warnings, msg)
+	}
 
 	// Step 1: Keycloak authentication has already been validated by the HTTP handler.
 	// Step 2: Permify Authorization
@@ -191,15 +213,14 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 	if err != nil || !allowed {
 		response.Status = "failed"
 		response.Error = "Authorization failed"
-		return response, fmt.Errorf("authorization failed")
+		return response, fmt.Errorf("authorization failed: %w", err)
 	}
 
 	// Step 3: Redis Cache Check
 	log.Println("3️⃣  Checking Redis cache...")
 	cacheKey := fmt.Sprintf("journey:%s:%s", req.JourneyID, req.UserID)
 	var cachedResult JourneyResponse
-	err = o.redis.GetJSON(ctx, cacheKey, &cachedResult)
-	if err == nil && cachedResult.Status == "completed" {
+	if cacheErr := o.redis.GetJSON(ctx, cacheKey, &cachedResult); cacheErr == nil && cachedResult.Status == "completed" {
 		log.Println("✅ Cache hit! Returning cached result")
 		cachedResult.Duration = time.Since(startTime).String()
 		return &cachedResult, nil
@@ -221,7 +242,8 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 	}
 	response.Data["workflow_run_id"] = runID
 
-	// Step 5: Kafka Event Publishing
+	// Step 5: Kafka Event Publishing — errors propagate; journeys must not
+	// continue silently when the audit event bus is down.
 	log.Println("5️⃣  Publishing event to Kafka...")
 	event := kafka.Event{
 		ID:   executionID,
@@ -231,26 +253,35 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 			"user_id":    req.UserID,
 		},
 	}
-	_ = o.kafka.PublishEvent(ctx, req.UserID, event)
+	if err := o.kafka.PublishEvent(ctx, req.UserID, event); err != nil {
+		response.Status = "failed"
+		response.Error = fmt.Sprintf("Event publish failed: %v", err)
+		return response, err
+	}
 
-	// Step 6: Fluvio Real-time Streaming
-	log.Println("6️⃣  Streaming event to Fluvio...")
-	fluvioEvent := fluvio.Event{
+	// Step 6: Real-time processing event — now on Kafka (Fluvio removed).
+	log.Println("6️⃣  Streaming processing event to Kafka...")
+	processingEvent := kafka.Event{
 		ID:   executionID,
 		Type: "journey.processing",
 		Data: req.Data,
 	}
-	_ = o.fluvio.ProduceEvent(ctx, req.UserID, fluvioEvent)
+	if err := o.kafka.PublishEvent(ctx, req.UserID, processingEvent); err != nil {
+		response.Status = "failed"
+		response.Error = fmt.Sprintf("Event publish failed: %v", err)
+		return response, err
+	}
 
-	// Step 7: Dapr Service Invocation
+	// Step 7: Dapr Service Invocation (best-effort enrichment, explicit warning)
 	log.Println("7️⃣  Invoking services via Dapr...")
 	kycData := map[string]interface{}{"bvn": req.Data["bvn"], "user_id": req.UserID}
-	kycResult, _ := o.dapr.InvokeService(ctx, "kyc-service", "verify", kycData)
-	if kycResult != nil {
+	if kycResult, err := o.dapr.InvokeService(ctx, "kyc-service", "verify", kycData); err != nil {
+		warn("Dapr kyc-service invocation failed: %v", err)
+	} else {
 		response.Data["kyc_result"] = kycResult.Data
 	}
 
-	// Step 8: APISIX Route Registration
+	// Step 8: APISIX Route Registration (best-effort, explicit warning)
 	log.Println("8️⃣  Registering route in APISIX...")
 	route := apisix.Route{
 		ID:          fmt.Sprintf("route-%s", executionID),
@@ -258,14 +289,25 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 		Methods:     []string{"GET"},
 		UpstreamURL: "http://journey-service:8080",
 	}
-	_ = o.apisix.CreateRoute(ctx, route)
+	if err := o.apisix.CreateRoute(ctx, route); err != nil {
+		warn("APISIX route registration failed: %v", err)
+	}
 
-	// Step 9: TigerBeetle Ledger Entry
+	// Step 9: TigerBeetle Ledger Entry (explicit warning on failure; in the
+	// default build the client is a stub that returns ErrUnavailable — build
+	// with `-tags tigerbeetle` to enable the native client).
 	log.Println("9️⃣  Creating ledger entry in TigerBeetle...")
 	accountID := uint64(12345)
-	_ = o.tigerbeetle.CreateAccount(ctx, accountID, 1, 100)
-	if amount, ok := req.Data["amount"].(float64); ok {
-		_ = o.tigerbeetle.CreateTransfer(ctx, uint64(time.Now().Unix()), accountID, accountID+1, uint64(amount), 1, 200)
+	if err := o.tigerbeetle.CreateAccount(ctx, accountID, 1, 100); err != nil {
+		warn("TigerBeetle account creation failed: %v", err)
+	}
+	if amount, ok := req.Data["amount"].(float64); ok && amount > 0 {
+		transferID, err := tigerbeetle.NewTransferID()
+		if err != nil {
+			warn("TigerBeetle transfer ID generation failed: %v", err)
+		} else if err := o.tigerbeetle.CreateTransfer(ctx, transferID, accountID, accountID+1, uint64(amount), 1, 200); err != nil {
+			warn("TigerBeetle transfer failed: %v", err)
+		}
 	}
 
 	// Step 10: Get Temporal Workflow Result
@@ -283,11 +325,13 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 	response.RiskScore = workflowResult.RiskScore
 	response.Data["workflow_result"] = workflowResult.Data
 
-	// Cache the result
+	// Cache the result (explicitly logged on failure, non-fatal)
 	log.Println("💾 Caching result in Redis...")
-	_ = o.redis.SetJSON(ctx, cacheKey, response, 1*time.Hour)
+	if err := o.redis.SetJSON(ctx, cacheKey, response, 1*time.Hour); err != nil {
+		warn("Redis cache write failed: %v", err)
+	}
 
-	// Publish completion event
+	// Publish completion event — errors propagate.
 	log.Println("📢 Publishing completion event to Kafka...")
 	completionEvent := kafka.Event{
 		ID:   executionID,
@@ -299,8 +343,15 @@ func (o *Orchestrator) ExecuteJourney(ctx context.Context, req *JourneyRequest) 
 			"risk_score": response.RiskScore,
 		},
 	}
-	_ = o.kafka.PublishEvent(ctx, req.UserID, completionEvent)
+	if err := o.kafka.PublishEvent(ctx, req.UserID, completionEvent); err != nil {
+		response.Status = "failed"
+		response.Error = fmt.Sprintf("Completion event publish failed: %v", err)
+		return response, err
+	}
 
+	if len(warnings) > 0 {
+		response.Data["warnings"] = warnings
+	}
 	response.Duration = time.Since(startTime).String()
 	log.Printf("✅ Journey completed in %s (Decision: %s, Risk: %.2f)", response.Duration, response.Decision, response.RiskScore)
 
@@ -312,7 +363,6 @@ func (o *Orchestrator) Close() {
 	log.Println("🔌 Closing all middleware connections...")
 	o.kafka.Close()
 	o.dapr.Close()
-	o.fluvio.Close()
 	o.temporal.Close()
 	o.keycloak.Close()
 	o.permify.Close()
@@ -374,34 +424,70 @@ func (o *Orchestrator) handleExecuteJourney(w http.ResponseWriter, r *http.Reque
 	json.NewEncoder(w).Encode(response)
 }
 
+// checkWithTimeout runs a health probe with a bounded timeout and returns
+// "connected" or the failure detail — never a hardcoded status.
+func checkWithTimeout(name string, probe func(context.Context) error, results map[string]string, mu *sync.Mutex, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	status := "connected"
+	if err := probe(ctx); err != nil {
+		status = "unavailable: " + err.Error()
+	}
+	mu.Lock()
+	results[name] = status
+	mu.Unlock()
+}
+
 func (o *Orchestrator) handleHealth(w http.ResponseWriter, r *http.Request) {
-	health := map[string]interface{}{
-		"status": "healthy",
-		"middleware": map[string]string{
-			"kafka":        "connected",
-			"dapr":         "connected",
-			"fluvio":       "connected",
-			"temporal":     "connected",
-			"keycloak":     "connected",
-			"permify":      "connected",
-			"redis":        "connected",
-			"apisix":       "connected",
-			"tigerbeetle":  "connected",
-			"lakehouse":    "configured",
-		},
+	results := map[string]string{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	probes := []struct {
+		name  string
+		probe func(context.Context) error
+	}{
+		{"kafka", o.kafka.Health},
+		{"dapr", o.dapr.Health},
+		{"temporal", o.temporal.Health},
+		{"keycloak", o.keycloak.Health},
+		{"permify", o.permify.Health},
+		{"redis", o.redis.Ping},
+		{"apisix", o.apisix.Health},
+		{"tigerbeetle", o.tigerbeetle.Health},
+	}
+	for _, p := range probes {
+		wg.Add(1)
+		go checkWithTimeout(p.name, p.probe, results, &mu, &wg)
+	}
+	wg.Wait()
+	results["lakehouse"] = "configured: " + o.lakehouseURL
+
+	overall := "healthy"
+	statusCode := http.StatusOK
+	for name, status := range results {
+		if strings.HasPrefix(status, "unavailable") {
+			overall = "degraded"
+			statusCode = http.StatusServiceUnavailable
+			_ = name
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     overall,
+		"middleware": results,
+	})
 }
 
 func main() {
 	log.Println("╔════════════════════════════════════════════════════════════╗")
-	log.Println("║   FraudFusion GO Orchestrator with 10 Middleware          ║")
+	log.Println("║   FraudFusion GO Orchestrator with 9 Middleware           ║")
 	log.Println("║   Production-Ready Journey Execution Engine                ║")
 	log.Println("╚════════════════════════════════════════════════════════════╝")
 
-	orchestrator, err := NewOrchestrator()
+	orchestrator, err := NewOrchestrator(context.Background())
 	if err != nil {
 		log.Fatalf("❌ Failed to initialize orchestrator: %v", err)
 	}
@@ -426,4 +512,13 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+// requiredEnv fails fast when a security-critical variable is missing.
+func requiredEnv(key string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		log.Fatalf("missing required environment variable: %s", key)
+	}
+	return value
 }

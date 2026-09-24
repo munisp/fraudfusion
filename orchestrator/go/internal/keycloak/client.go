@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/munisp/fraudfusion/orchestrator/go/internal/backoff"
 )
 
 // Client performs confidential-client OpenID Connect interactions with Keycloak.
@@ -68,29 +70,35 @@ func (c *Client) Login(ctx context.Context, username, password string) (*TokenRe
 		"username":      {username},
 		"password":      {password},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("token"), strings.NewReader(form.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("create Keycloak token request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request Keycloak token: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read Keycloak token response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Keycloak token request rejected with status %d", resp.StatusCode)
-	}
-
 	var token TokenResponse
-	if err := json.Unmarshal(body, &token); err != nil {
-		return nil, fmt.Errorf("decode Keycloak token response: %w", err)
+	err := backoff.Do(ctx, backoff.Default(), func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("token"), strings.NewReader(form.Encode()))
+		if err != nil {
+			return fmt.Errorf("create Keycloak token request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("request Keycloak token: %w", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return fmt.Errorf("read Keycloak token response: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("Keycloak token request rejected with status %d", resp.StatusCode)
+		}
+
+		if err := json.Unmarshal(body, &token); err != nil {
+			return fmt.Errorf("decode Keycloak token response: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	if token.AccessToken == "" || !strings.EqualFold(token.TokenType, "bearer") {
 		return nil, fmt.Errorf("Keycloak returned an invalid token response")
@@ -111,35 +119,59 @@ func (c *Client) ValidateToken(ctx context.Context, token string) (map[string]in
 		"client_id":     {c.clientID},
 		"client_secret": {c.clientSecret},
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("token/introspect"), strings.NewReader(form.Encode()))
-	if err != nil {
-		return nil, fmt.Errorf("create Keycloak introspection request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("introspect Keycloak token: %w", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read Keycloak introspection response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Keycloak introspection rejected with status %d", resp.StatusCode)
-	}
-
 	claims := make(map[string]interface{})
-	if err := json.Unmarshal(body, &claims); err != nil {
-		return nil, fmt.Errorf("decode Keycloak introspection response: %w", err)
+	err := backoff.Do(ctx, backoff.Default(), func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("token/introspect"), strings.NewReader(form.Encode()))
+		if err != nil {
+			return fmt.Errorf("create Keycloak introspection request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("introspect Keycloak token: %w", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return fmt.Errorf("read Keycloak introspection response: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("Keycloak introspection rejected with status %d", resp.StatusCode)
+		}
+
+		if err := json.Unmarshal(body, &claims); err != nil {
+			return fmt.Errorf("decode Keycloak introspection response: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	active, ok := claims["active"].(bool)
 	if !ok || !active {
 		return nil, fmt.Errorf("Keycloak reports token inactive")
 	}
 	return claims, nil
+}
+
+// Health performs a real realm lookup so /health reflects Keycloak
+// availability instead of a hardcoded "connected".
+func (c *Client) Health(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/realms/%s", c.serverURL, url.PathEscape(c.realm)), nil)
+	if err != nil {
+		return fmt.Errorf("create Keycloak health request: %w", err)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("call Keycloak realm endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Keycloak realm %q unavailable: status %d", c.realm, resp.StatusCode)
+	}
+	return nil
 }
 
 // Close satisfies the orchestrator client contract; the HTTP client owns no persistent connection requiring close.

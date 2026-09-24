@@ -86,18 +86,18 @@ func (r *SARGenerationRequest) Validate() error {
 
 // SAR represents a Suspicious Activity Report
 type SAR struct {
-	ID                 int64     `json:"id"`
-	SARID              string    `json:"sar_id"`
-	UserID             string    `json:"user_id"`
-	FilingInstitution  string    `json:"filing_institution"`
-	ActivityType       string    `json:"activity_type"`
-	Narrative          string    `json:"narrative"`
-	TransactionIDs     []string  `json:"transaction_ids"`
-	FilingDate         time.Time `json:"filing_date"`
-	Status             string    `json:"status"`
-	ReferenceNumber    string    `json:"reference_number"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                int64     `json:"id"`
+	SARID             string    `json:"sar_id"`
+	UserID            string    `json:"user_id"`
+	FilingInstitution string    `json:"filing_institution"`
+	ActivityType      string    `json:"activity_type"`
+	Narrative         string    `json:"narrative"`
+	TransactionIDs    []string  `json:"transaction_ids"`
+	FilingDate        time.Time `json:"filing_date"`
+	Status            string    `json:"status"`
+	ReferenceNumber   string    `json:"reference_number"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 // SARFilingRequest represents a request to file a SAR
@@ -175,17 +175,17 @@ type SourceOfFundsVerification struct {
 
 // DailyReport represents a daily AML report
 type DailyReport struct {
-	Date                    time.Time `json:"date"`
-	TotalTransactions       int       `json:"total_transactions"`
-	FlaggedTransactions     int       `json:"flagged_transactions"`
-	HighRiskTransactions    int       `json:"high_risk_transactions"`
-	SARsGenerated           int       `json:"sars_generated"`
-	SARsFiled               int       `json:"sars_filed"`
-	PatternsDetected        int       `json:"patterns_detected"`
-	SanctionsChecks         int       `json:"sanctions_checks"`
-	SanctionsMatches        int       `json:"sanctions_matches"`
-	TotalAmountFlagged      float64   `json:"total_amount_flagged"`
-	AverageRiskScore        float64   `json:"average_risk_score"`
+	Date                 time.Time `json:"date"`
+	TotalTransactions    int       `json:"total_transactions"`
+	FlaggedTransactions  int       `json:"flagged_transactions"`
+	HighRiskTransactions int       `json:"high_risk_transactions"`
+	SARsGenerated        int       `json:"sars_generated"`
+	SARsFiled            int       `json:"sars_filed"`
+	PatternsDetected     int       `json:"patterns_detected"`
+	SanctionsChecks      int       `json:"sanctions_checks"`
+	SanctionsMatches     int       `json:"sanctions_matches"`
+	TotalAmountFlagged   float64   `json:"total_amount_flagged"`
+	AverageRiskScore     float64   `json:"average_risk_score"`
 }
 
 // RiskScoreDistribution represents distribution of risk scores

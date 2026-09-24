@@ -1,0 +1,111 @@
+{
+  "realm": "fraudfusion",
+  "enabled": true,
+  "sslRequired": "external",
+  "roles": {
+    "realm": [
+      {"name": "fraud_analyst", "description": "Fraud analyst: run detections, manage blocks/blacklists"},
+      {"name": "compliance_officer", "description": "Compliance: SAR management, sanctions screening, regulatory filings"},
+      {"name": "auditor", "description": "Read-only audit reporting access"},
+      {"name": "admin", "description": "Platform administrator"},
+      {"name": "viewer", "description": "Read-only access"}
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "orchestrator",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect",
+      "attributes": {"client.secret.creation.time": "0"}
+    },
+    {
+      "clientId": "ledger-command",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "mobile-app",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "protocol": "openid-connect",
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "redirectUris": ["fraudfusion://auth/callback"],
+      "webOrigins": []
+    },
+    {
+      "clientId": "aml-monitor",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "crypto-fraud-detector",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "investment-fraud-detector",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "sim-swap-detector",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "advance-fee-fraud-detector",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "insider-fraud-detector",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "chargeback-fraud-detector",
+      "enabled": true,
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "protocol": "openid-connect"
+    }
+  ],
+  "users": [],
+  "scopeMappings": [
+    {
+      "clientScope": "roles",
+      "roles": ["fraud_analyst", "compliance_officer", "auditor", "admin", "viewer"]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+// FraudFusion Permify ReBAC schema.
+//
+// Model: tenants group users; journeys belong to a tenant and carry
+// owner/analyst relations. The `execute` permission is granted to the
+// journey owner, assigned analysts, and tenant admins.
+entity user {}
+
+entity tenant {
+    relation admin  @user
+    relation member @user
+}
+
+entity journey {
+    relation tenant  @tenant
+    relation owner   @user
+    relation analyst @user
+
+    permission execute = owner or analyst or tenant.admin
+}

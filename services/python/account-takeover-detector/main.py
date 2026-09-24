@@ -1,17 +1,134 @@
 from __future__ import annotations
 
+import logging
 import math
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import asyncpg
 import httpx
+import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-SERVICE_NAME = "account-takeover-detector"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+logger = logging.getLogger(SERVICE_NAME := "account-takeover-detector")
+
+# Hybrid scoring: ONNX model blended with rules. Rules remain as the
+# (loudly logged) fallback when the artifact is missing.
+ARTIFACT_DIR = Path(os.getenv(
+    "ATO_ARTIFACT_DIR",
+    str(Path(__file__).resolve().parents[3] / "ml" / "artifacts" / "fraud_net" / "v1"),
+))
+MODEL_PATH = Path(os.getenv("ATO_MODEL_PATH", "")) if os.getenv("ATO_MODEL_PATH") else next(
+    (p for p in (ARTIFACT_DIR / "fraud_net.onnx", ARTIFACT_DIR / "model.onnx") if p.exists()),
+    ARTIFACT_DIR / "model.onnx",
+)
+MODEL_BLEND_WEIGHT = float(os.getenv("ATO_MODEL_BLEND_WEIGHT", "0.6"))  # 0=rules only, 1=model only
+
+# ml lane fraud_net contract (mirrors ml/data/synthetic_nigeria.py).
+NUMERIC_FEATURES = [
+    "log_amount", "hour", "dow", "is_month_end", "is_market_day",
+    "amount_vs_sender_avg", "sender_txns_24h", "sender_unique_receivers_72h",
+    "receiver_fanin_72h", "mins_since_last_txn", "device_emulator",
+    "sim_swap_7d", "new_device", "cross_state", "cross_bank", "is_night",
+]
+CATEGORICAL_FEATURES = ["channel", "sender_bank", "receiver_bank", "sender_state", "device_os"]
+
+
+class OnnxScorer:
+    """Lazy-loading fraud_net ONNX scorer (x_num/x_cat contract). Never raises;
+    falls back to rules when the artifact is missing or unloadable."""
+
+    def __init__(self) -> None:
+        self.session = None
+        self.input_names: list[str] = []
+        self.vocab: dict[str, dict[str, int]] = {}
+        self.scaler_mean = None
+        self.scaler_std = None
+        self.mode = "rule_fallback"
+        if not MODEL_PATH.exists():
+            logger.warning(
+                "ATO MODEL ARTIFACT MISSING at %s — using RULE-BASED FALLBACK scoring (heuristic, NOT ML). "
+                "Train/export via ml/train to enable the ONNX model.", MODEL_PATH,
+            )
+            return
+        try:
+            import json as _json
+
+            import onnxruntime as ort
+
+            vocab_path = ARTIFACT_DIR / "vocab.json"
+            if vocab_path.exists():
+                self.vocab = _json.loads(vocab_path.read_text())
+            prep_path = ARTIFACT_DIR / "preprocess.npz"
+            if prep_path.exists():
+                prep = np.load(prep_path)
+                self.scaler_mean, self.scaler_std = prep["scaler_mean"], prep["scaler_std"]
+            self.session = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
+            self.input_names = [i.name for i in self.session.get_inputs()]
+            self.mode = "hybrid"
+            logger.info("Loaded ONNX model %s (inputs=%s)", MODEL_PATH, self.input_names)
+        except Exception as exc:  # noqa: BLE001
+            self.session = None
+            logger.warning("ATO MODEL FAILED TO LOAD (%s) — using RULE-BASED FALLBACK scoring.", exc)
+
+    def predict_proba(self, features: dict[str, float]) -> float | None:
+        """Model probability in [0,1], or None when the model is unavailable."""
+        if self.session is None:
+            return None
+        if "x_num" in self.input_names:
+            x_num = np.array([[float(features.get(f, 0.0)) for f in NUMERIC_FEATURES]], dtype=np.float32)
+            if self.scaler_mean is not None and self.scaler_std is not None:
+                x_num = ((x_num - self.scaler_mean) / self.scaler_std).astype(np.float32)
+            inputs: dict[str, np.ndarray] = {"x_num": x_num}
+            if "x_cat" in self.input_names:
+                # All-categorical-unknown -> OOV index 0 (sorted order matches the ml lane).
+                inputs["x_cat"] = np.zeros((1, len(CATEGORICAL_FEATURES)), dtype=np.int64)
+        else:
+            meta = self.session.get_inputs()[0]
+            dim = meta.shape[1] if len(meta.shape) >= 2 and isinstance(meta.shape[1], int) and meta.shape[1] > 0 else len(NUMERIC_FEATURES)
+            vec = np.zeros(dim, dtype=np.float32)
+            for i, name in enumerate(NUMERIC_FEATURES[:dim]):
+                vec[i] = float(features.get(name, 0.0))
+            inputs = {meta.name: vec.reshape(1, -1)}
+        raw = float(np.asarray(self.session.run(None, inputs)[0]).reshape(-1)[0])
+        if raw < 0.0 or raw > 1.0:
+            raw = 1.0 / (1.0 + math.exp(-raw))
+        return raw
+
+
+def blend_score(model_proba: float | None, rule_score: int) -> tuple[int, str]:
+    """Blend model probability with the rule score (both normalized to 0..100)."""
+    if model_proba is None:
+        return rule_score, "rule_fallback"
+    blended = MODEL_BLEND_WEIGHT * (model_proba * 100.0) + (1 - MODEL_BLEND_WEIGHT) * rule_score
+    return min(int(round(blended)), 100), "hybrid"
+
+
+def login_features(event: LoginEvent, history: Any, hour_window_logins: int | None = None) -> dict[str, float]:
+    """Map login context onto the fraud_net numeric feature contract."""
+    logins = int(hour_window_logins if hour_window_logins is not None else history["recent_logins"])
+    return {
+        "log_amount": 0.0,
+        "hour": float(event.timestamp.hour),
+        "dow": float(event.timestamp.weekday()),
+        "is_night": 1.0 if event.timestamp.hour < 6 else 0.0,
+        "sender_txns_24h": float(logins),
+        "sender_unique_receivers_72h": float(history["distinct_ips"] or 0),
+        "new_device": 0.0 if bool(history["known_device"]) else 1.0,
+        "cross_state": 0.0 if bool(history["known_location"]) else 1.0,
+    }
+
+
+def get_scorer(request: Request) -> OnnxScorer:
+    scorer = getattr(request.app.state, "scorer", None)
+    if scorer is None:
+        scorer = request.app.state.scorer = OnnxScorer()
+    return scorer
 
 
 class LoginEvent(BaseModel):
@@ -117,7 +234,13 @@ async def health_check(request: Request):
         await request.app.state.pool.fetchval("SELECT 1")
     except asyncpg.PostgresError:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="database unavailable")
-    return {"status": "healthy", "service": SERVICE_NAME, "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": "healthy",
+        "service": SERVICE_NAME,
+        "scoring_mode": get_scorer(request).mode,
+        "model_path": str(MODEL_PATH),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.post("/detect-takeover")
@@ -143,7 +266,12 @@ async def detect_takeover(event: LoginEvent, request: Request, _: AuthenticatedS
                 """,
                 event.tenant_id, event.user_id, event.ip_address, event.device_id, event.location, event.user_agent, event.timestamp,
             )
-            risk_score, indicators = takeover_score(history, event)
+            rule_score, indicators = takeover_score(history, event)
+            model_proba = get_scorer(request).predict_proba(login_features(event, history))
+            risk_score, score_mode = blend_score(model_proba, rule_score)
+            if score_mode == "rule_fallback":
+                logger.warning("takeover_detection served by RULE FALLBACK for user=%s", event.user_id)
+            indicators.append(f"score_mode:{score_mode}")
             await record_event(connection, event.tenant_id, event.user_id, "takeover_detection", risk_score, indicators)
             if risk_score >= 60:
                 await create_alert(connection, event.tenant_id, event.user_id, "account_takeover", risk_level(risk_score))
@@ -167,7 +295,12 @@ async def analyze_login(event: LoginEvent, request: Request, _: AuthenticatedSub
             "INSERT INTO login_patterns (tenant_id,user_id,ip_address,device_id,location,user_agent,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
             event.tenant_id, event.user_id, event.ip_address, event.device_id, event.location, event.user_agent, event.timestamp,
         )
-        risk_score, indicators = login_score(history, event)
+        rule_score, indicators = login_score(history, event)
+        model_proba = get_scorer(request).predict_proba(login_features(event, history))
+        risk_score, score_mode = blend_score(model_proba, rule_score)
+        if score_mode == "rule_fallback":
+            logger.warning("login_analysis served by RULE FALLBACK for user=%s", event.user_id)
+        indicators.append(f"score_mode:{score_mode}")
         await record_event(connection, event.tenant_id, event.user_id, "login_analysis", risk_score, indicators)
     return response(event.user_id, risk_score, indicators, "is_suspicious", risk_score >= 40)
 
