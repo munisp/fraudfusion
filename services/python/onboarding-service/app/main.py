@@ -23,9 +23,11 @@ import logging
 import os
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Path, status
+
+import json
 
 from app.auth import Principal, get_current_principal, require_admin
 from app.db import Database, get_db
@@ -36,8 +38,14 @@ from app.schemas import (
     ApprovalDecision,
     ChecklistItem,
     ChecklistUpdate,
+    KybApplicationView,
+    KybSubmission,
     KycTierSelection,
+    MerchantApplicationView,
+    MerchantSubmission,
     OnboardingStatus,
+    RegulatorAccessRequest,
+    RegulatorAccessView,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -390,6 +398,328 @@ def create_app() -> FastAPI:
         )
         _record_event(db, key_id, "reject", principal.sub, payload.reason[:200])
         return _key_view(_get_key(db, key_id))
+
+    # --------------------- KYB submissions (dual control) -----------------
+
+    def _kyb_view(row: dict) -> KybApplicationView:
+        return KybApplicationView(
+            applicationId=row["id"], businessName=row["business_name"],
+            cacNumber=row["cac_number"], businessType=row["business_type"],
+            status=row["status"], submittedBy=row["submitted_by"],
+            reviewedBy=row.get("reviewed_by"), approvedBy=row.get("approved_by"),
+            rejectionReason=row.get("rejection_reason"),
+            createdAt=str(row.get("created_at") or ""),
+        )
+
+    def _merchant_view(row: dict) -> MerchantApplicationView:
+        return MerchantApplicationView(
+            applicationId=row["id"], businessName=row["business_name"],
+            merchantCategory=row["merchant_category"], status=row["status"],
+            submittedBy=row["submitted_by"], reviewedBy=row.get("reviewed_by"),
+            approvedBy=row.get("approved_by"), rejectionReason=row.get("rejection_reason"),
+            createdAt=str(row.get("created_at") or ""),
+        )
+
+    def _current_tenant_id(db: Database, principal: Principal) -> str | None:
+        tenant = db.query_one(
+            "SELECT id FROM tenants WHERE owner_sub = :sub ORDER BY created_at DESC LIMIT 1",
+            {"sub": principal.sub},
+        )
+        return tenant["id"] if tenant else None
+
+    def _submit_application(db: Database, principal: Principal, table: str,
+                            values: dict) -> dict:
+        app_id = uuid.uuid4().hex
+        now = _now()
+        base = {
+            "id": app_id, "tenant_id": _current_tenant_id(db, principal),
+            "submitted_by": principal.sub, "now": now,
+        }
+        cols = ", ".join(["id", "tenant_id", *values.keys(), "submitted_by", "created_at", "updated_at"])
+        binds = ", ".join([":id", ":tenant_id", *[f":{k}" for k in values], ":submitted_by", ":now", ":now"])
+        db.execute(f"INSERT INTO {table} ({cols}) VALUES ({binds})", {**base, **values})
+        return db.query_one(f"SELECT * FROM {table} WHERE id = :id", {"id": app_id})
+
+    def _get_application(db: Database, table: str, app_id: str) -> dict:
+        row = db.query_one(f"SELECT * FROM {table} WHERE id = :id", {"id": app_id})
+        if not row:
+            raise HTTPException(status_code=404, detail="application not found")
+        return row
+
+    def _review_application(db: Database, principal: Principal, table: str, app_id: str) -> dict:
+        row = _get_application(db, table, app_id)
+        if row["status"] != "submitted":
+            raise HTTPException(status_code=409, detail=f"application is {row['status']}, not submitted")
+        if row["submitted_by"] == principal.sub:
+            raise HTTPException(status_code=409, detail="submitter cannot review their own application")
+        db.execute(
+            f"UPDATE {table} SET status = 'under_review', reviewed_by = :by, updated_at = :now"
+            " WHERE id = :id AND status = 'submitted'",
+            {"by": principal.sub, "now": _now(), "id": app_id},
+        )
+        logger.info("%s reviewed: id=%s by=%s", table, app_id, principal.sub)
+        return _get_application(db, table, app_id)
+
+    def _approve_application(db: Database, principal: Principal, table: str, app_id: str) -> dict:
+        """Dual control: approver must differ from both submitter and reviewer."""
+        row = _get_application(db, table, app_id)
+        if row["status"] != "under_review":
+            raise HTTPException(status_code=409,
+                                detail=f"application is {row['status']}; must be under_review to approve")
+        if principal.sub in {row["submitted_by"], row["reviewed_by"]}:
+            raise HTTPException(
+                status_code=409,
+                detail="dual control: approver must differ from submitter and reviewer",
+            )
+        db.execute(
+            f"UPDATE {table} SET status = 'approved', approved_by = :by, updated_at = :now"
+            " WHERE id = :id AND status = 'under_review'",
+            {"by": principal.sub, "now": _now(), "id": app_id},
+        )
+        logger.info("%s approved: id=%s by=%s", table, app_id, principal.sub)
+        return _get_application(db, table, app_id)
+
+    def _reject_application(db: Database, principal: Principal, table: str,
+                            app_id: str, reason: str) -> dict:
+        row = _get_application(db, table, app_id)
+        if row["status"] not in ("submitted", "under_review"):
+            raise HTTPException(status_code=409, detail=f"application is {row['status']}; cannot reject")
+        if row["submitted_by"] == principal.sub:
+            raise HTTPException(status_code=409, detail="submitter cannot reject their own application")
+        db.execute(
+            f"UPDATE {table} SET status = 'rejected', rejection_reason = :reason, updated_at = :now"
+            " WHERE id = :id",
+            {"reason": reason[:2000], "now": _now(), "id": app_id},
+        )
+        logger.info("%s rejected: id=%s by=%s", table, app_id, principal.sub)
+        return _get_application(db, table, app_id)
+
+    @app.post("/api/v1/onboarding/kyb", response_model=KybApplicationView, status_code=201,
+              response_model_by_alias=True)
+    def submit_kyb(
+        payload: KybSubmission,
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> KybApplicationView:
+        row = _submit_application(db, principal, "kyb_applications", {
+            "business_name": payload.business_name,
+            "cac_number": payload.cac_number,
+            "business_type": payload.business_type,
+            "contact_email": payload.contact_email,
+            "documents": json.dumps([d.model_dump() for d in payload.documents]),
+        })
+        logger.info("kyb submitted: id=%s business=%s by=%s", row["id"], row["business_name"], principal.sub)
+        return _kyb_view(row)
+
+    @app.get("/api/v1/onboarding/kyb", response_model=list[KybApplicationView],
+             response_model_by_alias=True)
+    def list_kyb(
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> list[KybApplicationView]:
+        if principal.is_admin:
+            rows = db.query("SELECT * FROM kyb_applications ORDER BY created_at DESC")
+        else:
+            rows = db.query(
+                "SELECT * FROM kyb_applications WHERE submitted_by = :sub ORDER BY created_at DESC",
+                {"sub": principal.sub},
+            )
+        return [_kyb_view(r) for r in rows]
+
+    @app.get("/api/v1/onboarding/kyb/{app_id}", response_model=KybApplicationView,
+             response_model_by_alias=True)
+    def get_kyb(
+        app_id: str,
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> KybApplicationView:
+        row = _get_application(db, "kyb_applications", app_id)
+        if row["submitted_by"] != principal.sub and not principal.is_admin:
+            raise HTTPException(status_code=403, detail="not your application")
+        return _kyb_view(row)
+
+    @app.post("/api/v1/onboarding/admin/kyb/{app_id}/review", response_model=KybApplicationView,
+              response_model_by_alias=True)
+    def review_kyb(app_id: str, principal: Principal = Depends(get_current_principal),
+                   db: Database = Depends(get_db)) -> KybApplicationView:
+        require_admin(principal)
+        return _kyb_view(_review_application(db, principal, "kyb_applications", app_id))
+
+    @app.post("/api/v1/onboarding/admin/kyb/{app_id}/approve", response_model=KybApplicationView,
+              response_model_by_alias=True)
+    def approve_kyb(app_id: str, principal: Principal = Depends(get_current_principal),
+                    db: Database = Depends(get_db)) -> KybApplicationView:
+        require_admin(principal)
+        return _kyb_view(_approve_application(db, principal, "kyb_applications", app_id))
+
+    @app.post("/api/v1/onboarding/admin/kyb/{app_id}/reject", response_model=KybApplicationView,
+              response_model_by_alias=True)
+    def reject_kyb(app_id: str, payload: ApprovalDecision,
+                   principal: Principal = Depends(get_current_principal),
+                   db: Database = Depends(get_db)) -> KybApplicationView:
+        require_admin(principal)
+        return _kyb_view(_reject_application(db, principal, "kyb_applications", app_id, payload.reason))
+
+    # --------------------- Merchant onboarding (dual control) --------------
+
+    @app.post("/api/v1/onboarding/merchants", response_model=MerchantApplicationView,
+              status_code=201, response_model_by_alias=True)
+    def submit_merchant(
+        payload: MerchantSubmission,
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> MerchantApplicationView:
+        row = _submit_application(db, principal, "merchant_applications", {
+            "business_name": payload.business_name,
+            "cac_number": payload.cac_number,
+            "merchant_category": payload.merchant_category,
+            "settlement_bank_code": payload.settlement_bank_code,
+            "settlement_account": payload.settlement_account,
+            "contact_email": payload.contact_email,
+        })
+        logger.info("merchant application submitted: id=%s business=%s by=%s",
+                    row["id"], row["business_name"], principal.sub)
+        return _merchant_view(row)
+
+    @app.get("/api/v1/onboarding/merchants", response_model=list[MerchantApplicationView],
+             response_model_by_alias=True)
+    def list_merchants(
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> list[MerchantApplicationView]:
+        if principal.is_admin:
+            rows = db.query("SELECT * FROM merchant_applications ORDER BY created_at DESC")
+        else:
+            rows = db.query(
+                "SELECT * FROM merchant_applications WHERE submitted_by = :sub ORDER BY created_at DESC",
+                {"sub": principal.sub},
+            )
+        return [_merchant_view(r) for r in rows]
+
+    @app.post("/api/v1/onboarding/admin/merchants/{app_id}/review",
+              response_model=MerchantApplicationView, response_model_by_alias=True)
+    def review_merchant(app_id: str, principal: Principal = Depends(get_current_principal),
+                        db: Database = Depends(get_db)) -> MerchantApplicationView:
+        require_admin(principal)
+        return _merchant_view(_review_application(db, principal, "merchant_applications", app_id))
+
+    @app.post("/api/v1/onboarding/admin/merchants/{app_id}/approve",
+              response_model=MerchantApplicationView, response_model_by_alias=True)
+    def approve_merchant(app_id: str, principal: Principal = Depends(get_current_principal),
+                         db: Database = Depends(get_db)) -> MerchantApplicationView:
+        require_admin(principal)
+        return _merchant_view(_approve_application(db, principal, "merchant_applications", app_id))
+
+    @app.post("/api/v1/onboarding/admin/merchants/{app_id}/reject",
+              response_model=MerchantApplicationView, response_model_by_alias=True)
+    def reject_merchant(app_id: str, payload: ApprovalDecision,
+                        principal: Principal = Depends(get_current_principal),
+                        db: Database = Depends(get_db)) -> MerchantApplicationView:
+        require_admin(principal)
+        return _merchant_view(
+            _reject_application(db, principal, "merchant_applications", app_id, payload.reason))
+
+    # --------------------- Regulator access (read-only, expiring, dual control)
+
+    def _regulator_view(row: dict) -> RegulatorAccessView:
+        return RegulatorAccessView(
+            accessId=row["id"], regulatorOrg=row["regulator_org"],
+            principalSub=row["principal_sub"], scope=row["scope"], status=row["status"],
+            requestedBy=row["requested_by"], approvedBy=row.get("approved_by"),
+            expiresAt=str(row.get("expires_at") or ""),
+        )
+
+    def _expire_stale_access(db: Database) -> None:
+        db.execute(
+            "UPDATE regulator_access SET status = 'expired', updated_at = :now"
+            " WHERE status = 'active' AND expires_at <= :now",
+            {"now": _now()},
+        )
+
+    @app.post("/api/v1/onboarding/admin/regulator-access", response_model=RegulatorAccessView,
+              status_code=201, response_model_by_alias=True)
+    def request_regulator_access(
+        payload: RegulatorAccessRequest,
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> RegulatorAccessView:
+        """Provision a read-only, time-boxed regulator access grant. The grant
+        is INERT until approved by a second, distinct admin (dual control)."""
+        require_admin(principal)
+        access_id = uuid.uuid4().hex
+        expires_at = datetime.now(timezone.utc) + timedelta(days=payload.expires_in_days)
+        db.execute(
+            "INSERT INTO regulator_access (id, regulator_org, principal_sub, scope, status,"
+            " requested_by, expires_at, created_at, updated_at)"
+            " VALUES (:id, :org, :sub, 'read_only', 'requested', :by, :exp, :now, :now)",
+            {"id": access_id, "org": payload.regulator_org, "sub": payload.principal_sub,
+             "by": principal.sub, "exp": expires_at.isoformat(), "now": _now()},
+        )
+        logger.info("regulator access requested: id=%s org=%s sub=%s by=%s",
+                    access_id, payload.regulator_org, payload.principal_sub, principal.sub)
+        return _regulator_view(db.query_one(
+            "SELECT * FROM regulator_access WHERE id = :id", {"id": access_id}))
+
+    @app.post("/api/v1/onboarding/admin/regulator-access/{access_id}/approve",
+              response_model=RegulatorAccessView, response_model_by_alias=True)
+    def approve_regulator_access(
+        access_id: str,
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> RegulatorAccessView:
+        require_admin(principal)
+        row = db.query_one("SELECT * FROM regulator_access WHERE id = :id", {"id": access_id})
+        if not row:
+            raise HTTPException(status_code=404, detail="regulator access grant not found")
+        if row["status"] != "requested":
+            raise HTTPException(status_code=409, detail=f"grant is {row['status']}, not requested")
+        if row["requested_by"] == principal.sub:
+            raise HTTPException(
+                status_code=409,
+                detail="dual control: approver must differ from the requester",
+            )
+        db.execute(
+            "UPDATE regulator_access SET status = 'active', approved_by = :by, updated_at = :now"
+            " WHERE id = :id AND status = 'requested'",
+            {"by": principal.sub, "now": _now(), "id": access_id},
+        )
+        logger.info("regulator access activated: id=%s by=%s", access_id, principal.sub)
+        return _regulator_view(db.query_one(
+            "SELECT * FROM regulator_access WHERE id = :id", {"id": access_id}))
+
+    @app.get("/api/v1/onboarding/admin/regulator-access",
+             response_model=list[RegulatorAccessView], response_model_by_alias=True)
+    def list_regulator_access(
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> list[RegulatorAccessView]:
+        require_admin(principal)
+        _expire_stale_access(db)
+        rows = db.query("SELECT * FROM regulator_access ORDER BY created_at DESC")
+        return [_regulator_view(r) for r in rows]
+
+    @app.post("/api/v1/onboarding/admin/regulator-access/{access_id}/revoke",
+              response_model=RegulatorAccessView, response_model_by_alias=True)
+    def revoke_regulator_access(
+        access_id: str,
+        payload: ApprovalDecision,
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> RegulatorAccessView:
+        require_admin(principal)
+        row = db.query_one("SELECT * FROM regulator_access WHERE id = :id", {"id": access_id})
+        if not row:
+            raise HTTPException(status_code=404, detail="regulator access grant not found")
+        if row["status"] not in ("requested", "active"):
+            raise HTTPException(status_code=409, detail=f"grant is {row['status']}; cannot revoke")
+        db.execute(
+            "UPDATE regulator_access SET status = 'revoked', revoked_by = :by,"
+            " revoke_reason = :reason, updated_at = :now WHERE id = :id",
+            {"by": principal.sub, "reason": payload.reason[:2000], "now": _now(), "id": access_id},
+        )
+        logger.info("regulator access revoked: id=%s by=%s", access_id, principal.sub)
+        return _regulator_view(db.query_one(
+            "SELECT * FROM regulator_access WHERE id = :id", {"id": access_id}))
 
     return app
 

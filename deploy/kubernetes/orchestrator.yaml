@@ -36,6 +36,18 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: orchestrator
+      # Dapr sidecar guidance: the orchestrator's DAPR_URL/DAPR_APP_ID envs
+      # below target a Dapr sidecar on localhost:3500. No Dapr install
+      # manifest is shipped here; once the Dapr control plane is installed in
+      # the cluster (dapr init -k, or the Dapr Helm chart), enable injection by
+      # uncommenting:
+      #   annotations:
+      #     dapr.io/enabled: "true"
+      #     dapr.io/app-id: "fraudfusion-orchestrator"
+      #     dapr.io/app-port: "8000"
+      #     dapr.io/enable-api-logging: "false"
+      # Until then the DAPR_* envs are inert (the orchestrator skips Dapr
+      # fan-out when the sidecar is absent/unreachable).
     spec:
       containers:
         - name: orchestrator

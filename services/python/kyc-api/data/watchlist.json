@@ -1,0 +1,20 @@
+{
+  "description": "Local sanctions watchlist seed for the KYC API sanctions stub. Live UN/OFAC/NFIU list feeds are NOT integrated; entries here are sample rows so the screening path is exercisable end-to-end. Production deployments should load real designations into the `watchlist` Postgres table (database/20260827_pep_kyb_merchant.sql), which takes precedence over this file.",
+  "entries": [
+    {
+      "full_name": "Sani Example Danladi",
+      "date_of_birth": "1970-01-01",
+      "nationality": "NG",
+      "program": "SAMPLE-DOMESTIC-LIST",
+      "source": "sample-seed",
+      "passport_number": "A00000000"
+    },
+    {
+      "full_name": "Victor Sample Okafor",
+      "date_of_birth": "1985-06-15",
+      "nationality": "NG",
+      "program": "SAMPLE-UN-1267",
+      "source": "sample-seed"
+    }
+  ]
+}

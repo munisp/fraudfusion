@@ -1,6 +1,7 @@
 import axios, { AxiosHeaders, InternalAxiosRequestConfig } from 'axios';
 import { AuthService } from './AuthService';
 import { logger } from './logger';
+import type { TamperReport } from './TamperService';
 
 export interface DashboardSummary { openCases: number; pendingKyc: number; unreadNotifications: number; riskLevel: 'low' | 'medium' | 'high'; }
 export interface KycSession { id: string; status: 'created' | 'documents_required' | 'biometric_required' | 'video_required' | 'under_review' | 'approved' | 'rejected'; updatedAt: string; decisionReason?: string; }
@@ -98,4 +99,14 @@ export const MobileApi = {
   biometricChallenge: (sessionId: string): Promise<{ challengeId: string; prompt: string }> => send('post', `/kyc/sessions/${sessionId}/biometric-challenge`),
   submitBiometric: (sessionId: string, challengeId: string): Promise<KycSession> => send('post', `/kyc/sessions/${sessionId}/biometric-challenge/${challengeId}/complete`),
   submitVideoKyc: (sessionId: string, videoReference: string): Promise<KycSession> => send('post', `/kyc/sessions/${sessionId}/video`, { videoReference }, UPLOAD_TIMEOUT_MS),
+  // Device-tamper report (TamperService wiring). Best-effort: failures are
+  // logged, never thrown — the local session wipe must not be masked by a
+  // reporting outage.
+  reportDeviceTamper: async (report: TamperReport): Promise<void> => {
+    try {
+      await send('post', '/api/v1/security/device-tamper', report);
+    } catch (error) {
+      logger.warn('security.device_tamper_report_failed', { reason: error instanceof Error ? error.message : 'unknown_error' });
+    }
+  },
 };

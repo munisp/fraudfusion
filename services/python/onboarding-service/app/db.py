@@ -84,6 +84,66 @@ CREATE TABLE IF NOT EXISTS onboarding_approval_events (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE INDEX IF NOT EXISTS onboarding_approval_events_key_idx ON onboarding_approval_events (api_key_id);
+
+-- KYB / merchant / regulator-access extensions (canonical Postgres schema:
+-- database/20260827_pep_kyb_merchant.sql).
+CREATE TABLE IF NOT EXISTS kyb_applications (
+    id               TEXT PRIMARY KEY,
+    tenant_id        TEXT REFERENCES tenants (id) ON DELETE SET NULL,
+    business_name    TEXT NOT NULL,
+    cac_number       TEXT NOT NULL,
+    business_type    TEXT NOT NULL DEFAULT 'limited_liability'
+                     CHECK (business_type IN ('business_name', 'limited_liability', 'plc', 'ngo', 'partnership')),
+    contact_email    TEXT NOT NULL,
+    documents        TEXT NOT NULL DEFAULT '[]',
+    status           TEXT NOT NULL DEFAULT 'submitted'
+                     CHECK (status IN ('submitted', 'under_review', 'approved', 'rejected')),
+    submitted_by     TEXT NOT NULL,
+    reviewed_by      TEXT,
+    approved_by      TEXT,
+    rejection_reason TEXT,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS kyb_applications_status_idx ON kyb_applications (status);
+CREATE INDEX IF NOT EXISTS kyb_applications_submitter_idx ON kyb_applications (submitted_by);
+
+CREATE TABLE IF NOT EXISTS merchant_applications (
+    id                    TEXT PRIMARY KEY,
+    tenant_id             TEXT REFERENCES tenants (id) ON DELETE SET NULL,
+    business_name         TEXT NOT NULL,
+    cac_number            TEXT,
+    merchant_category     TEXT NOT NULL DEFAULT 'general',
+    settlement_bank_code  TEXT NOT NULL,
+    settlement_account    TEXT NOT NULL,
+    contact_email         TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'submitted'
+                          CHECK (status IN ('submitted', 'under_review', 'approved', 'rejected', 'suspended')),
+    submitted_by          TEXT NOT NULL,
+    reviewed_by           TEXT,
+    approved_by           TEXT,
+    rejection_reason      TEXT,
+    created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS merchant_applications_status_idx ON merchant_applications (status);
+
+CREATE TABLE IF NOT EXISTS regulator_access (
+    id              TEXT PRIMARY KEY,
+    regulator_org   TEXT NOT NULL,
+    principal_sub   TEXT NOT NULL,
+    scope           TEXT NOT NULL DEFAULT 'read_only' CHECK (scope = 'read_only'),
+    status          TEXT NOT NULL DEFAULT 'requested'
+                    CHECK (status IN ('requested', 'active', 'expired', 'revoked')),
+    requested_by    TEXT NOT NULL,
+    approved_by     TEXT,
+    expires_at      TEXT NOT NULL,
+    revoked_by      TEXT,
+    revoke_reason   TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS regulator_access_status_idx ON regulator_access (status);
 """
 
 _NAMED_PARAM = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")

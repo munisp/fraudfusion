@@ -5,6 +5,7 @@
 
 import React, { useEffect, useState } from 'react';
 import {
+  AppState,
   InteractionManager,
   SafeAreaView,
   StatusBar,
@@ -172,8 +173,26 @@ function App(): React.JSX.Element {
     };
 
     void initializeApplication();
+
+    // Device-integrity re-check on every return to foreground: a critical
+    // verdict wipes the local session (in AuthService) and drops the user
+    // back to the login gate.
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState !== 'active' || cancelled) return;
+      void AuthService.verifyDeviceIntegrity('foreground')
+        .then((trusted) => {
+          if (!trusted && !cancelled) {
+            setIsAuthenticated(false);
+          }
+        })
+        .catch((error: unknown) => {
+          logger.warn('auth.foreground_integrity_check_failed', { reason: error instanceof Error ? error.message : 'unknown_error' });
+        });
+    });
+
     return () => {
       cancelled = true;
+      subscription.remove();
     };
   }, []);
 

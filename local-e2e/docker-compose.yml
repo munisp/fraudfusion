@@ -138,6 +138,47 @@ services:
       - "8100:8100"
     networks: [fraudfusion-e2e]
 
+  aml-monitor:
+    build:
+      context: ../services/go/aml-monitor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      aml-ml-service:
+        condition: service_healthy
+    environment:
+      PORT: "8081"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: fraudfusion
+      DB_PASSWORD: local_e2e_only
+      DB_NAME: fraudfusion_e2e
+      # Compose postgres has no TLS; aml-monitor refuses sslmode=disable
+      # without this explicit local-only override.
+      DB_SSLMODE: disable
+      DB_ALLOW_INSECURE: "true"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # In-cluster/plaintext Keycloak over http:8080 matches the compose
+      # keycloak (KC_HTTP_ENABLED=true); KEYCLOAK_INSECURE_HTTP mirrors the
+      # k8s detectors.yaml wiring.
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_INSECURE_HTTP: "true"
+      KEYCLOAK_REALM: fraudfusion
+      KEYCLOAK_CLIENT_ID: aml-monitor
+      KEYCLOAK_CLIENT_SECRET: ${AML_MONITOR_CLIENT_SECRET:-local_e2e_only}
+      AML_ML_SERVICE_URL: http://aml-ml-service:8100
+    # No container healthcheck: the aml-monitor image is distroless (no
+    # shell/curl/wget). Readiness is covered by the /api/v1/aml/health route
+    # and the contract script's retries.
+    ports:
+      - "8081:8081"
+    networks: [fraudfusion-e2e]
+
   go-mobile-mock:
     build:
       context: ./go-mobile-mock

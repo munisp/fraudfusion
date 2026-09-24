@@ -230,3 +230,189 @@ def test_health():
     resp = client.get("/health")
     assert resp.status_code == 200
     assert resp.json()["service"] == "onboarding-service"
+
+
+# ---------------------------------------------------------------------------
+# KYB / merchant / regulator-access extensions (20260827_pep_kyb_merchant.sql)
+# ---------------------------------------------------------------------------
+
+MERCHANT = Principal(sub="merchant-user-1", username="merchant", roles=set())
+
+
+def kyb_payload(**overrides):
+    payload = {
+        "businessName": "Acme Logistics Ltd",
+        "cacNumber": "RC1234567",
+        "businessType": "limited_liability",
+        "contactEmail": "compliance@acme.example",
+        "documents": [
+            {"type": "cac_certificate", "reference": "s3://kyb/acme/cac.pdf"},
+            {"type": "memart", "reference": "s3://kyb/acme/memart.pdf"},
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestKyb:
+    def test_submit_kyb_valid_cac(self, db):
+        client = make_client(db, TENANT)
+        resp = client.post("/api/v1/onboarding/kyb", json=kyb_payload())
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        assert body["status"] == "submitted"
+        assert body["cacNumber"] == "RC1234567"
+        assert body["submittedBy"] == TENANT.sub
+
+    def test_cac_format_validated(self, db):
+        client = make_client(db, TENANT)
+        for bad in ["1234567", "RC", "RC123", "BN1234567", "RC123456789"]:
+            resp = client.post("/api/v1/onboarding/kyb", json=kyb_payload(cacNumber=bad))
+            assert resp.status_code == 422, bad
+        # lowercase is normalized to uppercase
+        resp = client.post("/api/v1/onboarding/kyb", json=kyb_payload(cacNumber="rc1234567"))
+        assert resp.status_code == 201
+        assert resp.json()["cacNumber"] == "RC1234567"
+
+    def test_kyb_status_workflow_dual_control(self, db):
+        tenant_client = make_client(db, TENANT)
+        app_id = tenant_client.post("/api/v1/onboarding/kyb", json=kyb_payload()).json()["applicationId"]
+
+        admin_a = make_client(db, ADMIN_A)
+        admin_b = make_client(db, ADMIN_B)
+
+        # approve requires prior review
+        assert admin_b.post(f"/api/v1/onboarding/admin/kyb/{app_id}/approve").status_code == 409
+        # review moves to under_review
+        resp = admin_a.post(f"/api/v1/onboarding/admin/kyb/{app_id}/review")
+        assert resp.status_code == 200 and resp.json()["status"] == "under_review"
+        # reviewer cannot also approve (dual control)
+        assert admin_a.post(f"/api/v1/onboarding/admin/kyb/{app_id}/approve").status_code == 409
+        # distinct second admin approves
+        resp = admin_b.post(f"/api/v1/onboarding/admin/kyb/{app_id}/approve")
+        assert resp.status_code == 200 and resp.json()["status"] == "approved"
+        assert resp.json()["approvedBy"] == ADMIN_B.sub
+
+    def test_kyb_submitter_cannot_review_own(self, db):
+        self_admin = Principal(sub="staff-self", username="s", roles={"onboarding_admin"})
+        client = make_client(db, self_admin)
+        app_id = client.post("/api/v1/onboarding/kyb", json=kyb_payload()).json()["applicationId"]
+        assert client.post(f"/api/v1/onboarding/admin/kyb/{app_id}/review").status_code == 409
+
+    def test_kyb_visibility_isolated_per_submitter(self, db):
+        make_client(db, TENANT).post("/api/v1/onboarding/kyb", json=kyb_payload())
+        other = make_client(db, TENANT2).get("/api/v1/onboarding/kyb")
+        assert other.json() == []
+        admin = make_client(db, ADMIN_A).get("/api/v1/onboarding/kyb")
+        assert len(admin.json()) == 1
+
+    def test_kyb_requires_staff_role_for_admin_endpoints(self, db):
+        tenant_client = make_client(db, TENANT)
+        app_id = tenant_client.post("/api/v1/onboarding/kyb", json=kyb_payload()).json()["applicationId"]
+        assert tenant_client.post(f"/api/v1/onboarding/admin/kyb/{app_id}/review").status_code == 403
+
+
+class TestMerchantOnboarding:
+    def merchant_payload(self, **overrides):
+        payload = {
+            "businessName": "Acme Stores",
+            "cacNumber": "RC7654321",
+            "merchantCategory": "retail",
+            "settlementBankCode": "058",
+            "settlementAccount": "0123456789",
+            "contactEmail": "pay@acme.example",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_submit_and_approve_merchant(self, db):
+        client = make_client(db, MERCHANT)
+        resp = client.post("/api/v1/onboarding/merchants", json=self.merchant_payload())
+        assert resp.status_code == 201, resp.text
+        app_id = resp.json()["applicationId"]
+        assert resp.json()["status"] == "submitted"
+
+        admin_a = make_client(db, ADMIN_A)
+        admin_b = make_client(db, ADMIN_B)
+        assert admin_a.post(f"/api/v1/onboarding/admin/merchants/{app_id}/review").status_code == 200
+        assert admin_b.post(f"/api/v1/onboarding/admin/merchants/{app_id}/approve").status_code == 200
+        listing = make_client(db, MERCHANT).get("/api/v1/onboarding/merchants").json()
+        assert listing[0]["status"] == "approved"
+
+    def test_nuban_account_validated(self, db):
+        client = make_client(db, MERCHANT)
+        for bad in ["12345", "01234567890", "012345678a", ""]:
+            resp = client.post("/api/v1/onboarding/merchants",
+                               json=self.merchant_payload(settlementAccount=bad))
+            assert resp.status_code == 422, bad
+
+    def test_merchant_reject_with_reason(self, db):
+        client = make_client(db, MERCHANT)
+        app_id = client.post("/api/v1/onboarding/merchants", json=self.merchant_payload()).json()["applicationId"]
+        admin = make_client(db, ADMIN_A)
+        resp = admin.post(f"/api/v1/onboarding/admin/merchants/{app_id}/reject",
+                          json={"reason": "CAC record mismatch"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "rejected"
+        assert resp.json()["rejectionReason"] == "CAC record mismatch"
+
+
+class TestRegulatorAccess:
+    def payload(self, **overrides):
+        payload = {"regulatorOrg": "NFIU", "principalSub": "reg-user-1", "expiresInDays": 30}
+        payload.update(overrides)
+        return payload
+
+    def test_provision_dual_control_and_expiry(self, db):
+        admin_a = make_client(db, ADMIN_A)
+        admin_b = make_client(db, ADMIN_B)
+        resp = admin_a.post("/api/v1/onboarding/admin/regulator-access", json=self.payload())
+        assert resp.status_code == 201, resp.text
+        grant = resp.json()
+        assert grant["status"] == "requested"
+        assert grant["scope"] == "read_only"
+
+        # requester cannot approve their own grant
+        assert admin_a.post(
+            f"/api/v1/onboarding/admin/regulator-access/{grant['accessId']}/approve"
+        ).status_code == 409
+        resp = admin_b.post(
+            f"/api/v1/onboarding/admin/regulator-access/{grant['accessId']}/approve")
+        assert resp.status_code == 200 and resp.json()["status"] == "active"
+
+        # expiry is encoded
+        from datetime import datetime
+        expires = datetime.fromisoformat(resp.json()["expiresAt"])
+        assert expires > datetime.now(expires.tzinfo)
+
+    def test_expired_grant_marked_on_list(self, db):
+        admin_a = make_client(db, ADMIN_A)
+        admin_b = make_client(db, ADMIN_B)
+        grant = admin_a.post("/api/v1/onboarding/admin/regulator-access",
+                             json=self.payload(expiresInDays=1)).json()
+        admin_b.post(f"/api/v1/onboarding/admin/regulator-access/{grant['accessId']}/approve")
+        # force expiry
+        db.execute("UPDATE regulator_access SET expires_at = '2000-01-01T00:00:00+00:00'"
+                   " WHERE id = :id", {"id": grant["accessId"]})
+        listing = admin_a.get("/api/v1/onboarding/admin/regulator-access").json()
+        assert listing[0]["status"] == "expired"
+
+    def test_revoke_active_grant(self, db):
+        admin_a = make_client(db, ADMIN_A)
+        admin_b = make_client(db, ADMIN_B)
+        grant = admin_a.post("/api/v1/onboarding/admin/regulator-access", json=self.payload()).json()
+        admin_b.post(f"/api/v1/onboarding/admin/regulator-access/{grant['accessId']}/approve")
+        resp = admin_a.post(
+            f"/api/v1/onboarding/admin/regulator-access/{grant['accessId']}/revoke",
+            json={"reason": "investigation closed"})
+        assert resp.status_code == 200 and resp.json()["status"] == "revoked"
+
+    def test_regulator_access_requires_admin_and_valid_expiry(self, db):
+        non_admin = make_client(db, TENANT)
+        assert non_admin.post("/api/v1/onboarding/admin/regulator-access",
+                              json=self.payload()).status_code == 403
+        admin = make_client(db, ADMIN_A)
+        assert admin.post("/api/v1/onboarding/admin/regulator-access",
+                          json=self.payload(expiresInDays=0)).status_code == 422
+        assert admin.post("/api/v1/onboarding/admin/regulator-access",
+                          json=self.payload(expiresInDays=366)).status_code == 422

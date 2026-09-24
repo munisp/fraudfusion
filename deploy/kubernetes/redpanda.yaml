@@ -1,0 +1,87 @@
+# Redpanda single-broker, Kafka-compatible event backbone (DEV-GRADE).
+#
+# Backs the orchestrator's KAFKA_BROKERS env
+# (kafka.fraudfusion-data.svc.cluster.local:9092) — the Service is named
+# "kafka" so existing env wiring resolves unchanged.
+#
+# Dev-grade means: single broker, ephemeral emptyDir storage, no TLS/SASL,
+# no rack awareness. For production: 3+ brokers, PersistentVolumeClaims,
+# TLS + SASL/SCRAM, topic RF=3. Topic `fraudfusion-events` is auto-created
+# on first produce (auto.create.topics.enable default true in dev mode).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redpanda
+  namespace: fraudfusion-data
+  labels:
+    app.kubernetes.io/name: redpanda
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redpanda
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redpanda
+    spec:
+      containers:
+        - name: redpanda
+          image: docker.redpanda.com/redpandadata/redpanda:v24.1.7
+          command:
+            - redpanda
+            - start
+            - --smp=1
+            - --memory=1G
+            - --reserve-memory=0M
+            - --overprovisioned
+            - --node-id=0
+            - --check=false
+            - --kafka-addr=0.0.0.0:9092
+            - --advertise-kafka-addr=kafka.fraudfusion-data.svc.cluster.local:9092
+            - --pandaproxy-addr=0.0.0.0:8082
+            - --advertise-pandaproxy-addr=kafka.fraudfusion-data.svc.cluster.local:8082
+          ports:
+            - name: kafka
+              containerPort: 9092
+            - name: pandaproxy
+              containerPort: 8082
+            - name: admin
+              containerPort: 9644
+          readinessProbe:
+            tcpSocket:
+              port: kafka
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/redpanda/data
+      volumes:
+        # Dev-grade: ephemeral. Swap for a PVC in staging/prod.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # Service name is deliberately "kafka": consumers (orchestrator KAFKA_BROKERS)
+  # reference kafka.fraudfusion-data.svc.cluster.local:9092.
+  name: kafka
+  namespace: fraudfusion-data
+  labels:
+    app.kubernetes.io/name: redpanda
+spec:
+  selector:
+    app.kubernetes.io/name: redpanda
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+    - name: pandaproxy
+      port: 8082
+      targetPort: pandaproxy
+    - name: admin
+      port: 9644
+      targetPort: admin

@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+tests/
+data/kyc.db
+Dockerfile
+.dockerignore

@@ -1,6 +1,7 @@
 import * as Keychain from 'react-native-keychain';
 import { authorize, refresh, revoke, AuthorizeResult, AuthConfiguration, RefreshResult } from 'react-native-app-auth';
 import { logger } from './logger';
+import { TamperService, TamperEventReporter } from './TamperService';
 
 export interface AuthenticatedUser {
   id: string;
@@ -28,6 +29,48 @@ let refreshInFlight: Promise<Session> | null = null;
 
 // Refresh access tokens this far ahead of expiry instead of failing at 401.
 const REFRESH_MARGIN_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// Device-integrity enforcement (TamperService wiring)
+//
+// Tamper checks run on login and on every app-foreground transition. A
+// critical (untrusted) verdict under 'block' enforcement wipes the local
+// session (Keychain + in-memory cache) and blocks the sign-in. The server is
+// notified via POST /api/v1/security/device-tamper; reporting is best-effort
+// and never masks the local wipe.
+// ---------------------------------------------------------------------------
+
+function wipeCompromisedSession(): Promise<void> {
+  cachedSession = null;
+  return Keychain.resetGenericPassword({ service: keychainService }).then(() => undefined);
+}
+
+// Lazy require breaks the AuthService <-> MobileApi module cycle (deferred
+// until the first tamper report, after both modules have finished loading).
+const tamperReporter: TamperEventReporter = async (report) => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { MobileApi } = require('./MobileApi') as typeof import('./MobileApi');
+  await MobileApi.reportDeviceTamper(report);
+};
+
+let tamperService: TamperService | null = null;
+
+function getTamperService(): TamperService {
+  if (!tamperService) {
+    tamperService = new TamperService(tamperReporter, wipeCompromisedSession);
+  }
+  return tamperService;
+}
+
+/** Test hook: inject a pre-configured TamperService (or null to reset). */
+export function __setTamperService(service: TamperService | null): void {
+  tamperService = service;
+}
+
+async function deviceId(): Promise<string> {
+  const session = await AuthService.restoreSession().catch(() => null);
+  return session?.user.id ?? 'unauthenticated-device';
+}
 
 function isExpiringSoon(session: Session): boolean {
   if (!session.accessTokenExpirationDate) return false;
@@ -93,7 +136,35 @@ async function persistSession(result: AuthorizeResult | RefreshResult): Promise<
 }
 
 export const AuthService = {
+  /**
+   * Run tamper checks (jailbreak/root, hooks, debugger, emulator, enclave).
+   * On a critical verdict with 'block' enforcement the TamperService wipes
+   * the Keychain session; we additionally drop the in-memory cache. Returns
+   * true when the device is trusted and the session may proceed.
+   */
+  async verifyDeviceIntegrity(context: 'login' | 'foreground'): Promise<boolean> {
+    const service = getTamperService();
+    const verdict = await service.enforceDeviceIntegrity(await deviceId());
+    if (!verdict.trusted) {
+      logger.warn('auth.device_integrity_failed', { context, signals: verdict.signals });
+      if (service.enforcementMode === 'block') {
+        // TamperService already wiped Keychain via the session wiper; drop the
+        // in-memory cache too and block the caller.
+        cachedSession = null;
+        return false;
+      }
+    }
+    logger.info('auth.device_integrity_ok', { context });
+    return true;
+  },
+
   async signIn(): Promise<Session> {
+    // Tamper gate BEFORE any credential/token exchange: a compromised device
+    // must never obtain fresh tokens.
+    const trusted = await this.verifyDeviceIntegrity('login');
+    if (!trusted) {
+      throw new Error('Sign-in blocked: device integrity check failed');
+    }
     const result = await authorize(requiredConfig());
     const session = await persistSession(result);
     logger.info('auth.oidc_sign_in_succeeded', { userId: session.user.id });

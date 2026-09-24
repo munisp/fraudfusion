@@ -156,14 +156,26 @@ class StorageGateway:
         audit_callback: Optional[Callable[[AuditLogEntry], None]] = None,
         approval_store: Optional[DeletionApprovalStore] = None,
         token_issuer: Optional[DeleteTokenIssuer] = None,
+        guard: Optional[Any] = None,
+        enable_ransomware_guard: Optional[bool] = None,
     ):
-        """Initialize storage gateway"""
+        """Initialize storage gateway.
+
+        Ransomware guard wiring (hot path): every mutating operation emits an
+        op event to ``services.python.ransomware_guard.RansomwareGuard``
+        (in-process direct call). A guard lockdown trip makes
+        :meth:`_assert_writable` reject all subsequent writes/deletes.
+        Resolution order: explicit ``guard`` argument > disabled via
+        ``enable_ransomware_guard=False`` or ``STORAGE_RANSOMWARE_GUARD=false``
+        > default guard built from ``GuardConfig.from_env()``.
+        """
         self.client = client or RustFSClient()
         self.policy = policy or StoragePolicy()
         self.approval_store = approval_store
         self._token_issuer = token_issuer
         self._audit_log: List[AuditLogEntry] = []  # small in-memory ring for queries
         self._versioning_verified: Dict[str, bool] = {}
+        self._guard = self._resolve_guard(guard, enable_ransomware_guard)
 
         if audit_callback is not None:
             self.audit_callback = audit_callback
@@ -237,14 +249,107 @@ class StorageGateway:
         return sink
 
     # ------------------------------------------------------------------
+    # Ransomware guard wiring (hot path)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_guard(guard: Optional[Any], enabled: Optional[bool]) -> Optional[Any]:
+        if guard is not None:
+            return guard
+        env_off = os.getenv("STORAGE_RANSOMWARE_GUARD", "").strip().lower() in ("0", "false", "no")
+        if enabled is False or (enabled is None and env_off):
+            return None
+        try:
+            from services.python.ransomware_guard import RansomwareGuard
+        except ImportError:
+            # Standalone checkout layout: add the repo root and retry.
+            import sys
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            if repo_root not in sys.path:
+                sys.path.insert(0, repo_root)
+            try:
+                from services.python.ransomware_guard import RansomwareGuard
+            except ImportError as e:
+                logger.critical(
+                    "ransomware guard unavailable (%s); storage runs WITHOUT "
+                    "behavioral wipe detection — WORM/dual-control barriers remain", e,
+                )
+                return None
+        return RansomwareGuard()  # config from env (GuardConfig.from_env)
+
+    def _observe_upload(self, user_id: Optional[str], bucket: str, key: str,
+                        overwrite: bool, content_sample: bytes = b""):
+        """Emit a put/upload op event to the ransomware guard (best effort —
+        a guard observation failure must not corrupt the storage op, but a
+        guard lockdown always blocks the NEXT op via _assert_writable)."""
+        guard = self._guard
+        if guard is None:
+            return
+        try:
+            path = f"{bucket}/{key}"
+            principal = user_id or "system"
+            if overwrite:
+                guard.observe_overwrite(principal, path)
+            else:
+                guard.observe_upload(principal, path, content_sample)
+        except Exception as e:
+            logger.critical("ransomware guard observation failed for %s/%s: %s", bucket, key, e)
+
+    def _observe_delete(self, user_id: Optional[str], bucket: str, key: str):
+        guard = self._guard
+        if guard is None:
+            return
+        try:
+            guard.observe_delete(user_id or "system", f"{bucket}/{key}")
+        except Exception as e:
+            logger.critical("ransomware guard observation failed for %s/%s: %s", bucket, key, e)
+
+    def _lockdown_file_active(self) -> bool:
+        """Cross-process lockdown contract: the guard flips this JSON file so
+        sibling processes (Rust gateway, other Python workers) also lock down.
+        Absent file = no lockdown; unreadable/corrupt file = fail closed."""
+        path = os.getenv(
+            "STORAGE_LOCKDOWN_STATE", "/var/lib/fraudfusion/storage/lockdown.json"
+        )
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return bool(json.load(f).get("read_only"))
+        except FileNotFoundError:
+            return False
+        except (NotADirectoryError, IsADirectoryError, PermissionError):
+            # Path never provisioned in this environment — not a lockdown.
+            return False
+        except Exception as e:
+            logger.critical("lockdown state file %s unreadable (%s); failing closed", path, e)
+            return True
+
+    # ------------------------------------------------------------------
     # Lockdown / versioning / tombstones (anti-wipe)
     # ------------------------------------------------------------------
 
     def _assert_writable(self):
-        """Global read-only lockdown switch flipped by ransomware_guard."""
+        """Global read-only lockdown switch flipped by ransomware_guard.
+
+        Three lockdown signals, any one blocks writes/deletes:
+          1. STORAGE_READ_ONLY env (operator / orchestrator kill switch)
+          2. in-process guard lockdown state (direct call wiring)
+          3. shared lockdown state file (cross-process guard flip)
+        """
         if os.getenv("STORAGE_READ_ONLY", "").strip().lower() in ("1", "true", "yes"):
             raise StorageLockdownError(
                 "storage is in READ-ONLY lockdown; writes and deletes are rejected"
+            )
+        guard = self._guard
+        if guard is not None and guard.is_locked_down():
+            raise StorageLockdownError(
+                f"storage is in READ-ONLY lockdown (ransomware guard: "
+                f"{guard.state.reason or 'destructive activity detected'}); "
+                "writes and deletes are rejected"
+            )
+        if self._lockdown_file_active():
+            raise StorageLockdownError(
+                "storage is in READ-ONLY lockdown (lockdown state file); "
+                "writes and deletes are rejected"
             )
 
     def _ensure_versioned(self, bucket: str):
@@ -394,6 +499,7 @@ class StorageGateway:
         if metadata:
             upload_metadata.update(metadata)
 
+        overwrite = bool(self._guard) and self.client.object_exists(bucket, key)
         try:
             result = self.client.upload_file(
                 bucket=bucket,
@@ -402,6 +508,12 @@ class StorageGateway:
                 content_type=content_type,
                 metadata=upload_metadata,
             )
+            try:
+                with open(file_path, "rb") as fh:
+                    sample = fh.read(65536)
+            except OSError:
+                sample = b""
+            self._observe_upload(user_id, bucket, key, overwrite, sample)
 
             self._log_audit(
                 operation=StorageOperation.UPLOAD,
@@ -472,6 +584,7 @@ class StorageGateway:
         if metadata:
             upload_metadata.update(metadata)
 
+        overwrite = bool(self._guard) and self.client.object_exists(bucket, key)
         try:
             result = self.client.upload_bytes(
                 bucket=bucket,
@@ -480,6 +593,7 @@ class StorageGateway:
                 content_type=content_type,
                 metadata=upload_metadata,
             )
+            self._observe_upload(user_id, bucket, key, overwrite, data[:65536])
 
             self._log_audit(
                 operation=StorageOperation.UPLOAD,
@@ -619,6 +733,7 @@ class StorageGateway:
                 raise FileNotFoundError(f"{bucket}/{key} does not exist")
 
             self._write_tombstone(bucket, key, user_id, reason)
+            self._observe_delete(user_id, bucket, key)
 
             self._log_audit(
                 operation=StorageOperation.DELETE,
@@ -744,6 +859,7 @@ class StorageGateway:
             result = self.client.delete_object(bucket, key, version_id=claims.get("version_id"))
             if self._is_tombstoned(bucket, key):
                 self.client.delete_object(bucket, self._tombstone_key(key))
+            self._observe_delete(user_id, bucket, key)
             self.token_issuer.consume(claims)
             if self.approval_store is not None and self.policy.dual_control_required:
                 self.approval_store.mark_executed(claims["approval_id"])

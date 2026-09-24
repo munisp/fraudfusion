@@ -108,6 +108,11 @@ export class TamperService {
       (globalThis as { __TAMPER_ENFORCEMENT__?: 'block' | 'warn' }).__TAMPER_ENFORCEMENT__ ?? 'block',
   ) {}
 
+  /** Callers (AuthService) refuse login only under 'block' enforcement. */
+  get enforcementMode(): 'block' | 'warn' {
+    return this.enforcement;
+  }
+
   // -- Jailbreak / root / debugger / emulator detection ---------------------
 
   async detectTampering(): Promise<TamperVerdict> {
