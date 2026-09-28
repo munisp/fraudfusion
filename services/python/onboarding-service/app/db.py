@@ -162,6 +162,18 @@ CREATE TABLE IF NOT EXISTS agent_applications (
     UNIQUE (tenant_id, agent_code)
 );
 
+-- Post-onboarding outcomes for agent-enrolled customers: feeds the agent
+-- integrity score (Beta-Binomial smoothed fraud rate). Canonical PG schema:
+-- database/20260928_kyc_rigor_agents.sql.
+CREATE TABLE IF NOT EXISTS agent_outcomes (
+    id           TEXT PRIMARY KEY,
+    agent_id     TEXT NOT NULL,
+    customer_ref TEXT NOT NULL,
+    outcome      TEXT NOT NULL CHECK (outcome IN ('clean', 'flagged', 'confirmed_fraud')),
+    recorded_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS agent_outcomes_agent_idx ON agent_outcomes (agent_id);
+
 CREATE TABLE IF NOT EXISTS regulator_access (
     id              TEXT PRIMARY KEY,
     regulator_org   TEXT NOT NULL,

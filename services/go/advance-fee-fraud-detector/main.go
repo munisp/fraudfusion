@@ -9,8 +9,8 @@ import (
 	"math"
 	"net/http"
 	"os"
-	"strconv"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +46,20 @@ type RiskAnalysis struct {
 	RedFlags        []string        `json:"red_flags"`
 	Recommendation  string          `json:"recommendation"`
 	LanguageAnomaly LanguageAnomaly `json:"language_anomaly"`
+	LureSignals     LureSignals     `json:"lure_signals"`
+}
+
+// LureSignals reports the smishing / data-harvest lure detectors (NIN/BVN
+// identity-theft patterns: fake paid surveys, palliative-queue extortion,
+// government-impersonation smishing links). Added as a NEW field so the
+// response schema stays backward-compatible (no existing field renamed).
+type LureSignals struct {
+	DataHarvest      bool     `json:"data_harvest"`
+	SurveyLure       bool     `json:"survey_lure"`
+	PalliativeLure   bool     `json:"palliative_lure"`
+	GovImpersonation bool     `json:"gov_impersonation"`
+	LinkRiskScore    int      `json:"link_risk_score"` // 0-25, capped
+	RedFlags         []string `json:"red_flags"`
 }
 
 // LanguageAnomaly reports the language_anomaly_score. It is an explicit,
@@ -92,6 +106,7 @@ func main() {
 		v1.POST("/detect-419", requireRole("fraud_analyst", "admin"), detect419)
 		v1.POST("/detect-inheritance-scam", requireRole("fraud_analyst", "admin"), detectInheritanceScam)
 		v1.POST("/detect-lottery-scam", requireRole("fraud_analyst", "admin"), detectLotteryScam)
+		v1.POST("/detect-lures", requireRole("fraud_analyst", "admin"), detectLures)
 		v1.POST("/verify-sender", verifySender)
 		v1.POST("/track-fee-requests", requireRole("fraud_analyst", "admin"), trackFeeRequests)
 		v1.GET("/risk/:message_id", getMessageRisk)
@@ -107,7 +122,7 @@ func main() {
 	}
 
 	log.Printf("Advance Fee Fraud Detector starting on port %s", port)
-		server := &http.Server{
+	server := &http.Server{
 		Addr:              ":" + port,
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -235,6 +250,41 @@ func performAnalysis(message Message) RiskAnalysis {
 		redFlags = append(redFlags, "Urgency and secrecy tactics detected")
 	}
 
+	// Smishing / data-harvest lures (NIN/BVN identity-theft patterns seen in
+	// Nigerian smishing campaigns: fake paid surveys, palliative-queue
+	// extortion, government-impersonation links).
+	lure := LureSignals{RedFlags: []string{}}
+	if isHarvest, flags := detectDataHarvestPattern(combinedText); isHarvest {
+		riskScore += 35
+		lure.DataHarvest = true
+		lure.RedFlags = append(lure.RedFlags, flags...)
+		scamTypes = append(scamTypes, "data_harvest")
+	}
+	if isSurvey, flags := detectSurveyLurePattern(combinedText); isSurvey {
+		riskScore += 25
+		lure.SurveyLure = true
+		lure.RedFlags = append(lure.RedFlags, flags...)
+		scamTypes = append(scamTypes, "survey_lure")
+	}
+	if isPalliative, flags := detectPalliativeLurePattern(combinedText); isPalliative {
+		riskScore += 35
+		lure.PalliativeLure = true
+		lure.RedFlags = append(lure.RedFlags, flags...)
+		scamTypes = append(scamTypes, "palliative_extortion")
+	}
+	if isGov, flags := detectGovImpersonationPattern(combinedText); isGov {
+		riskScore += 30
+		lure.GovImpersonation = true
+		lure.RedFlags = append(lure.RedFlags, flags...)
+		scamTypes = append(scamTypes, "gov_impersonation")
+	}
+	if linkScore, flags := linkRiskScore(combinedText); linkScore > 0 {
+		lure.LinkRiskScore = min(linkScore, 25)
+		riskScore += lure.LinkRiskScore
+		lure.RedFlags = append(lure.RedFlags, flags...)
+	}
+	redFlags = append(redFlags, lure.RedFlags...)
+
 	// Check sender legitimacy (disposable-looking local part only)
 	if !verifySenderLegitimacy(message.SenderEmail) {
 		riskScore += 20
@@ -279,6 +329,7 @@ func performAnalysis(message Message) RiskAnalysis {
 		RedFlags:        redFlags,
 		Recommendation:  recommendation,
 		LanguageAnomaly: anomaly,
+		LureSignals:     lure,
 	}
 }
 
@@ -432,6 +483,310 @@ func detectUrgencyAndSecrecy(text string) int {
 	}
 
 	return min(score, 20)
+}
+
+// ---------------------------------------------------------------------------
+// Smishing / data-harvest lure detectors (NIN/BVN identity-theft patterns).
+// Heuristic behind all five: a data request is suspicious when the requesting
+// entity has NO legitimate need for that field ("if FRSC asks for your plate
+// number that makes sense; your BVN, not so much") — and when sensitive
+// identity fields are solicited via forms, replies, or links.
+//
+// All detectors take the already-lowercased subject+content, return
+// (matched, flags) and are wired into the composite score in performAnalysis
+// exactly like detect419Pattern & friends.
+// ---------------------------------------------------------------------------
+
+// sensitiveFieldRe matches the Nigerian identity fields harvested in NIN/BVN
+// identity-theft campaigns. Word boundaries are deliberate so "nin" does not
+// match "remaining"/"nineteen".
+var sensitiveFieldRe = regexp.MustCompile(
+	`\b(bvn|bank verification number|nin|national identification number|ninn?c slip|otp|one[\s-]?time (password|pin|code)|passcode|pvc|permanent voters? card|voter'?s? card|date of birth|dob|atm pin|card pin|bvn number|nin number)\b`)
+
+// solicitationRe matches verbs used to harvest data via forms or replies.
+var solicitationRe = regexp.MustCompile(
+	`\b(provide|send|submit|enter|fill|supply|disclose|input|share|reply with|respond with|type in|key in|confirm your|verify your|validate your|update your|re-?validate)\b`)
+
+// advisoryRe matches anti-fraud advisories ("never share your BVN...") which
+// mention sensitive fields and share/send verbs but are NOT harvest attempts.
+var advisoryRe = regexp.MustCompile(
+	`\b(never|do not|don't|not to)\s+(share|give|send|disclose|provide)\s+(your\s+)?(bvn|nin|otp|pin|password|voter'?s? card|pvc)`)
+
+// imperativeRe matches AFFIRMATIVE requests for data. When a text matches
+// advisoryRe but no imperative, the solicitation match is treated as an
+// advisory, not a harvest attempt.
+var imperativeRe = regexp.MustCompile(
+	`\b(reply with|respond with|send (us|me|back|your|ur)\b|submit|fill|enter|provide|supply|input|type in|key in|confirm your|verify your|validate your|update your|re-?validate|click (the |this |that )?link)\b`)
+
+// detectDataHarvestPattern fires when sensitive identity fields (BVN, NIN,
+// DOB, OTP, voter's card) are being SOLICITED via a form, reply, or link —
+// not merely mentioned (a bank warning you to "never share your BVN" is not
+// a harvest attempt).
+func detectDataHarvestPattern(text string) (bool, []string) {
+	flags := []string{}
+	score := 0
+
+	fieldMentions := len(sensitiveFieldRe.FindAllString(text, -1))
+	solicits := solicitationRe.MatchString(text)
+	if solicits && advisoryRe.MatchString(text) && !imperativeRe.MatchString(text) {
+		// "never share your BVN" style advisory — not a harvest attempt.
+		solicits = false
+	}
+
+	if fieldMentions > 0 && solicits {
+		score += 25
+		flags = append(flags, "Sensitive identity data (BVN/NIN/DOB/OTP/voter's card) solicited via reply or form")
+	}
+	if fieldMentions >= 2 {
+		score += 10
+		flags = append(flags, "Multiple sensitive identity fields requested together")
+	}
+	if matched, _ := regexp.MatchString(
+		`(reply|respond|send)\s+(back\s+)?with\s+(your\s+)?(full\s+)?(name|details|bvn|nin|otp|date of birth|voter)`, text); matched {
+		score += 15
+		flags = append(flags, "Reply-with-personal-data instruction")
+	}
+	if matched, _ := regexp.MatchString(
+		`(fill|complete|submit)\s+(out\s+)?(this|the|a|our)\s+(short\s+)?(form|questionnaire|survey|registration)`, text); matched && fieldMentions > 0 {
+		score += 10
+		flags = append(flags, "Form-based personal data collection")
+	}
+
+	return score >= 25, flags
+}
+
+// detectSurveyLurePattern fires on the "we're doing a survey, we'll pay you
+// ₦2k/₦5k" lure: an unsolicited survey/registration tied to a promised SMALL
+// naira payment — the bait used to harvest BVN/NIN/DOB.
+func detectSurveyLurePattern(text string) (bool, []string) {
+	flags := []string{}
+	score := 0
+
+	patterns := []struct {
+		regex string
+		flag  string
+		score int
+	}{
+		{`(conducting|running|doing|carrying out)\s+a\s+(short\s+|brief\s+|simple\s+)?(survey|questionnaire|poll|registration)`, "Unsolicited survey/registration claim", 20},
+		{`(survey|questionnaire|poll)\s+(for|and|that|to)\s+(get|be paid|earn|receive)`, "Survey tied to payment", 15},
+		{`(get paid|be paid|earn|pay you|paid|reward(ed)?|compensat\w+|cash\s*out)\s*(of|up to|about)?\s*(₦|ngn|n)?\s*\d{1,3}(,\d{3})?\s*(naira|k\b)?`, "Small promised payment (₦2k/₦5k bait)", 20},
+		{`\b\d{1,2}k\b\s*(naira|cash|reward|for you|each)?`, "Colloquial small-cash bait ('2k', '5k')", 10},
+		{`(fill|complete|answer)\s+(out\s+)?(this|the|a|our)\s+(short\s+|brief\s+|simple\s+)?(survey|form|questionnaire)`, "Fill-this-form instruction", 10},
+		{`(few\s+minutes?|2\s+minutes?|5\s+minutes?)\s+(of\s+)?(your\s+)?time`, "Minimal-effort framing", 10},
+	}
+
+	for _, p := range patterns {
+		matched, _ := regexp.MatchString(p.regex, text)
+		if matched {
+			score += p.score
+			flags = append(flags, p.flag)
+		}
+	}
+
+	return score >= 30, flags
+}
+
+// detectPalliativeLurePattern fires when access to palliatives / relief
+// materials / empowerment queues is made CONDITIONAL on surrendering NIN,
+// BVN, or voter's card details (queue-jump extortion).
+func detectPalliativeLurePattern(text string) (bool, []string) {
+	flags := []string{}
+	score := 0
+
+	patterns := []struct {
+		regex string
+		flag  string
+		score int
+	}{
+		{`(palliative|relief (materials?|package|items?|fund)|food\s*relief|empowerment\s*(programme|program|scheme)|subsidy removal (palliative|relief)|conditional cash transfer)`, "Palliative/relief/empowerment theme", 20},
+		{`(palliative|relief|empowerment|grant|stipend|cash transfer|shortlist)[\s\S]{0,80}(nin|bvn|voter'?s? card|pvc|national identification)`, "Palliative access conditioned on identity data", 20},
+		{`(submit|provide|present|bring|drop|send|come with)\s+(your\s+)?(nin|bvn|voter'?s? card|pvc|national identification)`, "Surrender-of-identity-document demand", 15},
+		{`(secure|reserve|book|confirm|jump)\s+(your\s+)?(spot|slot|place|position|queue)`, "Queue/slot pressure tactic", 10},
+		{`(queue|wait in line|join the (line|queue)|limited slots?|first come)`, "Queue scarcity framing", 10},
+	}
+
+	for _, p := range patterns {
+		matched, _ := regexp.MatchString(p.regex, text)
+		if matched {
+			score += p.score
+			flags = append(flags, p.flag)
+		}
+	}
+
+	return score >= 30, flags
+}
+
+// govEntityRe matches Nigerian government / regulatory bodies impersonated in
+// smishing (FRSC-lite bodies included). Full names and abbreviations both.
+var govEntityRe = regexp.MustCompile(
+	`\b(frsc|federal road safety( corps)?|nimc|national identity management commission|nibss|cbn|central bank of nigeria|efcc|nigeria immigration( service)?|nis\b|nigerian police( force)?|npf\b|inec|firs\b|national population commission|npc\b|ndic|ministry of (interior|finance|humanitarian affairs))\b`)
+
+// threatRe matches the coercion language used in gov-impersonation smishing
+// (stronger than ordinary urgency so legitimate renewal reminders don't fire).
+var threatRe = regexp.MustCompile(
+	`(will be (blocked|suspended|deactivated|impounded|arrested|prosecuted)|has been (blocked|suspended|deactivated|flagged)|failure to comply|within 24 hours|or face (arrest|prosecution|suspension)|final notice|last warning)`)
+
+// detectGovImpersonationPattern fires when a message CLAIMS to be a
+// government/regulatory entity AND compounds that claim with a link, a
+// sensitive-data demand, or a coercion threat. A bare entity mention (e.g. a
+// legitimate FRSC plate-number renewal reminder) is NOT enough — that is the
+// legitimacy heuristic from the field guidance.
+func detectGovImpersonationPattern(text string) (bool, []string) {
+	flags := []string{}
+	if !govEntityRe.MatchString(text) {
+		return false, flags
+	}
+	score := 15
+	flags = append(flags, "Claims government/regulatory entity identity")
+
+	if urlPattern.MatchString(text) {
+		score += 10
+		flags = append(flags, "Government claim combined with a link")
+	}
+	if sensitiveFieldRe.MatchString(text) && solicitationRe.MatchString(text) {
+		score += 15
+		flags = append(flags, "Government entity demanding sensitive identity data it has no legitimate need for")
+	}
+	if threatRe.MatchString(text) {
+		score += 10
+		flags = append(flags, "Coercion/threat language (suspension, arrest, 24-hour deadline)")
+	}
+
+	return score >= 30, flags
+}
+
+// ---------------------------------------------------------------------------
+// linkRiskScore: URL risk helper for smishing.
+// Signals: suspicious TLDs, URL shorteners, IP-literal hosts, look-alike
+// domains containing government entity names off official *.gov.ng domains,
+// and compounding when any URL co-occurs with data-harvest keywords.
+// Returns (score, flags); score is capped at 25 by the caller.
+// ---------------------------------------------------------------------------
+
+var urlPattern = regexp.MustCompile(
+	`(?i)\b(?:https?://)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?:/[^\s]*)?`)
+
+var ipHostPattern = regexp.MustCompile(
+	`\bhttps?://\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?(?:/|\b)`)
+
+// suspiciousTLDs: cheap/abuse-heavy TLDs disproportionately used in Nigerian
+// smishing links. .ng/.com/.org/.net are NOT listed — they are normal.
+var suspiciousTLDs = map[string]bool{
+	"tk": true, "ml": true, "ga": true, "cf": true, "gq": true, // free Freenom TLDs
+	"xyz": true, "top": true, "click": true, "link": true, "buzz": true,
+	"icu": true, "pw": true, "cam": true, "quest": true, "live": true,
+	"online": true, "site": true, "website": true, "shop": true, "rest": true,
+}
+
+// urlShorteners: short links hide the true destination from the victim.
+var urlShorteners = map[string]bool{
+	"bit.ly": true, "tinyurl.com": true, "t.co": true, "goo.gl": true,
+	"is.gd": true, "cutt.ly": true, "rb.gy": true, "ow.ly": true,
+	"buff.ly": true, "rebrand.ly": true, "shorturl.at": true, "tiny.cc": true,
+}
+
+// govLookalikeNames: entity names whose presence inside a NON-official domain
+// is a look-alike signal (e.g. frsc-verify.xyz). Official *.gov.ng domains are
+// explicitly excluded.
+var govLookalikeNames = []string{
+	"frsc", "nimc", "nibss", "cbn", "efcc", "inec", "immigration", "firs", "npf", "ndic",
+}
+
+// harvestKeywordRe is the compounding trigger: any URL in a message that also
+// solicits identity data.
+var harvestKeywordRe = regexp.MustCompile(
+	`\b(bvn|nin|otp|pvc|date of birth|voter'?s? card|bank verification number|national identification number|password|atm pin|card pin)\b`)
+
+func linkRiskScore(text string) (int, []string) {
+	flags := []string{}
+	urls := urlPattern.FindAllString(text, -1)
+	ipURLs := ipHostPattern.FindAllString(text, -1)
+	if len(urls) == 0 && len(ipURLs) == 0 {
+		return 0, flags
+	}
+
+	score := 0
+	seenTLD, seenShortener, seenLookalike := false, false, false
+
+	if len(ipURLs) > 0 {
+		score += 10
+		flags = append(flags, "Link uses a raw IP address instead of a domain name")
+	}
+
+	for _, u := range urls {
+		host := u
+		if i := strings.Index(host, "://"); i >= 0 {
+			host = host[i+3:]
+		}
+		if i := strings.Index(host, "/"); i >= 0 {
+			host = host[:i]
+		}
+		host = strings.ToLower(strings.TrimSuffix(host, "."))
+
+		labels := strings.Split(host, ".")
+		tld := labels[len(labels)-1]
+		if !seenTLD && suspiciousTLDs[tld] {
+			seenTLD = true
+			score += 8
+			flags = append(flags, fmt.Sprintf("Suspicious top-level domain (.%s)", tld))
+		}
+		if !seenShortener && urlShorteners[host] {
+			seenShortener = true
+			score += 10
+			flags = append(flags, "URL shortener hides the true destination")
+		}
+		if !seenLookalike && !strings.HasSuffix(host, ".gov.ng") && host != "gov.ng" {
+			for _, name := range govLookalikeNames {
+				if strings.Contains(host, name) {
+					seenLookalike = true
+					score += 12
+					flags = append(flags, fmt.Sprintf("Look-alike domain impersonating '%s' outside official *.gov.ng", name))
+					break
+				}
+			}
+		}
+	}
+
+	if harvestKeywordRe.MatchString(text) {
+		score += 8
+		flags = append(flags, "Link combined with request for sensitive identity data (compounding)")
+	}
+
+	return min(score, 25), flags
+}
+
+// detectLures is the standalone HTTP endpoint for the smishing/data-harvest
+// lure detectors (composite wiring lives in performAnalysis).
+func detectLures(c *gin.Context) {
+	var message Message
+	if err := c.ShouldBindJSON(&message); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	combinedText := strings.ToLower(message.Subject + " " + message.Content)
+	isHarvest, harvestFlags := detectDataHarvestPattern(combinedText)
+	isSurvey, surveyFlags := detectSurveyLurePattern(combinedText)
+	isPalliative, palliativeFlags := detectPalliativeLurePattern(combinedText)
+	isGov, govFlags := detectGovImpersonationPattern(combinedText)
+	linkScore, linkFlags := linkRiskScore(combinedText)
+
+	any := isHarvest || isSurvey || isPalliative || isGov || linkScore > 0
+	c.JSON(http.StatusOK, gin.H{
+		"message_id":        message.ID,
+		"lure_detected":     any,
+		"data_harvest":      gin.H{"matched": isHarvest, "red_flags": harvestFlags},
+		"survey_lure":       gin.H{"matched": isSurvey, "red_flags": surveyFlags},
+		"palliative_lure":   gin.H{"matched": isPalliative, "red_flags": palliativeFlags},
+		"gov_impersonation": gin.H{"matched": isGov, "red_flags": govFlags},
+		"link_risk":         gin.H{"score": linkScore, "red_flags": linkFlags},
+		"recommendation": func() string {
+			if any {
+				return "WARNING - Smishing/data-harvest lure detected. Do not click links or share BVN/NIN/OTP; navigate directly to the organisation's official site."
+			}
+			return "No smishing/data-harvest lure pattern detected"
+		}(),
+	})
 }
 
 // freeWebmailProviders are the dominant consumer mail providers in Nigeria;
@@ -770,6 +1125,10 @@ func getKnownPatterns(c *gin.Context) {
 		{"type": "business_proposal", "description": "Fake business opportunity"},
 		{"type": "overpayment", "description": "Overpayment scam"},
 		{"type": "employment", "description": "Fake job offer"},
+		{"type": "data_harvest", "description": "Solicitation of BVN/NIN/DOB/OTP/voter's card via forms or replies"},
+		{"type": "survey_lure", "description": "Fake paid survey (₦2k/₦5k bait) harvesting identity data"},
+		{"type": "palliative_extortion", "description": "Palliative/relief queue access conditioned on NIN/BVN/voter's card"},
+		{"type": "gov_impersonation", "description": "FRSC/NIMC/NIBSS/CBN/EFCC/immigration impersonation with links or data demands"},
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -828,7 +1187,6 @@ func healthCheck(c *gin.Context) {
 		"timestamp": time.Now().Format(time.RFC3339),
 	})
 }
-
 
 func getEnvInt(key string, fallback int) int {
 	if value := os.Getenv(key); value != "" {

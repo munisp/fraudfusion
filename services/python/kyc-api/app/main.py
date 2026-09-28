@@ -29,11 +29,11 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 
-from app import bureau, identity, screening, tiers
+from app import bureau, counterparty, identity, phone_tenure, screening, tiers
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db
 from app.schemas import (
@@ -42,6 +42,7 @@ from app.schemas import (
     BasicKYCRequest,
     BehavioralAnalysisRequest,
     BiometricVerifyRequest,
+    CounterpartyRigorEntry,
     CreditBureauRequest,
     EnhancedKYCRequest,
     FraudCheckRequest,
@@ -59,6 +60,8 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB per document/image
 # Periodic re-verification cadence by CBN tier (higher tiers review more often).
 REVIEW_INTERVAL_DAYS = {"tier_1": 365, "tier_2": 180, "tier_3": 90}
 DEFAULT_REKYC_DEADLINE_DAYS = 30
+# Address re-verification reviews are due within this many days of the trigger.
+ADDRESS_REVIEW_DEADLINE_DAYS = 30
 
 IMAGE_MAGIC = {
     b"\xff\xd8\xff": "jpeg",
@@ -107,6 +110,15 @@ def _run_verification(db: Database, principal: Principal, level: str,
     results["bvn"] = bvn_result
     results["nin"] = nin_result
 
+    # Recycled-number risk: a telco-recycled MSISDN can still be tied to a
+    # previous owner's identity/bank accounts. Fail-closed: when the tenure
+    # feed is absent the state is honestly 'unverified' (+0.05), never a
+    # silent pass. Recycled within the window (+0.15, plus +0.10 when prior
+    # owner account links persist) sets the recycled_number_risk flag.
+    tenure = phone_tenure.assess_recycled_number(payload.phone)
+    results["phone_tenure"] = tenure
+    risk += tenure["risk_contribution"]
+
     id_ok = (bvn_result.get("provided") and bvn_result["format_valid"]) or (
         nin_result.get("provided") and nin_result["format_valid"]
     )
@@ -134,6 +146,26 @@ def _run_verification(db: Database, principal: Principal, level: str,
         "daily": tier_limits.daily_ngn,
         "requirements": list(tier_limits.requirements),
     }
+
+    # Address-verification evidence: method + recency are tracked explicitly
+    # (CBN quarterly physical-contact cadence). Stale evidence (>90d) or
+    # electronic-only evidence at Tier 2+ schedules a 'triggered' address
+    # re-verification review — surfaced in the response, never silent.
+    addr_input = getattr(payload, "address_evidence", None)
+    addr_method = addr_verified_at = None
+    if addr_input is not None:
+        try:
+            record = tiers.validate_address_evidence(addr_input.method,
+                                                     addr_input.verified_at)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        addr_method, addr_verified_at = record["method"], record["verified_at"]
+    addr_review = tiers.address_review_required(
+        tier_limits.tier, addr_method, addr_verified_at)
+    results["address_verification"] = addr_review
+    if addr_review["required"]:
+        _schedule_address_review(db, payload.customer_id, tier_limits.tier,
+                                 addr_review["reasons"])
 
     full_name = f"{payload.first_name} {payload.last_name}"
     nationality = getattr(payload, "nationality", None)
@@ -181,14 +213,16 @@ def _run_verification(db: Database, principal: Principal, level: str,
     now = _now()
     db.execute(
         "INSERT INTO kyc_requests (id, customer_id, level, tier, status, decision,"
-        " risk_score, risk_level, results_json, actor_sub, created_at, updated_at)"
+        " risk_score, risk_level, results_json, actor_sub,"
+        " address_verification_method, address_verified_at, created_at, updated_at)"
         " VALUES (:id, :cid, :level, :tier, 'completed', :decision, :score, :rl,"
-        " :results, :actor, :now, :now)",
+        " :results, :actor, :addrm, :addrv, :now, :now)",
         {
             "id": request_id, "cid": payload.customer_id, "level": level,
             "tier": tier_limits.tier, "decision": decision, "score": risk,
             "rl": _risk_level(risk), "results": json.dumps(results),
-            "actor": principal.sub, "now": now,
+            "actor": principal.sub, "addrm": addr_method, "addrv": addr_verified_at,
+            "now": now,
         },
     )
     _schedule_periodic_review(db, payload.customer_id, tier_limits.tier)
@@ -221,6 +255,25 @@ def _schedule_periodic_review(db: Database, customer_id: str, tier: str) -> None
          "INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at)"
          " VALUES (:cid, 'periodic', :tier, :due) ON CONFLICT DO NOTHING"),
         {"cid": customer_id, "tier": tier, "due": due_iso},
+    )
+
+
+def _schedule_address_review(db: Database, customer_id: str, tier: str,
+                             reasons: list[str]) -> None:
+    """Address re-verification scheduler: stale (>90d) or electronic-only
+    address evidence enrolls a 'triggered' review item due in
+    ADDRESS_REVIEW_DEADLINE_DAYS. The due date is truncated to the day so
+    repeated verifications on the same day are idempotent per
+    (customer, type, due date)."""
+    now = datetime.now(timezone.utc)
+    due = (now.date() + timedelta(days=ADDRESS_REVIEW_DEADLINE_DAYS)).isoformat()
+    db.execute(
+        ("INSERT OR IGNORE INTO kyc_review_schedule (customer_id, review_type, tier, due_at,"
+         " reason) VALUES (:cid, 'triggered', :tier, :due, :reason)" if not db._is_pg else
+         "INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at, reason)"
+         " VALUES (:cid, 'triggered', :tier, :due, :reason) ON CONFLICT DO NOTHING"),
+        {"cid": customer_id, "tier": tier, "due": due,
+         "reason": "address_reverification: " + "; ".join(reasons)},
     )
 
 
@@ -347,6 +400,19 @@ def create_app() -> FastAPI:
         row = db.query_one("SELECT * FROM kyc_requests WHERE id = :id", {"id": request_id})
         if not row:
             raise HTTPException(status_code=404, detail="kyc request not found")
+        # Address-verification recency is customer-level: latest request with
+        # address evidence wins, regardless of which request this status is for.
+        addr_row = db.query_one(
+            "SELECT address_verification_method, address_verified_at FROM kyc_requests"
+            " WHERE customer_id = :cid AND address_verified_at IS NOT NULL"
+            " ORDER BY address_verified_at DESC LIMIT 1",
+            {"cid": row["customer_id"]},
+        )
+        address_verification = tiers.address_review_required(
+            row["tier"],
+            addr_row["address_verification_method"] if addr_row else None,
+            addr_row["address_verified_at"] if addr_row else None,
+        )
         return {
             "request_id": row["id"],
             "customer_id": row["customer_id"],
@@ -357,8 +423,43 @@ def create_app() -> FastAPI:
             "risk_score": row["risk_score"],
             "risk_level": row["risk_level"],
             "verification_results": json.loads(row["results_json"]),
+            "address_verification": address_verification,
             "timestamp": str(row.get("updated_at") or ""),
         }
+
+    # ------------------------- counterparty rigor registry -----------------
+
+    def _require_kyc_admin(principal: Principal) -> None:
+        if "kyc_admin" not in principal.roles:
+            raise HTTPException(status_code=403, detail="kyc_admin role required")
+
+    @app.post("/api/v1/kyc/admin/counterparty-rigor", status_code=201)
+    def upsert_counterparty_rigor(payload: CounterpartyRigorEntry,
+                                  principal: Principal = Depends(get_current_principal),
+                                  db: Database = Depends(get_db)) -> dict:
+        """Admin-managed registry upsert: record an institution's onboarding
+        verification rigor with a source note (auditability)."""
+        _require_kyc_admin(principal)
+        code = payload.institution_code.strip()
+        db.execute(
+            "INSERT INTO counterparty_rigor_registry (institution_code, institution_name,"
+            " rigor_level, source_note, updated_at) VALUES (:c, :n, :r, :s, :now)"
+            " ON CONFLICT (institution_code) DO UPDATE SET institution_name = :n,"
+            " rigor_level = :r, source_note = :s, updated_at = :now",
+            {"c": code, "n": payload.institution_name.strip(),
+             "r": payload.rigor_level, "s": payload.source_note, "now": _now()},
+        )
+        logger.info("counterparty rigor upserted: %s -> %s by=%s",
+                    code, payload.rigor_level, principal.sub)
+        return counterparty.lookup_rigor(db, code)
+
+    @app.get("/api/v1/kyc/counterparty-rigor/{institution_code}")
+    def get_counterparty_rigor(institution_code: str,
+                               principal: Principal = Depends(get_current_principal),
+                               db: Database = Depends(get_db)) -> dict:
+        """Look up rigor by institution code. Fail-closed: no entry -> rigor
+        'unknown' with an explicit reason, never silently strong."""
+        return counterparty.lookup_rigor(db, institution_code)
 
     # ------------------------- re-KYC / periodic review / appeals ---------
 
@@ -724,7 +825,8 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/risk/assess")
     def risk_assess(payload: dict,
-                    principal: Principal = Depends(get_current_principal)) -> dict:
+                    principal: Principal = Depends(get_current_principal),
+                    db: Database = Depends(get_db)) -> dict:
         """Rule-based risk assessment (no ML model wired for this endpoint;
         the scoring basis is returned explicitly)."""
         score = 0.10
@@ -750,19 +852,30 @@ def create_app() -> FastAPI:
         if country and country not in ("NG",):
             score += 0.10
             factors.append(f"non-domestic country {country} (+0.10)")
+        # Counterparty verification-rigor enrichment: institutions that skip
+        # CBN biometric BVN verification ('unverified') or have no registry
+        # entry ('unknown', fail-closed) contribute a documented gap flag.
+        rigor = counterparty.lookup_rigor(db, payload.get("counterparty_institution"))
+        gap = counterparty.risk_enrichment(rigor)
+        if gap["flag"]:
+            score += gap["contribution"]
+            factors.append(gap["factor"])
         score = round(min(score, 1.0), 3)
         return {
             "assessment_id": uuid.uuid4().hex,
             "risk_score": score,
             "risk_level": _risk_level(score),
             "factors": factors,
+            "counterparty_verification_gap": gap["flag"],
+            "counterparty_rigor": rigor,
             "model": "rules",
             "timestamp": _now(),
         }
 
     @app.post("/api/v1/risk/fraud-check")
     def fraud_check(payload: FraudCheckRequest,
-                    principal: Principal = Depends(get_current_principal)) -> dict:
+                    principal: Principal = Depends(get_current_principal),
+                    db: Database = Depends(get_db)) -> dict:
         txn = payload.transaction_data or {}
         history = payload.historical_data or []
         score = 0.10
@@ -788,6 +901,14 @@ def create_app() -> FastAPI:
         if txn.get("channel") == "card_not_present":
             score += 0.10
             factors.append("card-not-present channel (+0.10)")
+        # Counterparty verification-rigor enrichment (same documented rule as
+        # /risk/assess): 'unverified'/'unknown' counterparty institutions add
+        # the counterparty_verification_gap contribution.
+        rigor = counterparty.lookup_rigor(db, txn.get("counterparty_institution"))
+        gap = counterparty.risk_enrichment(rigor)
+        if gap["flag"]:
+            score += gap["contribution"]
+            factors.append(gap["factor"])
         score = round(min(score, 1.0), 3)
         return {
             "check_id": uuid.uuid4().hex,
@@ -796,6 +917,8 @@ def create_app() -> FastAPI:
             "risk_level": _risk_level(score),
             "is_fraud_suspected": score >= 0.5,
             "factors": factors,
+            "counterparty_verification_gap": gap["flag"],
+            "counterparty_rigor": rigor,
             "model": "rules",
             "timestamp": _now(),
         }

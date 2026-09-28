@@ -223,6 +223,46 @@ class AgentApplicationPage(BaseModel):
     next_cursor: Optional[str] = Field(default=None, serialization_alias="nextCursor")
 
 
+# ---------------------------------------------------------------------------
+# Agent integrity scoring (enrollment-agent fraud-rate surveillance)
+# ---------------------------------------------------------------------------
+
+AgentOutcome = Literal["clean", "flagged", "confirmed_fraud"]
+
+
+class AgentOutcomeSubmission(BaseModel):
+    """Post-onboarding outcome for one customer enrolled by an agent."""
+    customer_ref: str = Field(min_length=1, max_length=200)
+    outcome: AgentOutcome
+
+
+class AgentOutcomeView(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    outcome_id: str = Field(serialization_alias="outcomeId")
+    agent_id: str = Field(serialization_alias="agentId")
+    customer_ref: str = Field(serialization_alias="customerRef")
+    outcome: str
+    recorded_at: str = Field(serialization_alias="recordedAt")
+
+
+class AgentIntegrityView(BaseModel):
+    """Agent integrity score. k-anonymity: below min_enrollments the
+    fraud_rate is suppressed ('insufficient_data') so small agents are never
+    extreme-scored or individually exposed."""
+    model_config = {"populate_by_name": True}
+
+    agent_id: str = Field(serialization_alias="agentId")
+    status: str  # 'ok' | 'insufficient_data'
+    enrollments: int
+    fraud_rate: Optional[float] = Field(default=None, serialization_alias="fraudRate")
+    prior_mean: float = Field(serialization_alias="priorMean")
+    alert: bool = False
+    alert_threshold: float = Field(serialization_alias="alertThreshold")
+    min_enrollments: int = Field(serialization_alias="minEnrollments")
+    counts: dict = Field(default_factory=dict)
+
+
 class RegulatorAccessRequest(BaseModel):
     regulator_org: str = Field(alias="regulatorOrg", min_length=2, max_length=100)
     principal_sub: str = Field(alias="principalSub", min_length=1, max_length=200)

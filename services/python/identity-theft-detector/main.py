@@ -34,7 +34,8 @@ from pydantic import BaseModel, Field
 try:
     from identity_store import IdentityStore, get_store
     from registry import get_bvn_adapter, get_nin_adapter
-    from cross_reference import cross_reference
+    from cross_reference import cross_reference, enrollment_agent_rollup
+    from exposure import REDRESS_GUIDANCE, exposures_for_customer, import_exposure_batch
 except ImportError:  # when imported as a package from the repo root
     sys_path_added = str(Path(__file__).resolve().parent)
     import sys
@@ -43,7 +44,8 @@ except ImportError:  # when imported as a package from the repo root
         sys.path.insert(0, sys_path_added)
     from identity_store import IdentityStore, get_store
     from registry import get_bvn_adapter, get_nin_adapter
-    from cross_reference import cross_reference
+    from cross_reference import cross_reference, enrollment_agent_rollup
+    from exposure import REDRESS_GUIDANCE, exposures_for_customer, import_exposure_batch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -278,6 +280,19 @@ class CrossReferenceRequest(BaseModel):
     phone_number: Optional[str] = None
     email: Optional[str] = None
     device_id: Optional[str] = None
+
+
+class ExposureIndicatorRow(BaseModel):
+    identifier_type: str  # phone | email | device | nin | bvn
+    identifier_value: str  # plaintext IN TRANSIT only; persisted as sha256 hash
+    breach_ref: str
+    observed_at: Optional[str] = None
+
+
+class ExposureImportRequest(BaseModel):
+    batch_id: str = Field(min_length=1, max_length=255)
+    source_note: Optional[str] = None
+    rows: List[ExposureIndicatorRow] = Field(min_length=1, max_length=50000)
 
 
 # Nigerian document validation patterns
@@ -598,6 +613,7 @@ async def cross_reference_check(request: CrossReferenceRequest, _: dict = Depend
         'alerts': result['alerts'],
         'cross_reference_results': result['source_results'],
         'inconsistencies': result['inconsistencies'],
+        'registry_enrollment_tracing': result['registry_enrollment_tracing'],
         'risk_score': result['risk_score'],
         'all_checks_passed': not result['clusters'] and not result['alerts']
                              and not result['inconsistencies'],
@@ -616,7 +632,11 @@ async def import_registry(
 ):
     """Admin CSV import for the local BVN/NIN registries.
 
-    CSV header: `<bvn|nin>,full_name,date_of_birth,phone_number,email`
+    CSV header: `<bvn|nin>,full_name,date_of_birth,phone_number,email` plus
+    OPTIONAL enrollment-source tracing columns `enrollment_source`
+    (bank_branch|sim_registration_agent|nimc_fep|self_service|unknown),
+    `enrollment_agent_id`, `enrollment_channel`, `enrolled_at`. Rows without
+    source data keep working — enrollment_source defaults to 'unknown'.
     Rows are upserted with provenance `admin-import:<filename>` and the
     importing principal recorded. Requires the admin or identity_admin realm
     role. Rows imported here are REAL data (is_synthetic=false) — unlike the
@@ -657,31 +677,51 @@ async def import_registry(
         if not validator(id_value):
             rejected.append({"line": i, "reason": f"invalid {registry} format"})
             continue
+        enrollment = {
+            "esrc": (row.get("enrollment_source") or "").strip() or "unknown",
+            "eagent": (row.get("enrollment_agent_id") or "").strip() or None,
+            "echannel": (row.get("enrollment_channel") or "").strip() or None,
+            "eat": (row.get("enrolled_at") or "").strip() or None,
+        }
         if store._is_pg:
             store.execute(
                 f"INSERT INTO {table} ({registry}, full_name, date_of_birth, phone_number, email,"
-                f" is_synthetic, provenance, imported_by) VALUES (:idv, :name, :dob, :phone, :email,"
-                f" FALSE, :prov, :by) ON CONFLICT (tenant_id, {registry}) DO UPDATE SET"
+                f" is_synthetic, provenance, imported_by,"
+                f" enrollment_source, enrollment_agent_id, enrollment_channel, enrolled_at)"
+                f" VALUES (:idv, :name, :dob, :phone, :email,"
+                f" FALSE, :prov, :by, :esrc, :eagent, :echannel, :eat)"
+                f" ON CONFLICT (tenant_id, {registry}) DO UPDATE SET"
                 f" full_name = EXCLUDED.full_name, date_of_birth = EXCLUDED.date_of_birth,"
                 f" phone_number = EXCLUDED.phone_number, email = EXCLUDED.email,"
-                f" provenance = EXCLUDED.provenance, imported_by = EXCLUDED.imported_by",
+                f" provenance = EXCLUDED.provenance, imported_by = EXCLUDED.imported_by,"
+                f" enrollment_source = EXCLUDED.enrollment_source,"
+                f" enrollment_agent_id = EXCLUDED.enrollment_agent_id,"
+                f" enrollment_channel = EXCLUDED.enrollment_channel,"
+                f" enrolled_at = EXCLUDED.enrolled_at",
                 {"idv": id_value, "name": full_name, "dob": (row.get("date_of_birth") or "").strip() or None,
                  "phone": (row.get("phone_number") or "").strip() or None,
                  "email": (row.get("email") or "").strip() or None,
-                 "prov": provenance, "by": imported_by},
+                 "prov": provenance, "by": imported_by, **enrollment},
             )
         else:
             store.execute(
                 f"INSERT INTO {table} ({registry}, full_name, date_of_birth, phone_number, email,"
-                f" is_synthetic, provenance, imported_by) VALUES (:idv, :name, :dob, :phone, :email,"
-                f" 0, :prov, :by) ON CONFLICT (tenant_id, {registry}) DO UPDATE SET"
+                f" is_synthetic, provenance, imported_by,"
+                f" enrollment_source, enrollment_agent_id, enrollment_channel, enrolled_at)"
+                f" VALUES (:idv, :name, :dob, :phone, :email,"
+                f" 0, :prov, :by, :esrc, :eagent, :echannel, :eat)"
+                f" ON CONFLICT (tenant_id, {registry}) DO UPDATE SET"
                 f" full_name = excluded.full_name, date_of_birth = excluded.date_of_birth,"
                 f" phone_number = excluded.phone_number, email = excluded.email,"
-                f" provenance = excluded.provenance, imported_by = excluded.imported_by",
+                f" provenance = excluded.provenance, imported_by = excluded.imported_by,"
+                f" enrollment_source = excluded.enrollment_source,"
+                f" enrollment_agent_id = excluded.enrollment_agent_id,"
+                f" enrollment_channel = excluded.enrollment_channel,"
+                f" enrolled_at = excluded.enrolled_at",
                 {"idv": id_value, "name": full_name, "dob": (row.get("date_of_birth") or "").strip() or None,
                  "phone": (row.get("phone_number") or "").strip() or None,
                  "email": (row.get("email") or "").strip() or None,
-                 "prov": provenance, "by": imported_by},
+                 "prov": provenance, "by": imported_by, **enrollment},
             )
         imported += 1
     logger.info("registry import: table=%s imported=%d rejected=%d by=%s",
@@ -693,6 +733,101 @@ async def import_registry(
         "rejected_count": len(rejected),
         "provenance": provenance,
         "imported_by": imported_by,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/admin/exposure/import")
+async def import_exposure(
+    request: ExposureImportRequest,
+    claims: dict = Depends(authenticate),
+    store: IdentityStore = Depends(get_store),
+):
+    """Admin import of a leaked-data indicator batch (JSON).
+
+    Rows: `{identifier_type, identifier_value, breach_ref, observed_at?}` —
+    LAWFULLY OBTAINED breach/leak indicators (e.g. the EFCC account-supplier
+    crackdown, telco fraud reports). Identifiers are matched transiently and
+    persisted ONLY as sha256 hashes (NDPA pseudonymization posture). For every
+    affected customer an `exposure_detected` alert is written to
+    identity_theft_alerts — this is the production writer for proactive victim
+    notification ("you may not know until EFCC comes knocking"). Idempotent:
+    re-importing the same batch dedupes on customer+identifier+breach_ref.
+    Requires the admin or identity_admin realm role.
+    """
+    roles = set((claims.get("realm_access") or {}).get("roles") or [])
+    if not roles & ADMIN_ROLES:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"requires one of: {sorted(ADMIN_ROLES)}")
+    imported_by = claims.get("sub", "unknown")
+    result = await asyncio.to_thread(
+        import_exposure_batch,
+        store,
+        get_bvn_adapter(store),
+        get_nin_adapter(store),
+        batch_id=request.batch_id,
+        source_note=request.source_note,
+        rows=[r.model_dump() for r in request.rows],
+        imported_by=imported_by,
+    )
+    logger.info("exposure import: batch=%s rows=%d matched=%d alerts=%d deduped=%d by=%s",
+                result["batch_id"], result["row_count"], result["matched_count"],
+                result["alerts_written"], result["alerts_deduped"], imported_by)
+    return {
+        "batch_id": result["batch_id"],
+        "row_count": result["row_count"],
+        "rejected": result["rejected"],
+        "rejected_count": result["rejected_count"],
+        "matched_count": result["matched_count"],
+        "matches": result["matches"],
+        "alerts_written": result["alerts_written"],
+        "alerts_deduped": result["alerts_deduped"],
+        "imported_by": imported_by,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/admin/enrollment/agent-rollup")
+async def enrollment_agent_rollup_endpoint(
+    claims: dict = Depends(authenticate),
+    store: IdentityStore = Depends(get_store),
+):
+    """Admin roll-up: per-enrollment-agent "linked to N flagged clusters".
+
+    Trace-to-source view over customer_identifiers: every identifier held by
+    more than one distinct customer is a flagged duplicate-identity cluster,
+    attributed to the enrollment source/agent recorded on each holder's row.
+    """
+    roles = set((claims.get("realm_access") or {}).get("roles") or [])
+    if not roles & ADMIN_ROLES:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"requires one of: {sorted(ADMIN_ROLES)}")
+    rollup = await asyncio.to_thread(enrollment_agent_rollup, store)
+    return {
+        "agents": rollup,
+        "agent_count": len(rollup),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/identity-exposure/{customer_ref}")
+async def get_identity_exposure(customer_ref: str, _: dict = Depends(authenticate),
+                                store: IdentityStore = Depends(get_store)):
+    """Customer-facing exposure view + redress guidance.
+
+    Returns every proactive `exposure_detected` alert for the customer
+    (hashed identifiers only) together with structured redress guidance the
+    app can render: formal complaint to the organisation involved, copy the
+    FCCPC, report to the NDPC (NDPR enforcement), and immediate practical
+    steps (contact bank, change credentials, watch for OTPs).
+    """
+    exposures = await asyncio.to_thread(exposures_for_customer, store, customer_ref)
+    return {
+        "customer_ref": customer_ref,
+        "exposures": exposures,
+        "exposure_count": len(exposures),
+        "status": "exposed" if exposures else "no_known_exposure",
+        "redress_guidance": REDRESS_GUIDANCE,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

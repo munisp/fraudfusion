@@ -118,6 +118,13 @@ def create_app(artifact_dir: str | Path | None = None,
     app.include_router(cultural_router)
     app.state.cultural_router = cultural_router
 
+    # Request-legitimacy router (stateless heuristic scoring — no artifact,
+    # so it is never fail-closed; see app/request_legitimacy.py).
+    from app.request_legitimacy import create_request_legitimacy_router
+    legitimacy_router = create_request_legitimacy_router()
+    app.include_router(legitimacy_router)
+    app.state.request_legitimacy_router = legitimacy_router
+
     def require_store() -> IntelStore:
         if store is None:
             raise HTTPException(status_code=503,
@@ -137,6 +144,7 @@ def create_app(artifact_dir: str | Path | None = None,
                 "model_version": store.metrics.get("version"),
                 "cultural_layer": ("ok" if cultural_router.cultural_store is not None  # type: ignore[attr-defined]
                                    else f"unavailable: {cultural_router.cultural_load_error}"),  # type: ignore[attr-defined]
+                "request_legitimacy_layer": "ok (stateless, no artifact required)",
                 "provenance": store.summaries.get("provenance")}
 
     # ------------------------------------------------------------------

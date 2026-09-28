@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+class AddressEvidenceInput(BaseModel):
+    """Address-verification evidence supplied at onboarding/review.
+
+    method: how the address was verified (physical_visit | utility_bill |
+    agent_confirmation | electronic). verified_at: ISO-8601 date/datetime of
+    the verification — drives the CBN quarterly-contact staleness check."""
+    method: Literal["physical_visit", "utility_bill", "agent_confirmation", "electronic"]
+    verified_at: str = Field(min_length=8, max_length=40)
+
+
+class CounterpartyRigorEntry(BaseModel):
+    """Admin-managed counterparty verification-rigor registry entry."""
+    institution_code: str = Field(min_length=2, max_length=50)
+    institution_name: str = Field(min_length=2, max_length=255)
+    rigor_level: Literal["cbn_full_biometric", "cbn_basic", "unverified", "unknown"]
+    source_note: str = Field(default="", max_length=1000)
 
 
 class BasicKYCRequest(BaseModel):
@@ -16,6 +34,7 @@ class BasicKYCRequest(BaseModel):
     first_name: str = Field(min_length=1, max_length=100)
     last_name: str = Field(min_length=1, max_length=100)
     date_of_birth: Optional[str] = None
+    address_evidence: Optional[AddressEvidenceInput] = None
 
 
 class EnhancedKYCRequest(BasicKYCRequest):

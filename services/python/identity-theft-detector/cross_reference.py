@@ -172,25 +172,81 @@ def cross_reference(
     for cid in matched_customers:
         grouped.setdefault(uf.find(cid), set()).add(cid)
     for members in grouped.values():
-        shared = [
+        shared = sorted(set(
             e["matched_on"] for e in evidence
             if e["source"] == "customer_identifiers" and e.get("customer_id") in members
-        ]
-        clusters.append({
+        ))
+        cluster: dict[str, Any] = {
             "customers": sorted(members),
             "cluster_size": len(members),
-            "shared_identifiers": sorted(set(shared)),
+            "shared_identifiers": shared,
             "evidence": [e for e in evidence if e.get("customer_id") in members],
-        })
+        }
+        # Enrollment-source tracing: a duplicate-identity cluster must be
+        # traceable to source — surface where/how each holder of every shared
+        # identifier was enrolled, and which sources/agents DIFFER.
+        if len(members) > 1:
+            traces: list[dict[str, Any]] = []
+            for matched_on in shared:
+                id_type, _, id_value = matched_on.partition(":")
+                rows = [
+                    r for r in store.enrollments_for_identifier(tenant_id, id_type, id_value)
+                    if r["customer_id"] in members
+                ]
+                sources = {r["enrollment_source"] or "unknown" for r in rows}
+                agents = {r["enrollment_agent_id"] or "unknown" for r in rows}
+                traces.append({
+                    "shared_identifier": matched_on,
+                    "enrollments": [
+                        {
+                            "customer_id": r["customer_id"],
+                            "enrollment_source": r["enrollment_source"] or "unknown",
+                            "enrollment_agent_id": r["enrollment_agent_id"],
+                            "enrollment_channel": r["enrollment_channel"],
+                            "enrolled_at": r["enrolled_at"],
+                        }
+                        for r in rows
+                    ],
+                    "differing_enrollment_sources": sorted(sources) if len(sources) > 1 else [],
+                    "differing_enrollment_agents": sorted(agents) if len(agents) > 1 else [],
+                })
+            cluster["enrollment_traces"] = traces
+        clusters.append(cluster)
 
     inconsistencies: list[str] = []
     nin_rec, bvn_rec = registry_records.get("nin"), registry_records.get("bvn")
+    registry_enrollment_tracing: dict[str, Any] = {}
     if nin_rec and bvn_rec:
         if (nin_rec.get("full_name") or "").strip().lower() != (bvn_rec.get("full_name") or "").strip().lower():
             inconsistencies.append("name_mismatch_between_nin_and_bvn")
         if nin_rec.get("date_of_birth") and bvn_rec.get("date_of_birth") \
                 and nin_rec["date_of_birth"] != bvn_rec["date_of_birth"]:
             inconsistencies.append("dob_mismatch_between_nin_and_bvn")
+        if inconsistencies:
+            # A NIN<->BVN conflict is traceable to source: surface where each
+            # side of the conflict was enrolled (source/agent/channel/when).
+            def _enrollment(rec: dict[str, Any]) -> dict[str, Any]:
+                return {
+                    "enrollment_source": rec.get("enrollment_source") or "unknown",
+                    "enrollment_agent_id": rec.get("enrollment_agent_id"),
+                    "enrollment_channel": rec.get("enrollment_channel"),
+                    "enrolled_at": rec.get("enrolled_at"),
+                    "provenance": rec.get("provenance"),
+                }
+
+            nin_enr, bvn_enr = _enrollment(nin_rec), _enrollment(bvn_rec)
+            registry_enrollment_tracing = {
+                "nin": nin_enr,
+                "bvn": bvn_enr,
+                "differing_enrollment_sources": (
+                    [nin_enr["enrollment_source"], bvn_enr["enrollment_source"]]
+                    if nin_enr["enrollment_source"] != bvn_enr["enrollment_source"] else []
+                ),
+                "differing_enrollment_agents": (
+                    [nin_enr["enrollment_agent_id"], bvn_enr["enrollment_agent_id"]]
+                    if nin_enr["enrollment_agent_id"] != bvn_enr["enrollment_agent_id"] else []
+                ),
+            }
 
     risk_score = 0.0
     if any(c["cluster_size"] > 1 for c in clusters):
@@ -206,7 +262,54 @@ def cross_reference(
         "alerts": deduped_alerts,
         "source_results": source_results,
         "inconsistencies": inconsistencies,
+        "registry_enrollment_tracing": registry_enrollment_tracing,
         "risk_score": risk_score,
         "searched_sources": searched_sources,
         "checks_status": "degraded" if unavailable else "completed",
     }
+
+
+def enrollment_agent_rollup(store: IdentityStore, tenant_id: str = "default") -> list[dict[str, Any]]:
+    """Per-enrollment-agent roll-up: "linked to N flagged clusters".
+
+    A flagged cluster is any identifier value held by MORE THAN ONE distinct
+    customer (the duplicate-identity signal). For every such identifier we
+    attribute the flag to the enrollment source/agent recorded on each holder's
+    row, so an enrollment agent or channel that keeps appearing in flagged
+    clusters is traceable to source.
+    """
+    flagged = store.query(
+        "SELECT id_type, id_value, COUNT(DISTINCT customer_id) AS holders"
+        " FROM customer_identifiers WHERE tenant_id = :t"
+        " GROUP BY id_type, id_value HAVING COUNT(DISTINCT customer_id) > 1",
+        {"t": tenant_id},
+    )
+    rollup: dict[str, dict[str, Any]] = {}
+    for row in flagged:
+        for enr in store.enrollments_for_identifier(tenant_id, row["id_type"], row["id_value"]):
+            agent = enr["enrollment_agent_id"] or "unknown"
+            entry = rollup.setdefault(agent, {
+                "enrollment_agent_id": None if agent == "unknown" else agent,
+                "enrollment_sources": set(),
+                "enrollment_channels": set(),
+                "flagged_clusters": 0,
+                "customers": set(),
+                "flagged_identifiers": set(),
+            })
+            entry["enrollment_sources"].add(enr["enrollment_source"] or "unknown")
+            if enr["enrollment_channel"]:
+                entry["enrollment_channels"].add(enr["enrollment_channel"])
+            entry["customers"].add(enr["customer_id"])
+            entry["flagged_identifiers"].add(f"{row['id_type']}:{row['id_value']}")
+    out = []
+    for agent, entry in sorted(rollup.items()):
+        out.append({
+            "enrollment_agent_id": entry["enrollment_agent_id"],
+            "enrollment_sources": sorted(entry["enrollment_sources"]),
+            "enrollment_channels": sorted(entry["enrollment_channels"]),
+            "flagged_clusters": len(entry["flagged_identifiers"]),
+            "linked_customers": sorted(entry["customers"]),
+            "flagged_identifiers": sorted(entry["flagged_identifiers"]),
+        })
+    out.sort(key=lambda r: (-r["flagged_clusters"], str(r["enrollment_agent_id"])))
+    return out

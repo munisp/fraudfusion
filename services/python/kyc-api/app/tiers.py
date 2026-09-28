@@ -19,6 +19,7 @@ tier is never a bare label: limits travel with the tier and
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -53,6 +54,106 @@ TIER_LIMITS: dict[str, TierLimits] = {
 
 # Verification level offered by each /kyc/verify/* endpoint.
 LEVEL_TO_TIER = {"basic": "tier_1", "enhanced": "tier_2", "premium": "tier_3"}
+
+
+# ---------------------------------------------------------------------------
+# Address-verification evidence model (CBN: verify the customer's address and
+# maintain physical contact at least every 3 months; electronic-only
+# verification is weaker in the deepfake era).
+# ---------------------------------------------------------------------------
+
+# Accepted verification methods. 'physical_visit' is an in-person contact;
+# 'utility_bill' is documentary; 'electronic' is data-only (weakest).
+ADDRESS_VERIFICATION_METHODS = (
+    "physical_visit",
+    "utility_bill",
+    "agent_confirmation",
+    "electronic",
+)
+
+# Methods that provide no documentary or physical evidence at all.
+ELECTRONIC_ONLY_METHODS = ("electronic",)
+
+# CBN quarterly-contact cadence: address evidence older than this is stale.
+ADDRESS_EVIDENCE_MAX_AGE_DAYS = 90
+
+# Tiers at which electronic-only address verification is too weak to stand
+# alone and must trigger a re-verification review.
+ADDRESS_RIGOR_TIERS = ("tier_2", "tier_3")
+
+
+def parse_verified_at(value: str) -> datetime:
+    """Parse an ISO-8601 date/datetime into an aware UTC datetime."""
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(f"verified_at is not an ISO-8601 date/datetime: {value!r}") from None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def validate_address_evidence(method: str, verified_at: str) -> dict:
+    """Validate one address-evidence record; returns the normalized record."""
+    if method not in ADDRESS_VERIFICATION_METHODS:
+        raise ValueError(
+            f"unknown address verification method {method!r}; "
+            f"known: {', '.join(ADDRESS_VERIFICATION_METHODS)}"
+        )
+    dt = parse_verified_at(verified_at)
+    return {"method": method, "verified_at": dt.isoformat()}
+
+
+def address_evidence_age_days(verified_at: str, now: datetime | None = None) -> int:
+    """Whole days since the address was verified (negative -> 0)."""
+    dt = parse_verified_at(verified_at)
+    now = now or datetime.now(timezone.utc)
+    return max(0, (now - dt).days)
+
+
+def address_review_required(
+    tier: str,
+    method: Optional[str],
+    verified_at: Optional[str],
+    now: datetime | None = None,
+) -> dict:
+    """Decide whether an address re-verification review item is required.
+
+    Rules (documented, deterministic):
+      * Tier 2+ with NO address evidence at all -> required
+        ('no_address_evidence').
+      * Evidence older than ADDRESS_EVIDENCE_MAX_AGE_DAYS (90d) -> required
+        at every tier ('address_evidence_stale'); CBN expects physical
+        contact at least every 3 months.
+      * Tier 2+ whose latest evidence is electronic-only -> required
+        ('electronic_only_method'); data-only verification is too weak to
+        stand alone at elevated tiers.
+    """
+    reasons: list[str] = []
+    age_days: Optional[int] = None
+    if not method or not verified_at:
+        if tier in ADDRESS_RIGOR_TIERS:
+            reasons.append("no_address_evidence")
+    else:
+        age_days = address_evidence_age_days(verified_at, now)
+        if age_days > ADDRESS_EVIDENCE_MAX_AGE_DAYS:
+            reasons.append(
+                f"address_evidence_stale ({age_days}d > {ADDRESS_EVIDENCE_MAX_AGE_DAYS}d; "
+                "CBN quarterly contact cadence)"
+            )
+        if tier in ADDRESS_RIGOR_TIERS and method in ELECTRONIC_ONLY_METHODS:
+            reasons.append("electronic_only_method (weaker than physical/documentary at tier 2+)")
+    return {
+        "required": bool(reasons),
+        "reasons": reasons,
+        "method": method,
+        "verified_at": verified_at,
+        "age_days": age_days,
+        "max_age_days": ADDRESS_EVIDENCE_MAX_AGE_DAYS,
+    }
 
 
 class TierAssignmentError(ValueError):

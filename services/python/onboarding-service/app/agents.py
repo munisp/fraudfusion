@@ -30,7 +30,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth import Principal, get_current_principal, require_admin
 from app.db import Database, get_db
-from app.schemas import AgentApplicationPage, AgentApplicationView, AgentSubmission, ApprovalDecision
+from app.schemas import (
+    AgentApplicationPage,
+    AgentApplicationView,
+    AgentIntegrityView,
+    AgentOutcomeSubmission,
+    AgentOutcomeView,
+    AgentSubmission,
+    ApprovalDecision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +47,26 @@ router = APIRouter()
 KYC_API_URL = os.getenv("KYC_API_URL", "").rstrip("/")
 KYC_SERVICE_TOKEN = os.getenv("KYC_SERVICE_TOKEN", "")
 SCREENING_TIMEOUT = float(os.getenv("KYC_SCREENING_TIMEOUT_SECONDS", "10"))
+
+# --- Agent integrity scoring (Beta-Binomial smoothed fraud rate) -----------
+# Registration/enrollment agents whose enrollees disproportionately appear in
+# fraud are a black-market resale signal. The score is the posterior mean of a
+# Beta-Binomial model:
+#     prior  fraud_rate ~ Beta(PRIOR_ALPHA, PRIOR_BETA)   (mean 0.10, strength
+#                                                        20 pseudo-enrollments)
+#     data   confirmed_fraud counts 1.0, flagged counts 0.5, clean counts 0
+#     score  = (fraud_weight + PRIOR_ALPHA) / (enrollments + PRIOR_ALPHA + PRIOR_BETA)
+# A NEW agent (0 enrollments) sits exactly at the prior mean (0.10) — small
+# agents are never extreme-scored (1/1 fraud -> 0.143, not 100%).
+# Recency decay is NOT applied (outcomes are lifetime counts); it can be added
+# later by weighting agent_outcomes.recorded_at without changing the API.
+PRIOR_ALPHA = 2.0
+PRIOR_BETA = 18.0
+OUTCOME_WEIGHTS = {"clean": 0.0, "flagged": 0.5, "confirmed_fraud": 1.0}
+ALERT_THRESHOLD = float(os.getenv("AGENT_INTEGRITY_ALERT_THRESHOLD", "0.25"))
+# k-anonymity: per-agent fraud_rate is never exposed below this enrollment
+# count — the response is suppressed to 'insufficient_data'.
+MIN_ENROLLMENTS_FOR_EXPOSURE = int(os.getenv("AGENT_INTEGRITY_MIN_ENROLLMENTS", "10"))
 
 # Legal status transitions for agent_applications.
 TRANSITIONS = {
@@ -292,3 +320,88 @@ def suspend_agent(agent_id: str, payload: ApprovalDecision,
     require_admin(principal)
     return _agent_view(_transition(db, agent_id, "suspended",
                                    rejection_reason=payload.reason))
+
+
+# ---------------------------------------------------------------------------
+# Agent integrity: enrollment outcomes + smoothed fraud-rate surveillance
+# ---------------------------------------------------------------------------
+
+def compute_integrity(enrollments: int, fraud_weight: float,
+                      prior_alpha: float = PRIOR_ALPHA,
+                      prior_beta: float = PRIOR_BETA,
+                      alert_threshold: float = ALERT_THRESHOLD,
+                      min_enrollments: int = MIN_ENROLLMENTS_FOR_EXPOSURE) -> dict:
+    """Beta-Binomial smoothed fraud rate (see module docstring for the prior).
+
+    Returns {fraud_rate, alert, status}: status 'insufficient_data' (with
+    fraud_rate suppressed to None) when enrollments < min_enrollments —
+    k-anonymity guard so small agents are neither extreme-scored nor
+    individually exposed. Alerts only fire on exposed (sufficient) data."""
+    smoothed = (fraud_weight + prior_alpha) / (enrollments + prior_alpha + prior_beta)
+    if enrollments < min_enrollments:
+        return {"status": "insufficient_data", "fraud_rate": None, "alert": False}
+    return {
+        "status": "ok",
+        "fraud_rate": round(smoothed, 4),
+        "alert": smoothed >= alert_threshold,
+    }
+
+
+@router.post("/api/v1/onboarding/agents/{agent_id}/outcomes",
+             response_model=AgentOutcomeView, status_code=201,
+             response_model_by_alias=True)
+def record_agent_outcome(agent_id: str, payload: AgentOutcomeSubmission,
+                         principal: Principal = Depends(get_current_principal),
+                         db: Database = Depends(get_db)) -> AgentOutcomeView:
+    """Record the post-onboarding outcome of one customer the agent enrolled
+    (clean | flagged | confirmed_fraud). The agent must exist."""
+    _get_agent(db, agent_id)
+    outcome_id = uuid.uuid4().hex
+    now = _now()
+    db.execute(
+        "INSERT INTO agent_outcomes (id, agent_id, customer_ref, outcome, recorded_at)"
+        " VALUES (:id, :aid, :ref, :outcome, :now)",
+        {"id": outcome_id, "aid": agent_id, "ref": payload.customer_ref,
+         "outcome": payload.outcome, "now": now},
+    )
+    logger.info("agent outcome recorded: agent=%s outcome=%s by=%s",
+                agent_id, payload.outcome, principal.sub)
+    return AgentOutcomeView(outcome_id=outcome_id, agent_id=agent_id,
+                            customer_ref=payload.customer_ref,
+                            outcome=payload.outcome, recorded_at=now)
+
+
+@router.get("/api/v1/onboarding/agents/{agent_id}/integrity",
+            response_model=AgentIntegrityView, response_model_by_alias=True)
+def agent_integrity(agent_id: str,
+                    principal: Principal = Depends(get_current_principal),
+                    db: Database = Depends(get_db)) -> AgentIntegrityView:
+    """Beta-Binomial smoothed fraud rate for the agent's enrollees.
+
+    k-anonymity: below MIN_ENROLLMENTS_FOR_EXPOSURE enrollments the rate and
+    per-outcome counts are suppressed ('insufficient_data'); a new agent's
+    unsuppressed score would sit exactly at the prior mean, never at an
+    extreme."""
+    _get_agent(db, agent_id)
+    rows = db.query(
+        "SELECT outcome, COUNT(*) AS n FROM agent_outcomes WHERE agent_id = :aid"
+        " GROUP BY outcome",
+        {"aid": agent_id},
+    )
+    counts = {r["outcome"]: int(r["n"]) for r in rows}
+    enrollments = sum(counts.values())
+    fraud_weight = sum(OUTCOME_WEIGHTS[o] * n for o, n in counts.items())
+    result = compute_integrity(enrollments, fraud_weight)
+    return AgentIntegrityView(
+        agent_id=agent_id,
+        status=result["status"],
+        enrollments=enrollments,
+        fraud_rate=result["fraud_rate"],
+        prior_mean=round(PRIOR_ALPHA / (PRIOR_ALPHA + PRIOR_BETA), 4),
+        alert=result["alert"],
+        alert_threshold=ALERT_THRESHOLD,
+        min_enrollments=MIN_ENROLLMENTS_FOR_EXPOSURE,
+        # counts are only exposed alongside the rate (k-anonymity: a count
+        # breakdown would let a caller derive the suppressed rate).
+        counts=counts if result["status"] == "ok" else {},
+    )

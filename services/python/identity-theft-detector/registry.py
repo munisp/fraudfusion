@@ -60,7 +60,8 @@ class LocalRegistryAdapter(RegistryAdapter):
     def lookup(self, id_value: str, tenant_id: str = "default") -> dict[str, Any]:
         row = self.store.query_one(
             f"SELECT {self.id_type} AS id_value, full_name, date_of_birth, phone_number, email,"
-            f" is_synthetic, provenance FROM {self.table}"
+            f" is_synthetic, provenance, enrollment_source, enrollment_agent_id,"
+            f" enrollment_channel, enrolled_at FROM {self.table}"
             f" WHERE tenant_id = :t AND {self.id_type} = :v",
             {"t": tenant_id, "v": id_value},
         )
@@ -82,6 +83,11 @@ class LocalRegistryAdapter(RegistryAdapter):
                 "phone_number": row["phone_number"],
                 "email": row["email"],
                 "provenance": row["provenance"],
+                # enrollment-source tracing (trace duplicates to source)
+                "enrollment_source": row["enrollment_source"],
+                "enrollment_agent_id": row["enrollment_agent_id"],
+                "enrollment_channel": row["enrollment_channel"],
+                "enrolled_at": row["enrolled_at"],
             },
         }
 

@@ -39,6 +39,12 @@ CREATE TABLE IF NOT EXISTS bvn_registry (
     is_synthetic  INTEGER NOT NULL DEFAULT 0,
     provenance    TEXT NOT NULL DEFAULT 'admin-import',
     imported_by   TEXT,
+    -- enrollment-source tracing: where/how this identifier was enrolled
+    -- (bank_branch, sim_registration_agent, nimc_fep, self_service, unknown).
+    enrollment_source   TEXT NOT NULL DEFAULT 'unknown',
+    enrollment_agent_id TEXT,
+    enrollment_channel  TEXT,
+    enrolled_at         TEXT,
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (tenant_id, bvn)
 );
@@ -54,6 +60,10 @@ CREATE TABLE IF NOT EXISTS nin_registry (
     is_synthetic  INTEGER NOT NULL DEFAULT 0,
     provenance    TEXT NOT NULL DEFAULT 'admin-import',
     imported_by   TEXT,
+    enrollment_source   TEXT NOT NULL DEFAULT 'unknown',
+    enrollment_agent_id TEXT,
+    enrollment_channel  TEXT,
+    enrolled_at         TEXT,
     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (tenant_id, nin)
 );
@@ -64,6 +74,10 @@ CREATE TABLE IF NOT EXISTS customer_identifiers (
     customer_id TEXT NOT NULL,
     id_type     TEXT NOT NULL CHECK (id_type IN ('phone', 'email', 'device', 'nin', 'bvn')),
     id_value    TEXT NOT NULL,
+    enrollment_source   TEXT NOT NULL DEFAULT 'unknown',
+    enrollment_agent_id TEXT,
+    enrollment_channel  TEXT,
+    enrolled_at         TEXT,
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (tenant_id, id_type, id_value, customer_id)
 );
@@ -78,7 +92,44 @@ CREATE TABLE IF NOT EXISTS identity_theft_alerts (
     details    TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Victim-exposure detection (lane I1): lawfully obtained breach/leak
+-- indicator batches (e.g. EFCC account-supplier crackdown, telco reports).
+-- NDPA posture: identifiers are stored ONLY as sha256 hashes, never plaintext.
+CREATE TABLE IF NOT EXISTS exposure_import_batches (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    batch_id      TEXT NOT NULL,
+    source_note   TEXT,
+    row_count     INTEGER NOT NULL DEFAULT 0,
+    matched_count INTEGER NOT NULL DEFAULT 0,
+    imported_by   TEXT,
+    imported_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (tenant_id, batch_id)
+);
+
+CREATE TABLE IF NOT EXISTS exposure_indicators (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    batch_id        TEXT NOT NULL,
+    identifier_type TEXT NOT NULL CHECK (identifier_type IN ('phone', 'email', 'device', 'nin', 'bvn')),
+    identifier_hash TEXT NOT NULL,  -- sha256 of the normalised identifier; plaintext is NEVER persisted
+    breach_ref      TEXT NOT NULL,
+    observed_at     TEXT,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (tenant_id, identifier_type, identifier_hash, breach_ref)
+);
 """
+
+# Columns added after the initial schema shipped; existing SQLite DB files get
+# them via guarded ALTERs (CREATE TABLE IF NOT EXISTS does not upgrade them).
+_ENROLLMENT_COLUMNS = (
+    ("enrollment_source", "TEXT NOT NULL DEFAULT 'unknown'"),
+    ("enrollment_agent_id", "TEXT"),
+    ("enrollment_channel", "TEXT"),
+    ("enrolled_at", "TEXT"),
+)
+_ENROLLMENT_TABLES = ("bvn_registry", "nin_registry", "customer_identifiers")
 
 _NAMED_PARAM = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")
 
@@ -108,8 +159,18 @@ class IdentityStore:
             self._conn.row_factory = sqlite3.Row
             with self._lock, self._conn:
                 self._conn.executescript(SQLITE_SCHEMA)
+                self._upgrade_sqlite_schema()
                 if seed:
                     self._seed_synthetic()
+
+    def _upgrade_sqlite_schema(self) -> None:
+        """Backward-compatible column upgrades for pre-existing SQLite files
+        (CREATE TABLE IF NOT EXISTS never alters an existing table)."""
+        for table in _ENROLLMENT_TABLES:
+            existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            for col, ddl in _ENROLLMENT_COLUMNS:
+                if col not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
     def _seed_synthetic(self) -> None:
         """Clearly-marked SYNTHETIC rows so dev/tests exercise real match
@@ -192,6 +253,39 @@ class IdentityStore:
             " FROM identity_theft_alerts WHERE tenant_id = :t"
             " AND json_extract(details, '$.' || :f) = :v",
             {"t": tenant_id, "f": field, "v": value},
+        )
+
+    def exposure_alert_exists(self, tenant_id: str, user_id: str,
+                              identifier_hash: str, breach_ref: str) -> bool:
+        """Dedupe key for exposure alerts: customer + identifier + breach_ref
+        (the identifier itself is only ever compared as a sha256 hash)."""
+        if self._is_pg:
+            row = self.query_one(
+                "SELECT id FROM identity_theft_alerts WHERE tenant_id = :t"
+                " AND user_id = :u AND alert_type = 'exposure_detected'"
+                " AND details ->> 'identifier_hash' = :h AND details ->> 'breach_ref' = :b LIMIT 1",
+                {"t": tenant_id, "u": user_id, "h": identifier_hash, "b": breach_ref},
+            )
+        else:
+            row = self.query_one(
+                "SELECT id FROM identity_theft_alerts WHERE tenant_id = :t"
+                " AND user_id = :u AND alert_type = 'exposure_detected'"
+                " AND json_extract(details, '$.identifier_hash') = :h"
+                " AND json_extract(details, '$.breach_ref') = :b LIMIT 1",
+                {"t": tenant_id, "u": user_id, "h": identifier_hash, "b": breach_ref},
+            )
+        return row is not None
+
+    def enrollments_for_identifier(self, tenant_id: str, id_type: str,
+                                   id_value: str) -> list[dict[str, Any]]:
+        """Enrollment-source provenance for every customer holding this
+        identifier — the trace-to-source evidence for duplicate clusters."""
+        return self.query(
+            "SELECT customer_id, id_type, id_value, enrollment_source,"
+            " enrollment_agent_id, enrollment_channel, enrolled_at"
+            " FROM customer_identifiers"
+            " WHERE tenant_id = :t AND id_type = :ty AND id_value = :v",
+            {"t": tenant_id, "ty": id_type, "v": id_value},
         )
 
 

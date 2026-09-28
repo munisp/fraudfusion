@@ -107,6 +107,19 @@ CREATE TABLE IF NOT EXISTS kyc_appeals (
     created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Counterparty verification-rigor registry (canonical PG:
+-- database/20260928_kyc_rigor_agents.sql). Admin-managed; lookup fails
+-- closed to 'unknown' for institutions with no entry.
+CREATE TABLE IF NOT EXISTS counterparty_rigor_registry (
+    institution_code TEXT PRIMARY KEY,
+    institution_name TEXT NOT NULL,
+    rigor_level      TEXT NOT NULL
+                     CHECK (rigor_level IN ('cbn_full_biometric', 'cbn_basic',
+                                            'unverified', 'unknown')),
+    source_note      TEXT NOT NULL DEFAULT '',
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 # Columns added to kyc_requests for re-KYC + backoffice override (fresh DBs
@@ -118,6 +131,10 @@ KYC_REQUESTS_EXTRA_COLUMNS = {
     "override_by": "TEXT",
     "override_reason": "TEXT",
     "override_at": "TEXT",
+    # Address-verification evidence (canonical PG columns added by
+    # database/20260928_kyc_rigor_agents.sql).
+    "address_verification_method": "TEXT",
+    "address_verified_at": "TEXT",
 }
 
 # Demo seed so local/dev screening exercises a real match path. Production
