@@ -1,4 +1,5 @@
-"""intel-service — National Fraud Intelligence serving API (FastAPI, :8500).
+"""intel-service — National + Cultural Fraud Intelligence serving API
+(FastAPI, :8500).
 
 Serves the hierarchical Bayesian posteriors fit by
 ``ml/bayesian/national_intelligence.py`` and shipped under
@@ -11,6 +12,12 @@ Serves the hierarchical Bayesian posteriors fit by
     GET /v1/intel/typology-mix         per-zone Dirichlet-multinomial mix with intervals
     GET /v1/intel/brief                markdown National Fraud Intelligence Brief
     GET /health                        loud fail-closed health (503 when artifact missing)
+
+plus the Cultural Intelligence layer (``app/cultural.py``,
+``ml/bayesian/cultural_intelligence.py``) mounted under
+/v1/intel/cultural/: calendar uplift, ajo/esusu legitimacy posterior,
+audited anomaly-score adjustment, culturally-specific typology base rates,
+weekly giving rhythm, and weighted cultural-fraud indicator scoring.
 
 NDPA-safe by construction: the model only ever sees aggregate weekly
 counts; the artifact contains no PII; and any aggregate cell with
@@ -44,6 +51,8 @@ SUPPRESS_MIN_N = int(os.getenv("INTEL_SUPPRESS_MIN_N", "30"))  # k-anonymity flo
 
 DEFAULT_ARTIFACT_DIR = (Path(__file__).resolve().parents[4]
                         / "ml" / "artifacts" / "national_intelligence" / "v1")
+DEFAULT_CULTURAL_ARTIFACT_DIR = (Path(__file__).resolve().parents[4]
+                                 / "ml" / "artifacts" / "cultural_intelligence" / "v1")
 
 
 class IntelStore:
@@ -80,12 +89,16 @@ class IntelStore:
         return row
 
 
-def create_app(artifact_dir: str | Path | None = None) -> FastAPI:
+def create_app(artifact_dir: str | Path | None = None,
+               cultural_artifact_dir: str | Path | None = None) -> FastAPI:
     artifact_dir = Path(os.getenv("INTEL_ARTIFACT_DIR", "") or
                         (artifact_dir or DEFAULT_ARTIFACT_DIR))
+    cultural_dir = Path(os.getenv("INTEL_CULTURAL_ARTIFACT_DIR", "") or
+                        (cultural_artifact_dir or DEFAULT_CULTURAL_ARTIFACT_DIR))
     app = FastAPI(title="intel-service",
-                  version="1.0.0",
-                  description="National Fraud Intelligence (hierarchical Bayesian)")
+                  version="1.1.0",
+                  description="National + Cultural Fraud Intelligence "
+                              "(hierarchical Bayesian / MCMC)")
 
     store: IntelStore | None = None
     load_error: str | None = None
@@ -96,6 +109,14 @@ def create_app(artifact_dir: str | Path | None = None) -> FastAPI:
         logger.error("INTEL ARTIFACT UNAVAILABLE — %s. /health will report 503 "
                      "and all /v1/intel/* endpoints are disabled (fail-closed).",
                      load_error)
+
+    # Cultural intelligence router (independently fail-closed: a missing
+    # cultural artifact 503s /v1/intel/cultural/* only, never the national
+    # endpoints — and vice versa).
+    from app.cultural import create_cultural_router
+    cultural_router = create_cultural_router(cultural_dir)
+    app.include_router(cultural_router)
+    app.state.cultural_router = cultural_router
 
     def require_store() -> IntelStore:
         if store is None:
@@ -114,6 +135,8 @@ def create_app(artifact_dir: str | Path | None = None) -> FastAPI:
         return {"status": "ok", "service": SERVICE_NAME,
                 "artifact_dir": str(store.artifact_dir),
                 "model_version": store.metrics.get("version"),
+                "cultural_layer": ("ok" if cultural_router.cultural_store is not None  # type: ignore[attr-defined]
+                                   else f"unavailable: {cultural_router.cultural_load_error}"),  # type: ignore[attr-defined]
                 "provenance": store.summaries.get("provenance")}
 
     # ------------------------------------------------------------------

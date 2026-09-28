@@ -30,6 +30,32 @@ v2 additions (dataset_version=2):
   * Typology-weighted label noise (~2% overall, concentrated in pos/agent
     channels where disputes are common).
 
+Cultural patterns layer (CULTURAL_PATTERNS_VERSION=1, additive on top of v2;
+DATASET_VERSION stays 2 because ml/tests/test_q1_enhancements.py pins
+meta["dataset_version"] == 2 and this layer changes no existing
+distribution, label convention, or feature contract):
+  * Ajo/esusu/adashe rotating savings clubs: equal periodic member
+    contributions rotating a lump-sum payout so every member receives
+    exactly once per cycle (labelled legit, typology "ajo_contribution").
+  * Fraud rings masquerading as ajo: ponzi-style clubs where early members
+    are paid inflated "returns" from later joiners' contributions and the
+    rotation never completes (labelled fraud, typology "fake_ajo_ponzi").
+  * Festive spending uplift windows (Eid al-Fitr / Eid al-Adha lunar
+    approximations, Easter, Christmas / Detty December, Independence Day)
+    applied as amount multipliers + a ``cultural_event`` tag.
+  * Per-region market-week uplift: 4-day cycle in the South East
+    (Eke/Orie/Afo/Nkwo), 5-day in the South West, 7-day weekly markets in
+    the North (``is_local_market_day`` column; the existing global
+    ``is_market_day`` Tue/Fri contract is unchanged).
+  * The five documented cultural-fraud MASQUERADE typologies (domain
+    source: NIGERIAN_CULTURAL_FRAUD_PATTERNS_* documents), labelled fraud:
+    ceremony_exploitation, religious_manipulation, family_obligation_abuse,
+    business_practice_abuse, authority_status_abuse — each in two variants,
+    with timing tied to the cultural calendar.
+  * Legitimate cultural flows the masquerades hide inside: religious giving
+    with Friday/Sunday weekly rhythm and hometown family-support
+    remittances (labelled legit).
+
 Deterministic seed. Outputs parquet + temporal train/val/test split.
 """
 from __future__ import annotations
@@ -44,6 +70,10 @@ import pandas as pd
 
 SEED = 20240517
 DATASET_VERSION = 2
+# Additive cultural-patterns layer version (ajo/esusu cycles, festive uplift,
+# per-region market-week uplift). Separate constant so the pinned v2 feature
+# contracts (dataset_version == 2) stay green.
+CULTURAL_PATTERNS_VERSION = 1
 
 BANKS = [
     ("Access Bank", "044"), ("GTBank", "058"), ("Zenith Bank", "057"),
@@ -586,6 +616,392 @@ def add_label_lag(txns: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------
+# Cultural patterns layer (additive, CULTURAL_PATTERNS_VERSION=1)
+# --------------------------------------------------------------------------
+# Nigeria's legitimate financial life is culturally patterned; these additive
+# patterns make the synthetic data reflect that so detectors can be evaluated
+# against cultural false positives (ajo looking like structuring) and against
+# fraud hidden inside cultural patterns (ponzi clubs masquerading as ajo).
+# ETHICS: everything here is transaction-PATTERN level. No ethnicity,
+# religion, tribe, or language attribute is generated or attached to any
+# account; region enters only as the state/zone the account already had.
+
+# Geopolitical zone of each generator state (GEO uses title-case names).
+STATE_ZONE = {
+    "Lagos": "south_west", "Oyo": "south_west", "Ogun": "south_west",
+    "Rivers": "south_south", "Delta": "south_south", "Edo": "south_south",
+    "Enugu": "south_east", "Anambra": "south_east", "Imo": "south_east",
+    "Abuja": "north_central", "Kwara": "north_central", "Plateau": "north_central",
+    "Kano": "north_west", "Kaduna": "north_west", "Sokoto": "north_west",
+    "Borno": "north_east",
+}
+
+# Market-week cycle length (days) per zone: 4-day Igbo market week
+# (Eke/Orie/Afo/Nkwo) in the South East (and neighbouring South South),
+# 5-day Yoruba cycle in the South West, 7-day weekly markets in the North.
+MARKET_CYCLE_DAYS = {
+    "south_east": 4, "south_south": 4, "south_west": 5,
+    "north_central": 7, "north_west": 7, "north_east": 7,
+}
+MARKET_CYCLE_REFERENCE = pd.Timestamp("2023-12-31")  # day-of-cycle anchor
+
+# Festive uplift windows as (event, (m, d) start, (m, d) end, amount uplift).
+# Lunar events (Eid al-Fitr / Eid al-Adha) use 2024 Gregorian approximations
+# and are flagged as such; they drift ~11 days earlier each year.
+FESTIVE_WINDOWS = [
+    ("eid_al_fitr", (4, 9), (4, 12), 1.9),    # lunar approximation (2024)
+    ("eid_al_adha", (6, 15), (6, 18), 1.7),   # lunar approximation (2024)
+    ("easter", (3, 29), (4, 1), 1.5),
+    ("christmas_detty_december", (12, 15), (12, 31), 1.8),
+    ("independence_day", (10, 1), (10, 2), 1.3),
+    ("new_year", (1, 1), (1, 3), 1.4),
+]
+
+
+def _in_window(month: np.ndarray, day: np.ndarray, start, end) -> np.ndarray:
+    md = month * 100 + day
+    lo = start[0] * 100 + start[1]
+    hi = end[0] * 100 + end[1]
+    if lo <= hi:
+        return (md >= lo) & (md <= hi)
+    return (md >= lo) | (md <= hi)  # wraps year boundary
+
+
+def add_cultural_patterns(txns: pd.DataFrame, accts: pd.DataFrame,
+                          rng: np.random.Generator) -> pd.DataFrame:
+    """Additive cultural patterns: ajo/esusu cycles (legit + ponzi lookalikes),
+    festive amount uplift windows, per-region market-week amount uplift.
+
+    Called AFTER inject_fraud + add_salary_credits so the ~2% label-noise
+    flip does not touch these rows (same convention as salary credits):
+    ajo labels are exact by construction and documented as such. Existing
+    columns, distributions, and the ``is_market_day``/``is_month_end``
+    contracts are unchanged; new columns: ``cultural_event`` (str),
+    ``ajo_group_id`` (str), ``is_local_market_day`` (int).
+    """
+    txns = txns.sort_values("ts").reset_index(drop=True)
+    month = txns["ts"].dt.month.to_numpy()
+    day = txns["ts"].dt.day.to_numpy()
+
+    # --- festive uplift windows (amount multiplier + tag) ------------------
+    txns["cultural_event"] = ""
+    amt = txns["amount_ngn"].to_numpy(dtype=float, copy=True)
+    for name, start, end, uplift in FESTIVE_WINDOWS:
+        mask = _in_window(month, day, start, end)
+        if not mask.any():
+            continue  # window outside the generated date range
+        amt[mask] = _kobo_round(amt[mask] * rng.uniform(1.1, uplift, mask.sum()))
+        tag = txns["cultural_event"].to_numpy()
+        tag[mask & (tag == "")] = name
+        txns["cultural_event"] = tag
+
+    # --- per-region market-week uplift --------------------------------------
+    zone = txns["sender_state"].map(STATE_ZONE)
+    cyc = zone.map(MARKET_CYCLE_DAYS).fillna(7).to_numpy()
+    cyc_day = (txns["ts"].dt.normalize() - MARKET_CYCLE_REFERENCE).dt.days.to_numpy()
+    local_market = (np.mod(cyc_day, cyc.astype(int)) == 0)
+    # long-standing 4/5-day cycles are strongest outside Lagos/Abuja retail
+    amt[local_market] = _kobo_round(amt[local_market] * rng.uniform(1.1, 1.5, local_market.sum()))
+    txns["is_local_market_day"] = local_market.astype(int)
+    txns["amount_ngn"] = amt
+
+    # --- ajo / esusu / adashe rotating savings clubs ------------------------
+    txns["ajo_group_id"] = ""
+    cust = accts.set_index("customer_id")
+    cid = accts["customer_id"].to_numpy()
+    t0, t1 = txns["ts"].min(), txns["ts"].max()
+    span_days = max((t1 - t0).days - 20, 30)
+    rows = []
+
+    def _row(sender, receiver, ts, amount, group_id, is_fraud, typology):
+        s_zone = STATE_ZONE.get(cust["state"].iloc[sender], "north_central")
+        cyc_len = MARKET_CYCLE_DAYS.get(s_zone, 7)
+        cyc_day = (ts.normalize() - MARKET_CYCLE_REFERENCE).days
+        return dict(
+            txn_id=f"AJ{rng.integers(1e8):08d}", ts=ts,
+            sender_id=cid[sender], receiver_id=cid[receiver],
+            amount_ngn=float(_kobo_round(amount)), channel="nip",
+            sender_bank=cust["bank"].iloc[sender],
+            receiver_bank=cust["bank"].iloc[receiver],
+            sender_state=cust["state"].iloc[sender],
+            receiver_state=cust["state"].iloc[receiver],
+            device_os=cust["device_os"].iloc[sender],
+            hour=int(ts.hour), dow=int(ts.dayofweek),
+            is_month_end=int(25 <= ts.day <= 31),
+            is_market_day=int(ts.dayofweek in MARKET_DAYS),
+            is_fraud=is_fraud, fraud_typology=typology,
+            device_emulator=0, sim_swap_7d=0, new_device=0,
+            is_salary_credit=0, cultural_event="ajo_cycle",
+            ajo_group_id=group_id,
+            is_local_market_day=int(cyc_day % cyc_len == 0),
+        )
+
+    # legit clubs: n members contribute an equal amount every cadence days;
+    # the lump sum rotates so each member receives EXACTLY once per cycle.
+    n_legit = 10
+    for g in range(n_legit):
+        size = int(rng.integers(5, 13))
+        members = rng.choice(len(accts), size=size, replace=False)
+        contrib = float(rng.uniform(5_000, 100_000))
+        cadence = int(rng.choice([7, 14]))
+        start = t0 + pd.Timedelta(days=int(rng.integers(0, 10)))
+        order = rng.permutation(size)
+        gid = f"AJO{g:03d}"
+        for pos in range(size):
+            if cadence * pos > span_days:
+                break
+            recipient = members[order[pos]]
+            pay_day = start + pd.Timedelta(days=cadence * pos,
+                                           hours=int(rng.integers(9, 20)))
+            for m in members:
+                if m == recipient:
+                    continue
+                rows.append(_row(m, recipient, pay_day + pd.Timedelta(
+                    minutes=int(rng.integers(0, 240))),
+                    contrib * rng.uniform(0.98, 1.02), gid, 0, "ajo_contribution"))
+
+    # fraud rings masquerading as ajo: weekly contributions escalate, the
+    # organizer pays inflated "returns" to the first 1-2 slots (ponzi
+    # seeding) out of later joiners' contributions, then the rotation
+    # collapses — most members never receive. Labelled honestly as fraud.
+    for g in range(n_legit, n_legit + 4):
+        size = int(rng.integers(8, 15))
+        members = rng.choice(len(accts), size=size, replace=False)
+        organizer = members[0]
+        contrib = float(rng.uniform(10_000, 60_000))
+        start = t0 + pd.Timedelta(days=int(rng.integers(0, 10)))
+        gid = f"AJO{g:03d}"
+        n_weeks = int(rng.integers(5, 9))
+        for w in range(n_weeks):
+            if 7 * w > span_days:
+                break
+            pay_day = start + pd.Timedelta(days=7 * w, hours=int(rng.integers(9, 20)))
+            for m in members[1:]:
+                rows.append(_row(m, organizer, pay_day + pd.Timedelta(
+                    minutes=int(rng.integers(0, 240))),
+                    contrib * (1 + 0.15 * w) * rng.uniform(0.9, 1.1),
+                    gid, 1, "fake_ajo_ponzi"))
+            if w < 2:  # seeded "returns" to early slots, from the organizer
+                lucky = members[1 + w]
+                rows.append(_row(organizer, lucky, pay_day + pd.Timedelta(hours=2),
+                                 contrib * size * rng.uniform(0.5, 0.8),
+                                 gid, 1, "fake_ajo_ponzi"))
+
+    if rows:
+        txns = pd.concat([txns, pd.DataFrame(rows)], ignore_index=True)
+    txns = _inject_cultural_masquerades(txns, accts, rng)
+    txns = _add_legit_cultural_flows(txns, accts, rng)
+    return txns.sort_values("ts").reset_index(drop=True)
+
+
+# The five culturally-specific fraud typologies (domain source: uploaded
+# NIGERIAN_CULTURAL_FRAUD_PATTERNS_* documents) — fraud masquerading as
+# cultural norms. Each is emitted in two documented variants.
+CULTURAL_MASQUERADE_TYPOLOGIES = [
+    "ceremony_exploitation",      # fake wedding contributions / phantom
+                                  # chieftaincy title ceremony levies
+    "religious_manipulation",     # fake building-fund drives / fraudulent
+                                  # Hajj savings schemes
+    "family_obligation_abuse",    # fake medical-emergency diaspora appeals /
+                                  # false school-fees claims
+    "business_practice_abuse",    # fake igba-boi apprenticeship schemes /
+                                  # fraudulent cooperative-ajo "investment"
+    "authority_status_abuse",     # fake traditional-ruler land allocation /
+                                  # fraudulent political campaign collections
+]
+
+
+def _masq_row(rng, cust, cid, sender, receiver, ts, amount, typology, channel):
+    return dict(
+        txn_id=f"CM{rng.integers(1e8):08d}", ts=ts,
+        sender_id=cid[sender], receiver_id=cid[receiver],
+        amount_ngn=float(_kobo_round(amount)), channel=channel,
+        sender_bank=cust["bank"].iloc[sender],
+        receiver_bank=cust["bank"].iloc[receiver],
+        sender_state=cust["state"].iloc[sender],
+        receiver_state=cust["state"].iloc[receiver],
+        device_os=cust["device_os"].iloc[sender],
+        hour=int(ts.hour), dow=int(ts.dayofweek),
+        is_month_end=int(25 <= ts.day <= 31),
+        is_market_day=int(ts.dayofweek in MARKET_DAYS),
+        is_fraud=1, fraud_typology=typology,
+        device_emulator=0, sim_swap_7d=0, new_device=1,
+        is_salary_credit=0, cultural_event="", ajo_group_id="",
+        is_local_market_day=0,
+    )
+
+
+def _inject_cultural_masquerades(txns: pd.DataFrame, accts: pd.DataFrame,
+                                 rng: np.random.Generator) -> pd.DataFrame:
+    """Fraud rings exploiting the five cultural fraud typologies.
+
+    Honest labels (is_fraud=1, exact — injected after the label-noise step,
+    same convention as ajo rows). Timing tied to the cultural calendar
+    (ceremony/authority scams cluster in festive windows; Hajj schemes in
+    the pre-Ramadan/Eid savings season; campaign collections near political
+    season). Social-structure patterns: one collector receiving from many
+    socially-pressured victims (broadcast-list fan-in), diaspora-corridor
+    amounts on web channel.
+    """
+    n = len(accts)
+    cust = accts.set_index("customer_id")
+    cid = accts["customer_id"].to_numpy()
+    t0 = txns["ts"].min()
+    rows = []
+
+    def pick_window(prefer_festive: bool) -> pd.Timestamp:
+        if prefer_festive:
+            # sample a day inside one of the festive windows (mapped into
+            # the generation year); ceremony/authority scams cluster there
+            _, start, end, _ = FESTIVE_WINDOWS[int(rng.integers(len(FESTIVE_WINDOWS)))]
+            year = t0.year
+            s = pd.Timestamp(year, start[0], start[1])
+            e = pd.Timestamp(year, end[0], end[1])
+            if e < s:  # year wrap
+                e = pd.Timestamp(year + 1, end[0], end[1])
+            return s + pd.Timedelta(days=float(rng.uniform(0, max((e - s).days, 0))),
+                                    hours=int(rng.integers(9, 21)))
+        return t0 + pd.Timedelta(days=int(rng.integers(0, 150)),
+                                 hours=int(rng.integers(9, 21)))
+
+    def fanin(collector, n_victims, amount_lo, amount_hi, typology, ts,
+              channel_pool=("nip", "mobile_app")):
+        for _ in range(n_victims):
+            victim = int(rng.integers(n))
+            if victim == collector:
+                continue
+            rows.append(_masq_row(
+                rng, cust, cid, victim, collector,
+                ts + pd.Timedelta(hours=int(rng.integers(0, 72))),
+                float(rng.uniform(amount_lo, amount_hi)), typology,
+                str(rng.choice(list(channel_pool)))))
+
+    # 1. ceremony_exploitation: (a) fake wedding contributions ~N2.5M scale,
+    #    festive-season fan-in; (b) phantom chieftaincy title levies, large
+    #    diaspora-corridor amounts (web channel)
+    c = int(rng.integers(n)); fanin(c, int(rng.integers(5, 9)), 400_000, 2_800_000,
+                                    "ceremony_exploitation", pick_window(True))
+    c = int(rng.integers(n)); fanin(c, int(rng.integers(2, 5)), 3_000_000, 12_000_000,
+                                    "ceremony_exploitation", pick_window(True),
+                                    channel_pool=("web",))
+    # 2. religious_manipulation: (a) fake building-fund drives (Sunday-peak
+    #    small-medium fan-in); (b) fraudulent Hajj savings (weekly
+    #    "installments", Friday peak, sub-official-price lure)
+    c = int(rng.integers(n))
+    sun = t0 + pd.Timedelta(days=int((6 - t0.dayofweek) % 7), hours=11)
+    fanin(c, int(rng.integers(8, 15)), 5_000, 250_000,
+          "religious_manipulation", sun + pd.Timedelta(weeks=int(rng.integers(0, 20))))
+    c = int(rng.integers(n))
+    fri = t0 + pd.Timedelta(days=int((4 - t0.dayofweek) % 7), hours=13)
+    for w in range(int(rng.integers(4, 8))):
+        fanin(c, int(rng.integers(3, 6)), 150_000, 650_000,
+              "religious_manipulation", fri + pd.Timedelta(weeks=int(w)))
+    # 3. family_obligation_abuse: (a) fake medical-emergency diaspora appeals
+    #    (urgent, web, large); (b) false school-fees claims (term-start
+    #    months: Jan/Sep-ish, medium amounts)
+    c = int(rng.integers(n)); fanin(c, int(rng.integers(2, 4)), 500_000, 3_500_000,
+                                    "family_obligation_abuse", pick_window(False),
+                                    channel_pool=("web", "nip"))
+    c = int(rng.integers(n)); fanin(c, int(rng.integers(3, 6)), 150_000, 850_000,
+                                    "family_obligation_abuse", pick_window(False))
+    # 4. business_practice_abuse: (a) fake igba-boi apprenticeship upfront
+    #    "training/setup" payments (culturally inverted: real apprenticeship
+    #    does not require upfront payment); (b) fraudulent cooperative /
+    #    ajo-esusu "investment" with promised returns (recruiter fan-in)
+    c = int(rng.integers(n)); fanin(c, int(rng.integers(3, 6)), 800_000, 2_200_000,
+                                    "business_practice_abuse", pick_window(False))
+    c = int(rng.integers(n))
+    base = pick_window(False)
+    for w in range(int(rng.integers(3, 6))):
+        fanin(c, int(rng.integers(3, 7)), 50_000, 500_000,
+              "business_practice_abuse", base + pd.Timedelta(weeks=int(w)))
+    # 5. authority_status_abuse: (a) fake traditional-ruler land allocation
+    #    fees (large); (b) fraudulent political/campaign collections
+    #    (many small, festive-season adjacent)
+    c = int(rng.integers(n)); fanin(c, int(rng.integers(2, 4)), 1_500_000, 8_000_000,
+                                    "authority_status_abuse", pick_window(False))
+    c = int(rng.integers(n)); fanin(c, int(rng.integers(8, 14)), 20_000, 450_000,
+                                    "authority_status_abuse", pick_window(True))
+
+    if rows:
+        txns = pd.concat([txns, pd.DataFrame(rows)], ignore_index=True)
+    return txns
+
+
+def _add_legit_cultural_flows(txns: pd.DataFrame, accts: pd.DataFrame,
+                              rng: np.random.Generator) -> pd.DataFrame:
+    """Legitimate cultural flows (is_fraud=0): religious giving with the
+    Friday/Sunday weekly rhythm, and family-support remittances — the
+    baseline communal finance the masquerades hide inside."""
+    n = len(accts)
+    cust = accts.set_index("customer_id")
+    cid = accts["customer_id"].to_numpy()
+    t0, t1 = txns["ts"].min(), txns["ts"].max()
+    span_weeks = max((t1 - t0).days // 7, 4)
+    n_give = max(20, int(0.015 * len(txns)))
+    rows = []
+    for _ in range(n_give):
+        sender = int(rng.integers(n))
+        receiver = int(rng.integers(n))
+        if receiver == sender:
+            continue
+        # Friday (mosque) / Sunday (church) giving peaks, zone-level only
+        peak = 4 if rng.random() < 0.45 else 6
+        wk = int(rng.integers(0, span_weeks))
+        ts = t0 + pd.Timedelta(days=int((peak - t0.dayofweek) % 7) + 7 * wk,
+                               hours=int(rng.integers(8, 14)))
+        if ts > t1:
+            continue
+        rows.append(dict(
+            txn_id=f"GV{rng.integers(1e8):08d}", ts=ts,
+            sender_id=cid[sender], receiver_id=cid[receiver],
+            amount_ngn=float(_kobo_round(rng.uniform(500, 60_000))),
+            channel=str(rng.choice(["nip", "ussd", "mobile_app"])),
+            sender_bank=cust["bank"].iloc[sender],
+            receiver_bank=cust["bank"].iloc[receiver],
+            sender_state=cust["state"].iloc[sender],
+            receiver_state=cust["state"].iloc[receiver],
+            device_os=cust["device_os"].iloc[sender],
+            hour=int(ts.hour), dow=int(ts.dayofweek),
+            is_month_end=int(25 <= ts.day <= 31),
+            is_market_day=int(ts.dayofweek in MARKET_DAYS),
+            is_fraud=0, fraud_typology="religious_giving",
+            device_emulator=0, sim_swap_7d=0, new_device=0,
+            is_salary_credit=0, cultural_event="weekly_giving",
+            ajo_group_id="", is_local_market_day=0,
+        ))
+    # hometown family-support remittances (moderate, recurring feel)
+    for _ in range(max(10, int(0.006 * len(txns)))):
+        sender = int(rng.integers(n))
+        receiver = int(rng.integers(n))
+        if receiver == sender:
+            continue
+        ts = t0 + pd.Timedelta(days=int(rng.integers(0, max((t1 - t0).days, 1))),
+                               hours=int(rng.integers(8, 20)))
+        rows.append(dict(
+            txn_id=f"FS{rng.integers(1e8):08d}", ts=ts,
+            sender_id=cid[sender], receiver_id=cid[receiver],
+            amount_ngn=float(_kobo_round(rng.uniform(10_000, 300_000))),
+            channel="nip",
+            sender_bank=cust["bank"].iloc[sender],
+            receiver_bank=cust["bank"].iloc[receiver],
+            sender_state=cust["state"].iloc[sender],
+            receiver_state=cust["state"].iloc[receiver],
+            device_os=cust["device_os"].iloc[sender],
+            hour=int(ts.hour), dow=int(ts.dayofweek),
+            is_month_end=int(25 <= ts.day <= 31),
+            is_market_day=int(ts.dayofweek in MARKET_DAYS),
+            is_fraud=0, fraud_typology="family_support",
+            device_emulator=0, sim_swap_7d=0, new_device=0,
+            is_salary_credit=0, cultural_event="family_support",
+            ajo_group_id="", is_local_market_day=0,
+        ))
+    if rows:
+        txns = pd.concat([txns, pd.DataFrame(rows)], ignore_index=True)
+    return txns
+
+
+# --------------------------------------------------------------------------
 # Feature engineering
 # --------------------------------------------------------------------------
 
@@ -759,6 +1175,7 @@ def main(out_dir: str = "ml/data/generated", n_customers: int = 4000,
     txns = generate_transactions(accts, rng, n_txns=n_txns)
     txns = inject_fraud(txns, accts, networks, rng)
     txns = add_salary_credits(txns, accts, rng)
+    txns = add_cultural_patterns(txns, accts, rng)
     txns = add_channel_semantics(txns, accts, rng)
     txns = add_label_lag(txns, rng)
     txns = add_behavioral_features(txns)
@@ -792,6 +1209,7 @@ def main(out_dir: str = "ml/data/generated", n_customers: int = 4000,
              test_mask=_node_mask(accts, txns, "test"))
     meta = dict(
         seed=seed, dataset_version=DATASET_VERSION,
+        cultural_patterns_version=CULTURAL_PATTERNS_VERSION,
         n_customers=len(accts), n_txns=len(txns),
         fraud_rate=float(txns["is_fraud"].mean()),
         fraud_typologies=txns[txns["is_fraud"] == 1]["fraud_typology"]
@@ -801,6 +1219,15 @@ def main(out_dir: str = "ml/data/generated", n_customers: int = 4000,
         split_counts=pd.Series(split).value_counts().to_dict(),
         n_agents=int(accts["is_agent"].sum()),
         salary_credits=int(txns["is_salary_credit"].sum()),
+        ajo_groups=int(txns["ajo_group_id"].ne("").sum() > 0 and
+                       txns.loc[txns["ajo_group_id"].ne(""), "ajo_group_id"].nunique() or 0),
+        ajo_txns=int(txns["ajo_group_id"].ne("").sum()),
+        cultural_masquerade_txns=int(txns["fraud_typology"].isin(
+            CULTURAL_MASQUERADE_TYPOLOGIES).sum()),
+        legit_cultural_flow_txns=int(txns["fraud_typology"].isin(
+            ["ajo_contribution", "religious_giving", "family_support"]).sum()),
+        festive_txns=int(txns["cultural_event"].isin(
+            [w[0] for w in FESTIVE_WINDOWS]).sum()),
         agent_txns=int((txns["channel"] == "agent").sum()),
         pos_txns=int((txns["channel"] == "pos").sum()),
         ussd_txns=int((txns["channel"] == "ussd").sum()),
