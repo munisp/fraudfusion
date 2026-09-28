@@ -16,6 +16,14 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY app /app/app
 COPY data/watchlist.json /app/data/watchlist.json
 
+# The document-verification engine (services/python/doc-verification) lives
+# OUTSIDE this build context. To ship it in the image, build from the
+# services/python context and add:
+#   COPY doc-verification /app/doc-verification
+#   ENV DOCVERIFICATION_PATH=/app/doc-verification
+# Without it, document/biometric endpoints fall back to the honest
+# "not performed / unavailable" responses (nothing is fabricated).
+
 RUN groupadd --system app && useradd --system --gid app app \
     && mkdir -p /app/data && chown -R app:app /app
 USER app:app

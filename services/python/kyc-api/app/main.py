@@ -11,9 +11,13 @@ Backed by:
   - Sanctions screening: local watchlist (DB table or JSON seed file)
   - BVN/NIN: format + luhn-style validation; registries reported unavailable
   - Credit bureau: adapter interface; default adapter reports unavailable
-  - Biometric/document: honest capability reporting (no face-match/liveness/
-    OCR model configured => performed=false / status=unavailable, never
-    fabricated scores)
+  - Document verification: layered engine in services/python/doc-verification
+    (wired via app/docverification.py) — real local cv2 forensics (blur/glare/
+    moire FFT/border/texture) always run for image payloads; PaddleOCR,
+    docling, and an ollama vision model are lazy OPTIONAL backends; every
+    layer reports ran/unavailable provenance, nothing is fabricated
+  - Biometric: OpenKYC-compatible remote IDV (IDV_SERVER_URL) performs real
+    face-match/liveness when configured; otherwise honest not-performed
 
 Auth: fail-closed Keycloak introspection (app/auth.py).
 Schema: database/20260827_pep_kyb_merchant.sql (pep_list, watchlist);
@@ -24,6 +28,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -33,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 
-from app import bureau, counterparty, identity, phone_tenure, screening, tiers
+from app import bureau, counterparty, docverification, identity, phone_tenure, screening, tiers
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db
 from app.schemas import (
@@ -305,9 +310,71 @@ def _decode_base64_image(value: str, field: str) -> bytes:
     return data
 
 
+def _idv_payload(call_result: dict) -> dict | None:
+    """Extract the first result object from an OpenKYC-compatible call
+    response (the Gradio shape returns a list of outputs)."""
+    result = call_result.get("result")
+    if isinstance(result, list) and result and isinstance(result[0], dict):
+        return result[0]
+    if isinstance(result, dict):
+        return result
+    return None
+
+
+def _idv_liveness_result(call_result: dict) -> dict:
+    """Map an OpenKYC-compatible face_liveness_base64 response onto the
+    kyc-api liveness schema. Unknown remote schemas are surfaced raw with an
+    explicit note — never guessed."""
+    base = {"adapter": call_result.get("adapter"),
+            "source": call_result.get("source")}
+    if call_result.get("status") != "ok":
+        return {"performed": False, "result": "not_evaluated",
+                "reason": call_result.get("reason",
+                                          "remote liveness call failed"), **base}
+    payload = _idv_payload(call_result)
+    if payload is None:
+        return {"performed": True, "result": "evaluated",
+                "raw_result": call_result.get("result"),
+                "reason": "remote response schema not mapped; raw result "
+                          "included for manual review", **base}
+    score = payload.get("liveness_score", payload.get("score",
+                        payload.get("confidence")))
+    is_live = payload.get("is_live", payload.get("liveness"))
+    if isinstance(is_live, str):
+        is_live = is_live.strip().lower() in ("live", "real", "true")
+    result = ("live" if is_live else "spoof") if is_live is not None else "evaluated"
+    return {"performed": True, "result": result,
+            "score": score, "raw_result": payload, **base}
+
+
+def _idv_face_match_result(call_result: dict) -> dict:
+    """Map an OpenKYC-compatible compare_face_base64 response onto the
+    kyc-api face_match schema."""
+    base = {"adapter": call_result.get("adapter"),
+            "source": call_result.get("source")}
+    if call_result.get("status") != "ok":
+        return {"performed": False, "score": None, "match": None,
+                "reason": call_result.get("reason",
+                                          "remote face-match call failed"), **base}
+    payload = _idv_payload(call_result)
+    if payload is None:
+        return {"performed": True, "score": None, "match": None,
+                "raw_result": call_result.get("result"),
+                "reason": "remote response schema not mapped; raw result "
+                          "included for manual review", **base}
+    score = payload.get("similarity", payload.get("score",
+                        payload.get("confidence")))
+    match = payload.get("match", payload.get("is_same_person"))
+    return {"performed": True, "score": score, "match": match,
+            "raw_result": payload, **base}
+
+
 def _biometric_response(selfie: bytes, reference: bytes | None, check_liveness: bool) -> dict:
-    """Honest biometric response: no face-match or liveness model is deployed,
-    so nothing is fabricated — every probe reports its true status."""
+    """Biometric verification: when an OpenKYC-compatible IDV server is
+    configured (IDV_SERVER_URL) the face-match/liveness probes are REALLY
+    performed remotely and carry adapter/source provenance. Without one,
+    nothing is fabricated — every probe reports its true status and the
+    capture routes to manual review."""
     selfie_kind = _sniff_type(selfie)
     results = {
         "verification_id": uuid.uuid4().hex,
@@ -332,9 +399,49 @@ def _biometric_response(selfie: bytes, reference: bytes | None, check_liveness: 
     if selfie_kind == "unknown":
         results["status"] = "rejected"
         results["rejection_reason"] = "selfie is not a recognizable image format"
-    elif reference is not None:
+        return results
+    if reference is not None:
         results["reference_format"] = _sniff_type(reference)
+
+    idv = (docverification.get_idv_adapter()
+           if docverification.DOCVERIFICATION_AVAILABLE else None)
+    if idv is None or not idv.available:
+        return results
+
+    # Liveness probe on the selfie.
+    if check_liveness:
+        results["liveness"] = _idv_liveness_result(
+            idv.face_liveness_base64(selfie))
+    # Face match against the reference document portrait.
+    if reference is not None:
+        results["face_match"] = _idv_face_match_result(
+            idv.compare_face_base64(selfie, reference))
+
+    liveness = results["liveness"]
+    face_match = results["face_match"]
+    if liveness.get("performed") and liveness.get("result") == "spoof":
+        results["status"] = "rejected"
+        results["rejection_reason"] = "liveness probe reported a spoof"
+    elif face_match.get("performed") and face_match.get("match") is False:
+        results["status"] = "rejected"
+        results["rejection_reason"] = "face does not match the reference portrait"
+    elif (face_match.get("performed") and face_match.get("match") is True
+          and (not check_liveness or liveness.get("result") == "live")):
+        results["status"] = "verified"
     return results
+
+
+def _is_image_kind(kind: str) -> bool:
+    return kind in ("jpeg", "png", "gif", "webp")
+
+
+def _cv_forgery_analysis(data: bytes, kind: str) -> dict | None:
+    """Run the local cv2 integrity layer on image payloads. Returns None when
+    the payload is not an image or the engine is unavailable — callers keep
+    the honest structural-only response in that case."""
+    if not (_is_image_kind(kind) and docverification.DOCVERIFICATION_AVAILABLE):
+        return None
+    return docverification.local_cv.analyze_document_image(data)
 
 
 def _document_checks(data: bytes, document_type: str, check_forgery: bool) -> dict:
@@ -352,6 +459,28 @@ def _document_checks(data: bytes, document_type: str, check_forgery: bool) -> di
                   "only — document routed to manual review",
         "structural_checks": checks,
     } if check_forgery else {"performed": False, "reason": "check_forgery=false"}
+
+    if check_forgery:
+        analysis = _cv_forgery_analysis(data, kind)
+        if analysis is not None and analysis["decode_ok"]:
+            # Real cv2 integrity analysis ran: moire (screen-replay), border
+            # and texture signals. confidence = screen-replay integrity —
+            # i.e. confidence that this is NOT a photograph of a screen.
+            replay = analysis["screen_replay_integrity"]
+            forgery = {
+                "performed": True,
+                "forgery_detected": replay is not None
+                and replay < docverification.pipeline.SCREEN_REPLAY_REJECT_THRESHOLD,
+                "confidence": replay,
+                "reason": "local cv2 integrity analysis (moire FFT, border, "
+                          "colour texture) performed; deep ML forgery model "
+                          "not configured",
+                "cv_analysis": analysis,
+                "structural_checks": checks,
+            }
+        elif analysis is not None:
+            forgery["reason"] = ("document bytes could not be decoded as an "
+                                 "image; structural checks only")
     return {
         "document_type": document_type,
         "detected_format": kind,
@@ -360,6 +489,41 @@ def _document_checks(data: bytes, document_type: str, check_forgery: bool) -> di
         "forgery": forgery,
         "structurally_valid": all(c["passed"] for c in checks),
     }
+
+
+def _persist_document_verdict(db: Database, result: dict, data: bytes,
+                              principal: Principal) -> None:
+    """Audit-trail persistence for document verdicts (canonical PG schema:
+    database/20260929_doc_verification.sql). Hash-only: the raw document is
+    NEVER stored, just its SHA-256, the verdict status, and the per-layer
+    provenance so a reviewer can see exactly which layers ran."""
+    try:
+        pipeline_verdict = result.get("pipeline") or {}
+        db.execute(
+            "INSERT INTO document_verifications (id, actor_sub, document_type,"
+            " detected_format, sha256, size_bytes, status, quality,"
+            " screen_replay_integrity, printed_cutout_integrity,"
+            " provenance_json, reasons_json, created_at)"
+            " VALUES (:id, :actor, :dt, :fmt, :sha, :sz, :st, :q, :sri, :pci,"
+            " :prov, :reasons, :now)",
+            {
+                "id": result["verification_id"], "actor": principal.sub,
+                "dt": result["document_type"], "fmt": result["detected_format"],
+                "sha": hashlib.sha256(data).hexdigest(),
+                "sz": result["size_bytes"], "st": result["status"],
+                "q": pipeline_verdict.get("quality"),
+                "sri": (pipeline_verdict.get("authenticity") or {}).get(
+                    "screen_replay_integrity"),
+                "pci": (pipeline_verdict.get("authenticity") or {}).get(
+                    "printed_cutout_integrity"),
+                "prov": json.dumps(pipeline_verdict.get("provenance", [])),
+                "reasons": json.dumps(pipeline_verdict.get("reasons", [])),
+                "now": result["timestamp"],
+            },
+        )
+    except Exception as exc:  # persistence must never break verification
+        logger.error("document verdict persistence failed (id=%s): %s",
+                     result.get("verification_id"), exc)
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +831,7 @@ def create_app() -> FastAPI:
         principal: Principal = Depends(get_current_principal),
     ) -> dict:
         data = await _read_upload(image)
-        return {
+        response = {
             "check_id": uuid.uuid4().hex,
             "image_format": _sniff_type(data),
             "performed": False,
@@ -676,6 +840,11 @@ def create_app() -> FastAPI:
                       "to manual review",
             "timestamp": _now(),
         }
+        idv = (docverification.get_idv_adapter()
+               if docverification.DOCVERIFICATION_AVAILABLE else None)
+        if idv is not None and idv.available:
+            response.update(_idv_liveness_result(idv.face_liveness_base64(data)))
+        return response
 
     @app.post("/api/v1/biometric/face-match")
     async def biometric_face_match(
@@ -685,7 +854,7 @@ def create_app() -> FastAPI:
     ) -> dict:
         data1 = await _read_upload(image1)
         data2 = await _read_upload(image2)
-        return {
+        response = {
             "match_id": uuid.uuid4().hex,
             "performed": False,
             "match": None,
@@ -696,6 +865,12 @@ def create_app() -> FastAPI:
                       "service wired); routed to manual review",
             "timestamp": _now(),
         }
+        idv = (docverification.get_idv_adapter()
+               if docverification.DOCVERIFICATION_AVAILABLE else None)
+        if idv is not None and idv.available:
+            response.update(_idv_face_match_result(
+                idv.compare_face_base64(data1, data2)))
+        return response
 
     # ------------------------- Document ------------------------------------
 
@@ -705,14 +880,26 @@ def create_app() -> FastAPI:
         document_type: str = Form(...),
         check_forgery: bool = Form(default=True),
         principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
     ) -> dict:
         data = await _read_upload(document)
         result = _document_checks(data, document_type, check_forgery)
         result["verification_id"] = uuid.uuid4().hex
-        result["status"] = (
-            "manual_review" if result["structurally_valid"] else "rejected"
-        )
+        kind = result["detected_format"]
+        if _is_image_kind(kind) and docverification.DOCVERIFICATION_AVAILABLE:
+            # Full layered pipeline: local cv2 forensics -> OCR (when
+            # available) -> VLM structured extraction (when available), with
+            # per-layer provenance. The pipeline status drives the verdict.
+            verdict = docverification.pipeline.verify_document(
+                data, document_type, docverification.build_backends())
+            result["pipeline"] = verdict
+            result["status"] = verdict["status"]
+        else:
+            result["status"] = (
+                "manual_review" if result["structurally_valid"] else "rejected"
+            )
         result["timestamp"] = _now()
+        _persist_document_verdict(db, result, data, principal)
         return result
 
     @app.post("/api/v1/document/ocr")
@@ -722,15 +909,60 @@ def create_app() -> FastAPI:
         principal: Principal = Depends(get_current_principal),
     ) -> dict:
         data = await _read_upload(document)
-        return {
+        kind = _sniff_type(data)
+        response = {
             "document_type": document_type,
-            "detected_format": _sniff_type(data),
+            "detected_format": kind,
             "status": "unavailable",
             "extracted_fields": {},
             "reason": "OCR engine not configured (no Tesseract/OCR service "
                       "wired for this deployment)",
             "timestamp": _now(),
         }
+        if not docverification.DOCVERIFICATION_AVAILABLE:
+            response["reason"] = docverification.DOCVERIFICATION_UNAVAILABLE_REASON
+            return response
+
+        backends = docverification.build_backends()
+        if kind == "pdf":
+            parsed = docverification.pipeline.verify_pdf(data, backends)
+            response["provenance"] = parsed["provenance"]
+            if parsed["status"] == "ok":
+                response.update(status="ok", reason=None,
+                                text_blocks=parsed.get("blocks", []),
+                                tables=parsed.get("tables", []))
+            else:
+                response["reason"] = parsed.get("reason")
+            return response
+
+        if _is_image_kind(kind):
+            reasons = []
+            if backends.ocr.available:
+                ocr_result = backends.ocr.ocr(data)
+                if ocr_result["status"] == "ok":
+                    response.update(status="ok", reason=None,
+                                    text_lines=ocr_result["lines"],
+                                    adapter=ocr_result["adapter"])
+                    return response
+                reasons.append(f"ocr: {ocr_result.get('reason')}")
+            else:
+                reasons.append(f"ocr: {backends.ocr.unavailable_reason}")
+            if backends.vlm.available:
+                vlm_result = backends.vlm.extract(data, document_type)
+                if vlm_result["status"] == "ok":
+                    response.update(status="ok", reason=None,
+                                    extracted_fields=vlm_result["fields"],
+                                    adapter=vlm_result["adapter"],
+                                    model=vlm_result.get("model"))
+                    return response
+                reasons.append(f"vlm: {vlm_result.get('reason')}")
+            else:
+                reasons.append(f"vlm: {backends.vlm.unavailable_reason}")
+            response["reason"] = "; ".join(reasons)
+            return response
+
+        response["reason"] = "payload is neither an image nor a PDF"
+        return response
 
     @app.post("/api/v1/document/forgery-check")
     async def document_forgery_check(
@@ -756,7 +988,7 @@ def create_app() -> FastAPI:
             issues.append("unrecognized or corrupt file format")
         if len(data) < 1024:
             issues.append("file suspiciously small (<1KB) — likely unreadable scan")
-        return {
+        response = {
             "check_id": uuid.uuid4().hex,
             "detected_format": kind,
             "size_bytes": len(data),
@@ -764,6 +996,23 @@ def create_app() -> FastAPI:
             "issues": issues,
             "timestamp": _now(),
         }
+        # Real cv2 quality scoring for image payloads: blur (Laplacian
+        # variance), glare, resolution floor — the composite quality and the
+        # per-signal scores are reported with provenance.
+        analysis = _cv_forgery_analysis(data, kind)
+        if analysis is not None and analysis["decode_ok"]:
+            response["quality"] = analysis["quality"]
+            response["issues"] = sorted(set(issues) |
+                                        set(analysis["verdict_reasons"]))
+            response["quality_scores"] = analysis["quality_scores"]
+            response["screen_replay_integrity"] = \
+                analysis["screen_replay_integrity"]
+            response["analysis_layer"] = "local_cv"
+        elif analysis is not None:
+            response["quality"] = "poor"
+            response["issues"] = sorted(set(issues) |
+                                        set(analysis["verdict_reasons"]))
+        return response
 
     # ------------------------- Screening -----------------------------------
 

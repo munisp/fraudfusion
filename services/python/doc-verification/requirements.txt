@@ -1,0 +1,23 @@
+# Core local_cv layer — always required, no ML deps.
+opencv-python-headless>=4.8
+numpy>=1.26
+# HTTP adapters (ollama VLM, OpenKYC-compatible IDV).
+httpx==0.28.1
+
+# ---------------------------------------------------------------------------
+# OPTIONAL heavy backends — lazy-loaded at runtime; the service and its tests
+# work WITHOUT these installed. Install only in deployments that need them:
+#
+#   paddleocr + paddlepaddle   local OCR (PaddleOCRAdapter). Large install;
+#                              follow https://github.com/PaddlePaddle/PaddleOCR
+#                              for the paddlepaddle wheel matching your CPU/GPU.
+#                              Kill-switch env: PADDLEOCR_ENABLED=false.
+#   docling                    PDF layout parsing (DoclingAdapter). NOTE: its
+#                              pipeline downloads models from HuggingFace on
+#                              first use — blocked in network-restricted
+#                              deployments, where the adapter reports
+#                              status="unavailable" honestly.
+#
+# pip install paddleocr paddlepaddle
+# pip install docling
+# ---------------------------------------------------------------------------

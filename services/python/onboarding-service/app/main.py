@@ -30,6 +30,7 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query, status
 
 import json
 
+from app import kyb_verification
 from app.auth import Principal, get_current_principal, require_admin
 from app.db import Database, get_db
 from app.schemas import (
@@ -42,7 +43,9 @@ from app.schemas import (
     ChecklistUpdate,
     KybApplicationPage,
     KybApplicationView,
+    KybReverifyRequest,
     KybSubmission,
+    KybVerificationSummary,
     KycTierSelection,
     MerchantApplicationPage,
     MerchantApplicationView,
@@ -459,6 +462,30 @@ def create_app() -> FastAPI:
 
     # --------------------- KYB submissions (dual control) -----------------
 
+    def _parse_verdict(raw) -> dict | None:
+        """verification_json is TEXT on SQLite (str) and JSONB on Postgres
+        (psycopg hands back a dict) — accept both."""
+        if not raw:
+            return None
+        if isinstance(raw, dict):
+            return raw
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _kyb_verification_summary(row: dict) -> KybVerificationSummary | None:
+        verdict = _parse_verdict(row.get("verification_json"))
+        if verdict is None:
+            return None
+        verified_at = row.get("verified_at") or verdict.get("verified_at")
+        return KybVerificationSummary(
+            verdict=verdict.get("verdict", "unknown"),
+            verifiedAt=str(verified_at) if verified_at else None,
+            engines=verdict.get("provenance", {}).get("engines", []),
+            documentsWithContent=verdict.get("documents_with_content", 0),
+        )
+
     def _kyb_view(row: dict) -> KybApplicationView:
         return KybApplicationView(
             applicationId=row["id"], businessName=row["business_name"],
@@ -467,7 +494,48 @@ def create_app() -> FastAPI:
             reviewedBy=row.get("reviewed_by"), approvedBy=row.get("approved_by"),
             rejectionReason=row.get("rejection_reason"),
             createdAt=str(row.get("created_at") or ""),
+            verification=_kyb_verification_summary(row),
         )
+
+    def _process_kyb_documents(documents) -> tuple[list[dict], list[dict]]:
+        """Split submitted documents into (stored, verification) forms.
+
+        Stored form keeps only type/reference/content_sha256 — document bytes
+        are NEVER persisted or logged. Raises 413 over the 10MB cap (mirrors
+        kyc-api's MAX_UPLOAD_BYTES convention)."""
+        stored, for_verify = [], []
+        for d in documents:
+            sha = None
+            if d.content is not None:
+                data = base64.b64decode(d.content)  # base64 validated by schema
+                if len(data) > kyb_verification.MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413,
+                                        detail=f"{d.type} content exceeds 10MB limit")
+                sha = hashlib.sha256(data).hexdigest()
+            stored.append({"type": d.type, "reference": d.reference,
+                           "content_sha256": sha})
+            for_verify.append({"type": d.type, "reference": d.reference,
+                               "content": d.content})
+        return stored, for_verify
+
+    def _run_kyb_verification(db: Database, app_id: str, documents,
+                              business_name: str, cac_number: str) -> dict:
+        """Verify document content and persist the verdict on the row."""
+        verdict = kyb_verification.verify_kyb_documents(
+            documents, business_name, cac_number)
+        db.execute(
+            # SQLite stores the verdict as plain TEXT; Postgres needs the
+            # explicit cast because psycopg binds str as text and text->jsonb
+            # has no implicit assignment cast.
+            ("UPDATE kyb_applications SET verification_json = :v,"
+             " verified_at = :t, updated_at = :t WHERE id = :id") if not db._is_pg else
+            ("UPDATE kyb_applications SET verification_json = CAST(:v AS JSONB),"
+             " verified_at = :t, updated_at = :t WHERE id = :id"),
+            {"v": json.dumps(verdict), "t": verdict["verified_at"], "id": app_id},
+        )
+        logger.info("kyb verification: id=%s verdict=%s docs_with_content=%d",
+                    app_id, verdict["verdict"], verdict["documents_with_content"])
+        return verdict
 
     def _merchant_view(row: dict) -> MerchantApplicationView:
         return MerchantApplicationView(
@@ -559,13 +627,21 @@ def create_app() -> FastAPI:
         principal: Principal = Depends(get_current_principal),
         db: Database = Depends(get_db),
     ) -> KybApplicationView:
+        stored_docs, verify_docs = _process_kyb_documents(payload.documents)
         row = _submit_application(db, principal, "kyb_applications", {
             "business_name": payload.business_name,
             "cac_number": payload.cac_number,
             "business_type": payload.business_type,
             "contact_email": payload.contact_email,
-            "documents": json.dumps([d.model_dump() for d in payload.documents]),
+            "documents": json.dumps(stored_docs),
         })
+        # Content verification runs only when at least one document carries
+        # content; reference-only submissions keep the historical behaviour
+        # (verification skipped honestly, no verdict row).
+        if any(d["content"] is not None for d in verify_docs):
+            _run_kyb_verification(db, row["id"], verify_docs,
+                                  payload.business_name, payload.cac_number)
+            row = _get_application(db, "kyb_applications", row["id"])
         logger.info("kyb submitted: id=%s business=%s by=%s", row["id"], row["business_name"], principal.sub)
         return _kyb_view(row)
 
@@ -605,6 +681,68 @@ def create_app() -> FastAPI:
         if row["submitted_by"] != principal.sub and not principal.is_admin:
             raise HTTPException(status_code=403, detail="not your application")
         return _kyb_view(row)
+
+    @app.get("/api/v1/onboarding/kyb/{app_id}/verification",
+             response_model_by_alias=True)
+    def get_kyb_verification(
+        app_id: str,
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> dict:
+        """Full KYB content-verification verdict (per-document verdicts,
+        extracted fields, cross-document consistency, engine provenance)."""
+        row = _get_application(db, "kyb_applications", app_id)
+        if row["submitted_by"] != principal.sub and not principal.is_admin:
+            raise HTTPException(status_code=403, detail="not your application")
+        verdict = _parse_verdict(row.get("verification_json"))
+        if verdict is None:
+            raise HTTPException(
+                status_code=404,
+                detail="no verification has run for this application "
+                       "(reference-only submission, or predates verification)")
+        return verdict
+
+    @app.post("/api/v1/onboarding/kyb/{app_id}/reverify",
+              response_model_by_alias=True)
+    def reverify_kyb(
+        app_id: str,
+        payload: KybReverifyRequest | None = None,
+        principal: Principal = Depends(get_current_principal),
+        db: Database = Depends(get_db),
+    ) -> dict:
+        """Re-run content verification, e.g. after resubmitting documents.
+
+        Document bytes are retained hash-only, so a re-run over new content
+        requires the resubmitted documents in the request body; with an empty
+        body the stored verdict is returned (a re-run over the original bytes
+        is impossible and we say so instead of pretending)."""
+        row = _get_application(db, "kyb_applications", app_id)
+        if row["submitted_by"] != principal.sub and not principal.is_admin:
+            raise HTTPException(status_code=403, detail="not your application")
+        docs = (payload.documents if payload else None) or []
+        if not docs:
+            verdict = _parse_verdict(row.get("verification_json"))
+            if verdict is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="no document content retained (hash-only storage); "
+                           "resubmit documents in the request body to re-verify")
+            verdict["reused_stored_verdict"] = True
+            verdict["note"] = ("document content is not retained; returning the "
+                               "stored verdict — supply documents to re-run")
+            return verdict
+        stored_docs, verify_docs = _process_kyb_documents(docs)
+        db.execute(
+            "UPDATE kyb_applications SET documents = :docs, updated_at = :now"
+            " WHERE id = :id",
+            {"docs": json.dumps(stored_docs), "now": _now(), "id": app_id},
+        )
+        if any(d["content"] is not None for d in verify_docs):
+            return _run_kyb_verification(db, app_id, verify_docs,
+                                         row["business_name"], row["cac_number"])
+        raise HTTPException(
+            status_code=422,
+            detail="resubmitted documents carry no content; nothing to verify")
 
     @app.post("/api/v1/onboarding/admin/kyb/{app_id}/review", response_model=KybApplicationView,
               response_model_by_alias=True)

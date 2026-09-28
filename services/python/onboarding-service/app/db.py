@@ -192,6 +192,14 @@ CREATE TABLE IF NOT EXISTS regulator_access (
 CREATE INDEX IF NOT EXISTS regulator_access_status_idx ON regulator_access (status);
 """
 
+# KYB document-content verification columns (canonical PG columns added by
+# database/20260929_kyb_verification.sql). Applied to the SQLite mirror via
+# guarded ALTER TABLE below so pre-existing dev databases upgrade in place.
+KYB_EXTRA_COLUMNS = {
+    "verification_json": "TEXT",   # full verdict JSON from app/kyb_verification.py
+    "verified_at": "TEXT",
+}
+
 _NAMED_PARAM = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")
 
 
@@ -222,6 +230,12 @@ class Database:
             self._conn.execute("PRAGMA foreign_keys = ON")
             with self._lock, self._conn:
                 self._conn.executescript(SQLITE_SCHEMA)
+                existing = {row["name"] for row in
+                            self._conn.execute("PRAGMA table_info(kyb_applications)").fetchall()}
+                for col, ddl in KYB_EXTRA_COLUMNS.items():
+                    if col not in existing:
+                        self._conn.execute(
+                            f"ALTER TABLE kyb_applications ADD COLUMN {col} {ddl}")
 
     def _pg_conn(self):
         # Fresh short-lived connection per call keeps the worker simple and

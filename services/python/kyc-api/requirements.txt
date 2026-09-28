@@ -7,3 +7,27 @@ python-multipart==0.0.20
 # PostgreSQL persistence; without DATABASE_URL the service uses a local
 # SQLite file (stdlib sqlite3) for local dev/tests.
 psycopg[binary]==3.2.3
+# Document-verification local cv2 layer (services/python/doc-verification,
+# wired via app/docverification.py). These power the real blur/glare/moire/
+# border analysis behind /api/v1/document/*.
+opencv-python-headless>=4.8
+numpy>=1.26
+
+# ---------------------------------------------------------------------------
+# OPTIONAL document-verification backends — lazy-loaded at runtime; the
+# service (and its tests) work WITHOUT these, reporting the corresponding
+# layer honestly unavailable. Install only in deployments that need them:
+#
+#   paddleocr + paddlepaddle   local OCR behind /api/v1/document/ocr.
+#                              Large install; follow the PaddleOCR docs for
+#                              the paddlepaddle wheel matching your CPU/GPU.
+#                              Kill-switch env: PADDLEOCR_ENABLED=false.
+#   docling                    PDF layout parsing behind /api/v1/document/ocr
+#                              for PDF uploads. NOTE: docling downloads models
+#                              from HuggingFace on first use — blocked in
+#                              network-restricted deployments (adapter then
+#                              reports status="unavailable" honestly).
+#
+# pip install paddleocr paddlepaddle
+# pip install docling
+# ---------------------------------------------------------------------------

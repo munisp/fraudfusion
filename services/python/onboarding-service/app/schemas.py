@@ -101,9 +101,37 @@ def _validate_cac(value: str) -> str:
     return normalized
 
 
+# Mirrors kyc-api's MAX_UPLOAD_BYTES convention (10MB per document). The
+# base64 envelope inflates bytes by ~4/3, so the raw string cap is slightly
+# above 13.3M chars; the exact decoded-size check (413) happens at intake in
+# app/main.py, the same place kyc-api enforces it.
+KYB_MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+KYB_MAX_CONTENT_CHARS = 14_000_000
+
+
 class KybDocument(BaseModel):
+    """One KYB supporting document. `reference` (e.g. an s3:// pointer) is
+    always required; `content` is an OPTIONAL base64-encoded copy of the
+    document bytes for automated verification. Content is never persisted or
+    logged — only its SHA-256 hash is stored alongside the reference."""
     type: Literal["cac_certificate", "memart", "utility_bill", "board_resolution"]
     reference: str = Field(min_length=1, max_length=500)
+    content: Optional[str] = Field(default=None, max_length=KYB_MAX_CONTENT_CHARS)
+
+    @field_validator("content")
+    @classmethod
+    def _content_is_base64(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        import base64
+        import binascii
+
+        try:
+            if not base64.b64decode(value, validate=True):
+                raise ValueError("content decodes to empty bytes")
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("content must be non-empty valid base64") from exc
+        return value
 
 
 class KybSubmission(BaseModel):
@@ -118,6 +146,25 @@ class KybSubmission(BaseModel):
     _cac = field_validator("cac_number")(_validate_cac)
 
 
+class KybReverifyRequest(BaseModel):
+    """Optional resubmitted documents for POST /kyb/{id}/reverify. Document
+    content is never retained (hash-only), so a content re-run requires the
+    documents to be supplied again here; an empty body just returns the
+    stored verdict."""
+    documents: list[KybDocument] = Field(default_factory=list)
+
+
+class KybVerificationSummary(BaseModel):
+    """Compact verdict summary embedded in KYB application views (the full
+    per-document verdict JSON is served by GET .../kyb/{id}/verification)."""
+    verdict: str  # verified | manual_review | rejected | engine_unavailable | skipped
+    verified_at: Optional[str] = Field(default=None, alias="verifiedAt")
+    engines: list[str] = Field(default_factory=list)
+    documents_with_content: int = Field(alias="documentsWithContent")
+
+    model_config = {"populate_by_name": True}
+
+
 class KybApplicationView(BaseModel):
     application_id: str = Field(alias="applicationId")
     business_name: str = Field(alias="businessName")
@@ -129,6 +176,7 @@ class KybApplicationView(BaseModel):
     approved_by: Optional[str] = Field(default=None, alias="approvedBy")
     rejection_reason: Optional[str] = Field(default=None, alias="rejectionReason")
     created_at: Optional[str] = Field(default=None, alias="createdAt")
+    verification: Optional[KybVerificationSummary] = None
 
     model_config = {"populate_by_name": True}
 

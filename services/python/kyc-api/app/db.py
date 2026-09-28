@@ -120,6 +120,29 @@ CREATE TABLE IF NOT EXISTS counterparty_rigor_registry (
     source_note      TEXT NOT NULL DEFAULT '',
     updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Document-verification audit trail (canonical PG:
+-- database/20260929_doc_verification.sql). HASH-ONLY: the raw document bytes
+-- are never persisted — sha256 + verdict + per-layer provenance only.
+CREATE TABLE IF NOT EXISTS document_verifications (
+    id                       TEXT PRIMARY KEY,
+    actor_sub                TEXT NOT NULL DEFAULT '',
+    document_type            TEXT NOT NULL,
+    detected_format          TEXT NOT NULL,
+    sha256                   TEXT NOT NULL,
+    size_bytes               INTEGER NOT NULL,
+    status                   TEXT NOT NULL
+                             CHECK (status IN ('verified', 'manual_review',
+                                               'rejected', 'unavailable')),
+    quality                  TEXT,
+    screen_replay_integrity  REAL,
+    printed_cutout_integrity REAL,
+    provenance_json          TEXT NOT NULL DEFAULT '[]',
+    reasons_json             TEXT NOT NULL DEFAULT '[]',
+    created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS document_verifications_sha_idx
+    ON document_verifications (sha256);
 """
 
 # Columns added to kyc_requests for re-KYC + backoffice override (fresh DBs
