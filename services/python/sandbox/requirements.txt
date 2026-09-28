@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.4
+httpx==0.28.1
+# Multipart form parsing for /api/v1/document/verify file uploads.
+python-multipart==0.0.20
+# EmailStr validation for the KYB submission schema (mirrors onboarding-service).
+email-validator==2.2.0

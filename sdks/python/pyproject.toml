@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fraudfusion"
+version = "0.1.0"
+description = "Official Python SDK for the FraudFusion API (KYC/KYB, fraud intelligence, webhooks)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "FraudFusion" }]
+keywords = ["fraud", "kyc", "kyb", "nigeria", "fraudfusion"]
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["fraudfusion*"]
+
+[tool.setuptools.package-data]
+fraudfusion = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

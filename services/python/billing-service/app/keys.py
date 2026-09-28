@@ -37,11 +37,17 @@ KEY_ENV = os.getenv("BILLING_KEY_ENV", "live")
 KEY_PREFIX = f"ffk_{KEY_ENV}_"
 
 
-def generate_key() -> tuple[str, str, str]:
-    """Return (plaintext, key_prefix, sha256_hex). Plaintext is shown once."""
+def generate_key(key_type: str = "live") -> tuple[str, str, str]:
+    """Return (plaintext, key_prefix, sha256_hex). Plaintext is shown once.
+
+    key_type "live" uses the deployment's BILLING_KEY_ENV prefix
+    (ffk_live_ / ffk_dev_); key_type "test" always mints an ffk_test_ key.
+    Test keys never meter revenue usage (see require_api_key)."""
+    env = "test" if key_type == "test" else KEY_ENV
+    prefix_head = f"ffk_{env}_"
     random_part = secrets.token_hex(16)  # 32 hex chars
-    plaintext = f"{KEY_PREFIX}{random_part}"
-    prefix = f"{KEY_PREFIX}{random_part[:8]}"
+    plaintext = f"{prefix_head}{random_part}"
+    prefix = f"{prefix_head}{random_part[:8]}"
     return plaintext, prefix, hash_key(plaintext)
 
 
@@ -158,11 +164,14 @@ class UsageBuffer:
         for event in batch:
             inserted = self._db.insert_idempotent(
                 "INSERT INTO usage_events "
-                "(id, tenant_id, api_key_id, service, operation, units, amount_kobo, idempotency_key, occurred_at) "
-                "VALUES (:id, :tenant_id, :api_key_id, :service, :operation, :units, :amount_kobo, :idem, :occurred_at)",
+                "(id, tenant_id, api_key_id, service, operation, units, amount_kobo, idempotency_key, occurred_at, environment) "
+                "VALUES (:id, :tenant_id, :api_key_id, :service, :operation, :units, :amount_kobo, :idem, :occurred_at, :environment)",
                 event,
             )
-            if inserted:
+            # Test-environment keys (ffk_test_) never meter revenue usage:
+            # the event is recorded for audit with amount_kobo=0 but is NOT
+            # folded into the billable usage_rollups.
+            if inserted and event.get("environment") != "test":
                 # Same upsert works on Postgres and SQLite: unqualified
                 # `units` on the RHS refers to the existing row's value.
                 self._db.execute(
@@ -242,6 +251,7 @@ def require_api_key(
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "rate limit exceeded")
 
     now = utcnow()
+    key_type = row.get("key_type") or "live"
     db.execute("UPDATE api_keys SET last_used_at = :now, updated_at = :now WHERE id = :id",
                {"now": now, "id": row["id"]})
     buffer.record({
@@ -251,9 +261,11 @@ def require_api_key(
         "service": "billing-gateway",
         "operation": operation,
         "units": 1,
-        "amount_kobo": 0,  # rated at invoice time against the plan
+        "amount_kobo": 0,  # rated at invoice time against the plan (live keys)
         "idem": f"key:{row['id']}:{now}",
         "occurred_at": now,
+        # ffk_test_ keys: audit-only usage, excluded from billable rollups.
+        "environment": "test" if key_type == "test" else "live",
     })
     row["scopes"] = _parse_scopes(row.get("scopes"))
     return row

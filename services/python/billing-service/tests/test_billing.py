@@ -364,6 +364,112 @@ def test_current_usage_estimated_bill(db):
     assert est["total_kobo"] == est["subtotal_kobo"] + est["vat_kobo"]
 
 
+# ---------------------------------------------------------------------------
+# Internal introspection endpoint (service-to-service)
+# ---------------------------------------------------------------------------
+
+def _introspect(client, key, token="tok"):
+    return client.post("/internal/api-keys/introspect", json={"key": key},
+                       headers={"X-Internal-Token": token})
+
+
+def test_introspect_fail_closed_when_token_unset(db, monkeypatch):
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "BILLING_INTERNAL_TOKEN", "")
+    client = make_client(db, TENANT_USER)
+    assert _introspect(client, "ffk_live_whatever").status_code == 503
+
+
+def test_introspect_wrong_token_401(db, monkeypatch):
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "BILLING_INTERNAL_TOKEN", "tok")
+    client = make_client(db, TENANT_USER)
+    assert _introspect(client, "ffk_live_whatever", token="wrong").status_code == 401
+    assert client.post("/internal/api-keys/introspect", json={"key": "ffk_live_x"}).status_code == 401
+
+
+def test_introspect_active_key_returns_metadata_never_raw(db, monkeypatch):
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "BILLING_INTERNAL_TOKEN", "tok")
+    client = make_client(db, TENANT_USER)
+    subscribe(client, "tenant-1")
+    issued = issue_key(client, scopes=["kyc_verify"])
+    body = _introspect(client, issued["plaintext_key"]).json()
+    assert body["active"] is True
+    assert body["tenant_id"] == "tenant-1"
+    assert body["scopes"] == ["kyc_verify"]
+    assert body["status"] == "active"
+    assert body["key_id"] == issued["id"]
+    assert body["key_type"] == "live"
+    assert body["expires_at"] is None
+    # The raw key material is never echoed back.
+    assert issued["plaintext_key"] not in str(body)
+
+
+def test_introspect_inactive_and_malformed_keys(db, monkeypatch):
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "BILLING_INTERNAL_TOKEN", "tok")
+    client = make_client(db, TENANT_USER)
+    subscribe(client, "tenant-1")
+    issued = issue_key(client)
+    assert _introspect(client, "ffk_live_" + "0" * 32).json() == {
+        "active": False, "reason": "unknown key"}
+    assert _introspect(client, "not-a-key").json() == {
+        "active": False, "reason": "malformed key"}
+    client.post(f"/v1/billing/api-keys/{issued['id']}/revoke")
+    body = _introspect(client, issued["plaintext_key"]).json()
+    assert body["active"] is False and body["reason"] == "key revoked"
+    # Expired keys report inactive with a reason.
+    issued2 = issue_key(client)
+    db.execute("UPDATE api_keys SET expires_at = '2020-01-01T00:00:00+00:00' WHERE id = :id",
+               {"id": issued2["id"]})
+    body = _introspect(client, issued2["plaintext_key"]).json()
+    assert body["active"] is False and body["reason"] == "key expired"
+
+
+# ---------------------------------------------------------------------------
+# ffk_test_ key class
+# ---------------------------------------------------------------------------
+
+def test_issue_test_key_prefix_and_audit_only_usage(db):
+    client = make_client(db, TENANT_USER)
+    subscribe(client, "tenant-1")
+    issued = issue_key(client)
+    assert issued["key_type"] == "live"  # default unchanged
+    test_issued = client.post("/v1/billing/api-keys",
+                              json={"tenant_id": "tenant-1", "key_type": "test"}).json()
+    assert test_issued["plaintext_key"].startswith("ffk_test_")
+    assert test_issued["key_type"] == "test"
+    # Test key works on the data plane...
+    assert client.post("/v1/billing/meter/fraud_score",
+                       headers={"X-API-Key": test_issued["plaintext_key"]}).status_code == 200
+    # ...records an audit usage event tagged environment=test...
+    event = db.query_one("SELECT environment, amount_kobo FROM usage_events"
+                         " WHERE api_key_id = :k", {"k": test_issued["id"]})
+    assert event["environment"] == "test" and event["amount_kobo"] == 0
+    # ...but NEVER meters revenue usage (no billable rollup).
+    assert db.query_one("SELECT * FROM usage_rollups WHERE tenant_id = 'tenant-1'") is None
+    # Live keys still meter normally.
+    assert client.post("/v1/billing/meter/fraud_score",
+                       headers={"X-API-Key": issued["plaintext_key"]}).status_code == 200
+    rollup = db.query_one("SELECT units FROM usage_rollups WHERE tenant_id = 'tenant-1'"
+                          " AND operation = 'fraud_score'")
+    assert rollup["units"] == 1
+
+
+def test_test_key_rotation_preserves_class_and_bad_key_type_rejected(db):
+    client = make_client(db, TENANT_USER)
+    subscribe(client, "tenant-1")
+    resp = client.post("/v1/billing/api-keys",
+                       json={"tenant_id": "tenant-1", "key_type": "staging"})
+    assert resp.status_code == 422
+    issued = client.post("/v1/billing/api-keys",
+                         json={"tenant_id": "tenant-1", "key_type": "test"}).json()
+    rotated = client.post(f"/v1/billing/api-keys/{issued['id']}/rotate").json()
+    assert rotated["plaintext_key"].startswith("ffk_test_")
+    assert rotated["key_type"] == "test"
+
+
 def test_dunning_marks_past_due_then_suspends_keys_after_grace(db):
     client = make_client(db, ADMIN)
     _seed_growth_usage(client, db)

@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from identity_store import IdentityStore
 from registry import RegistryAdapter
+from webhook_emitter import emit_event
 
 VALID_IDENTIFIER_TYPES = ("phone", "email", "device", "nin", "bvn")
 # severity by identifier sensitivity: BVN/NIN are high-sensitivity identity
@@ -206,13 +207,14 @@ def import_exposure_batch(
             if store.exposure_alert_exists(tenant_id, customer_id, id_hash, breach_ref):
                 alerts_deduped += 1
                 continue
+            alert_id = f"exp-{id_hash[:16]}-{abs(hash((customer_id, breach_ref))) % 10**8:08d}"
             store.execute(
                 "INSERT INTO identity_theft_alerts (tenant_id, alert_id, user_id,"
                 " alert_type, risk_level, details, created_at)"
                 " VALUES (:t, :aid, :u, 'exposure_detected', :sev, :d, :ts)",
                 {
                     "t": tenant_id,
-                    "aid": f"exp-{id_hash[:16]}-{abs(hash((customer_id, breach_ref))) % 10**8:08d}",
+                    "aid": alert_id,
                     "u": customer_id,
                     "sev": severity,
                     "d": json.dumps(evidence, sort_keys=True),
@@ -220,6 +222,22 @@ def import_exposure_batch(
                 },
             )
             alerts_written += 1
+            # Round-9 webhook contract: identity.exposure.detected fires ONLY
+            # for newly written alerts (deduped re-imports skip it) and
+            # carries alert id/type/hash refs ONLY — never plaintext
+            # identifiers or customer PII. Fire-and-forget.
+            emit_event(
+                "identity.exposure.detected",
+                tenant_id,
+                {
+                    "alert_id": alert_id,
+                    "alert_type": "exposure_detected",
+                    "identifier_type": id_type,
+                    "identifier_hash": id_hash,
+                    "breach_ref": breach_ref,
+                    "risk_level": severity,
+                },
+            )
         matched.append({
             "identifier_type": id_type,
             "identifier_hash": id_hash,

@@ -24,6 +24,12 @@ counts; the artifact contains no PII; and any aggregate cell with
 fewer than ``SUPPRESS_MIN_N`` weekly transactions is suppressed
 (k-anonymity-style) as ``{"suppressed": true}``.
 
+AUTH: every /v1/intel/* data-plane route requires EITHER a staff Keycloak
+JWT (app/auth.py, fail-closed, mirrors kyc-api) OR a tenant API key
+(X-API-Key: ffk_*) validated via billing-service introspection with the
+fraud_score scope (app/api_keys.py; fail-closed, <=60s TTL cache).
+/health stays unauthenticated for orchestrators.
+
 FAIL-CLOSED: if the artifact is missing/unloadable the service still
 boots (so orchestrators can see it), but /health returns 503 and every
 /v1/intel/* endpoint returns 503 with a loud reason. There is NO silent
@@ -39,8 +45,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
+
+from app.api_keys import require_scope
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -110,19 +118,25 @@ def create_app(artifact_dir: str | Path | None = None,
                      "and all /v1/intel/* endpoints are disabled (fail-closed).",
                      load_error)
 
+    # All /v1/intel/* data-plane routes require EITHER a staff Keycloak JWT
+    # OR a tenant API key (X-API-Key: ffk_*) with the fraud_score scope,
+    # validated via billing-service introspection (fail-closed). /health
+    # stays unauthenticated for orchestrators.
+    _intel_auth = [Depends(require_scope("fraud_score"))]
+
     # Cultural intelligence router (independently fail-closed: a missing
     # cultural artifact 503s /v1/intel/cultural/* only, never the national
     # endpoints — and vice versa).
     from app.cultural import create_cultural_router
     cultural_router = create_cultural_router(cultural_dir)
-    app.include_router(cultural_router)
+    app.include_router(cultural_router, dependencies=_intel_auth)
     app.state.cultural_router = cultural_router
 
     # Request-legitimacy router (stateless heuristic scoring — no artifact,
     # so it is never fail-closed; see app/request_legitimacy.py).
     from app.request_legitimacy import create_request_legitimacy_router
     legitimacy_router = create_request_legitimacy_router()
-    app.include_router(legitimacy_router)
+    app.include_router(legitimacy_router, dependencies=_intel_auth)
     app.state.request_legitimacy_router = legitimacy_router
 
     def require_store() -> IntelStore:
@@ -148,7 +162,7 @@ def create_app(artifact_dir: str | Path | None = None,
                 "provenance": store.summaries.get("provenance")}
 
     # ------------------------------------------------------------------
-    @app.get("/v1/intel/national/summary")
+    @app.get("/v1/intel/national/summary", dependencies=_intel_auth)
     def national_summary():
         s = require_store().summaries
         nat = s["national"]
@@ -168,7 +182,7 @@ def create_app(artifact_dir: str | Path | None = None,
             "model_version": require_store().metrics.get("version"),
         }
 
-    @app.get("/v1/intel/states")
+    @app.get("/v1/intel/states", dependencies=_intel_auth)
     def states():
         st = require_store()
         nat_mean = st.summaries["national"]["posterior_mean"]
@@ -188,7 +202,7 @@ def create_app(artifact_dir: str | Path | None = None,
                 "suppression_min_weekly_n": SUPPRESS_MIN_N,
                 "provenance": st.summaries["provenance"]}
 
-    @app.get("/v1/intel/states/{code}")
+    @app.get("/v1/intel/states/{code}", dependencies=_intel_auth)
     def state_detail(code: str):
         st = require_store()
         code = code.lower()
@@ -216,7 +230,7 @@ def create_app(artifact_dir: str | Path | None = None,
                                 "for lagos, kano, abuja_fct")
         return out
 
-    @app.get("/v1/intel/hotspots")
+    @app.get("/v1/intel/hotspots", dependencies=_intel_auth)
     def hotspots(k: int = Query(10, ge=1, le=37),
                  threshold: float | None = Query(None, gt=0, lt=1)):
         st = require_store()
@@ -236,14 +250,14 @@ def create_app(artifact_dir: str | Path | None = None,
         return {"k": k, "threshold": thr, "hotspots": rows[:k],
                 "provenance": st.summaries["provenance"]}
 
-    @app.get("/v1/intel/typology-mix")
+    @app.get("/v1/intel/typology-mix", dependencies=_intel_auth)
     def typology_mix():
         st = require_store()
         return {"zones": st.summaries["typology_mix"],
                 "model": "Dirichlet-multinomial per geopolitical zone",
                 "provenance": st.summaries["provenance"]}
 
-    @app.get("/v1/intel/brief", response_class=PlainTextResponse)
+    @app.get("/v1/intel/brief", response_class=PlainTextResponse, dependencies=_intel_auth)
     def brief():
         return render_brief(require_store())
 

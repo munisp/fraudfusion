@@ -13,11 +13,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from tests.conftest import override_auth
 
 
 @pytest.fixture(scope="module")
 def client():
-    return TestClient(create_app())
+    return TestClient(override_auth(create_app()))
 
 
 ASSESS = "/v1/intel/request-legitimacy/assess"

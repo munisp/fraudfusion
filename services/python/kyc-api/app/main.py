@@ -19,9 +19,17 @@ Backed by:
   - Biometric: OpenKYC-compatible remote IDV (IDV_SERVER_URL) performs real
     face-match/liveness when configured; otherwise honest not-performed
 
-Auth: fail-closed Keycloak introspection (app/auth.py).
-Schema: database/20260827_pep_kyb_merchant.sql (pep_list, watchlist);
-SQLite mirror in app/db.py for local dev/tests.
+Auth: dual data-plane auth (app/api_keys.py) — staff Keycloak JWT
+(app/auth.py, fail-closed) OR tenant API key (X-API-Key: ffk_live_/ffk_test_)
+validated via billing-service introspection with per-endpoint scope
+enforcement and tenant isolation. POST verify endpoints accept an
+Idempotency-Key header (first-wins replay, 24h TTL, 409 on payload
+conflict). /document/verify emits kyc.verification.completed via
+app/webhooks.py (fire-and-forget, hash-only payload).
+
+Schema: database/20260827_pep_kyb_merchant.sql (pep_list, watchlist),
+database/20260930_kyc_idempotency.sql (kyc_idempotency_keys,
+kyc_requests.tenant_id); SQLite mirror in app/db.py for local dev/tests.
 """
 
 from __future__ import annotations
@@ -36,9 +44,10 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile, status
 
-from app import bureau, counterparty, docverification, identity, phone_tenure, screening, tiers
+from app import bureau, counterparty, docverification, identity, phone_tenure, screening, tiers, webhooks
+from app.api_keys import is_api_key, principal_tenant, require_scope
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db
 from app.schemas import (
@@ -67,6 +76,70 @@ REVIEW_INTERVAL_DAYS = {"tier_1": 365, "tier_2": 180, "tier_3": 90}
 DEFAULT_REKYC_DEADLINE_DAYS = 30
 # Address re-verification reviews are due within this many days of the trigger.
 ADDRESS_REVIEW_DEADLINE_DAYS = 30
+
+# Idempotency-Key support on POST verify endpoints (first-wins replay).
+IDEMPOTENCY_TTL = timedelta(hours=24)
+
+
+def _request_hash(payload) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _idempotency_lookup(db: Database, tenant: str, key: str) -> dict | None:
+    row = db.query_one(
+        "SELECT * FROM kyc_idempotency_keys WHERE tenant_id = :t AND key = :k",
+        {"t": tenant, "k": key},
+    )
+    if row is None:
+        return None
+    created = datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - created > IDEMPOTENCY_TTL:
+        # Expired (24h TTL): evict and treat as absent.
+        db.execute("DELETE FROM kyc_idempotency_keys WHERE id = :id", {"id": row["id"]})
+        return None
+    return row
+
+
+def _idempotent_run(db: Database, tenant: str, key: str, req_hash: str, compute):
+    """First-wins idempotent execution for POST verify endpoints.
+
+    Returns (payload, replayed). Same key + same request hash replays the
+    stored response; same key + different hash is a 409. The first completed
+    response wins: a concurrent loser replays (or conflicts) instead of
+    double-executing."""
+    if not key:
+        return compute(), False
+    row = _idempotency_lookup(db, tenant, key)
+    if row is not None:
+        if row["request_hash"] != req_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency-Key was already used with a different request payload",
+            )
+        return json.loads(row["response_payload"]), True
+    payload = compute()
+    inserted = db.execute(
+        ("INSERT OR IGNORE INTO kyc_idempotency_keys (key, tenant_id, request_hash, response_payload)"
+         " VALUES (:k, :t, :h, :p)" if not db._is_pg else
+         "INSERT INTO kyc_idempotency_keys (key, tenant_id, request_hash, response_payload)"
+         " VALUES (:k, :t, :h, :p) ON CONFLICT (tenant_id, key) DO NOTHING"),
+        {"k": key, "t": tenant, "h": req_hash, "p": json.dumps(payload, default=str)},
+    )
+    if not inserted:
+        # Lost the first-wins race: replay (or conflict on) the winner's row.
+        row = _idempotency_lookup(db, tenant, key)
+        if row is not None:
+            if row["request_hash"] != req_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key was already used with a different request payload",
+                )
+            return json.loads(row["response_payload"]), True
+    return payload, False
 
 IMAGE_MAGIC = {
     b"\xff\xd8\xff": "jpeg",
@@ -218,15 +291,16 @@ def _run_verification(db: Database, principal: Principal, level: str,
     now = _now()
     db.execute(
         "INSERT INTO kyc_requests (id, customer_id, level, tier, status, decision,"
-        " risk_score, risk_level, results_json, actor_sub,"
+        " risk_score, risk_level, results_json, actor_sub, tenant_id,"
         " address_verification_method, address_verified_at, created_at, updated_at)"
         " VALUES (:id, :cid, :level, :tier, 'completed', :decision, :score, :rl,"
-        " :results, :actor, :addrm, :addrv, :now, :now)",
+        " :results, :actor, :tenant, :addrm, :addrv, :now, :now)",
         {
             "id": request_id, "cid": payload.customer_id, "level": level,
             "tier": tier_limits.tier, "decision": decision, "score": risk,
             "rl": _risk_level(risk), "results": json.dumps(results),
-            "actor": principal.sub, "addrm": addr_method, "addrv": addr_verified_at,
+            "actor": principal.sub, "tenant": principal_tenant(principal),
+            "addrm": addr_method, "addrv": addr_verified_at,
             "now": now,
         },
     )
@@ -539,30 +613,48 @@ def create_app() -> FastAPI:
 
     # ------------------------- KYC verification ----------------------------
 
+    def _verify_idempotent(level: str, payload, principal, db: Database,
+                           idempotency_key: str, response: Response):
+        tenant = principal_tenant(principal)
+        body, replayed = _idempotent_run(
+            db, tenant, idempotency_key.strip(), _request_hash(payload.model_dump()),
+            lambda: _run_verification(db, principal, level, payload).model_dump())
+        if replayed:
+            response.headers["Idempotency-Replayed"] = "true"
+        return body
+
     @app.post("/api/v1/kyc/verify/basic", response_model=KYCResponse)
-    def verify_basic(payload: BasicKYCRequest,
-                     principal: Principal = Depends(get_current_principal),
-                     db: Database = Depends(get_db)) -> KYCResponse:
-        return _run_verification(db, principal, "basic", payload)
+    def verify_basic(payload: BasicKYCRequest, response: Response,
+                     idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+                     principal: Principal = Depends(require_scope("kyc_verify")),
+                     db: Database = Depends(get_db)):
+        return _verify_idempotent("basic", payload, principal, db, idempotency_key, response)
 
     @app.post("/api/v1/kyc/verify/enhanced", response_model=KYCResponse)
-    def verify_enhanced(payload: EnhancedKYCRequest,
-                        principal: Principal = Depends(get_current_principal),
-                        db: Database = Depends(get_db)) -> KYCResponse:
-        return _run_verification(db, principal, "enhanced", payload)
+    def verify_enhanced(payload: EnhancedKYCRequest, response: Response,
+                        idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+                        principal: Principal = Depends(require_scope("kyc_verify")),
+                        db: Database = Depends(get_db)):
+        return _verify_idempotent("enhanced", payload, principal, db, idempotency_key, response)
 
     @app.post("/api/v1/kyc/verify/premium", response_model=KYCResponse)
-    def verify_premium(payload: PremiumKYCRequest,
-                       principal: Principal = Depends(get_current_principal),
-                       db: Database = Depends(get_db)) -> KYCResponse:
-        return _run_verification(db, principal, "premium", payload)
+    def verify_premium(payload: PremiumKYCRequest, response: Response,
+                       idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+                       principal: Principal = Depends(require_scope("kyc_verify")),
+                       db: Database = Depends(get_db)):
+        return _verify_idempotent("premium", payload, principal, db, idempotency_key, response)
 
     @app.get("/api/v1/kyc/status/{request_id}")
     def kyc_status(request_id: str,
-                   principal: Principal = Depends(get_current_principal),
+                   principal: Principal = Depends(require_scope("kyc_verify")),
                    db: Database = Depends(get_db)) -> dict:
         row = db.query_one("SELECT * FROM kyc_requests WHERE id = :id", {"id": request_id})
         if not row:
+            raise HTTPException(status_code=404, detail="kyc request not found")
+        # Tenant isolation: API-key principals only see their own tenant's
+        # requests. 404 (not 403) so existence of other tenants' ids is not
+        # leaked. Staff JWT principals are cross-tenant (unchanged).
+        if is_api_key(principal) and (row.get("tenant_id") or "default") != principal.tenant_id:
             raise HTTPException(status_code=404, detail="kyc request not found")
         # Address-verification recency is customer-level: latest request with
         # address evidence wins, regardless of which request this status is for.
@@ -619,7 +711,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/v1/kyc/counterparty-rigor/{institution_code}")
     def get_counterparty_rigor(institution_code: str,
-                               principal: Principal = Depends(get_current_principal),
+                               principal: Principal = Depends(require_scope("kyc_verify")),
                                db: Database = Depends(get_db)) -> dict:
         """Look up rigor by institution code. Fail-closed: no entry -> rigor
         'unknown' with an explicit reason, never silently strong."""
@@ -805,7 +897,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/biometric/verify")
     def biometric_verify(payload: BiometricVerifyRequest,
-                         principal: Principal = Depends(get_current_principal)) -> dict:
+                         principal: Principal = Depends(require_scope("kyc_verify"))) -> dict:
         selfie = _decode_base64_image(payload.selfie_image_base64, "selfie_image_base64")
         reference = (
             _decode_base64_image(payload.reference_image_base64, "reference_image_base64")
@@ -819,7 +911,7 @@ def create_app() -> FastAPI:
         selfie: UploadFile = File(...),
         reference: UploadFile | None = File(default=None),
         check_liveness: bool = Form(default=True),
-        principal: Principal = Depends(get_current_principal),
+        principal: Principal = Depends(require_scope("kyc_verify")),
     ) -> dict:
         selfie_data = await _read_upload(selfie)
         reference_data = await _read_upload(reference) if reference else None
@@ -828,7 +920,7 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/biometric/liveness")
     async def biometric_liveness(
         image: UploadFile = File(...),
-        principal: Principal = Depends(get_current_principal),
+        principal: Principal = Depends(require_scope("kyc_verify")),
     ) -> dict:
         data = await _read_upload(image)
         response = {
@@ -850,7 +942,7 @@ def create_app() -> FastAPI:
     async def biometric_face_match(
         image1: UploadFile = File(...),
         image2: UploadFile = File(...),
-        principal: Principal = Depends(get_current_principal),
+        principal: Principal = Depends(require_scope("kyc_verify")),
     ) -> dict:
         data1 = await _read_upload(image1)
         data2 = await _read_upload(image2)
@@ -876,37 +968,62 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/document/verify")
     async def document_verify(
+        response: Response,
         document: UploadFile = File(...),
         document_type: str = Form(...),
         check_forgery: bool = Form(default=True),
-        principal: Principal = Depends(get_current_principal),
+        idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+        principal: Principal = Depends(require_scope("kyc_verify")),
         db: Database = Depends(get_db),
     ) -> dict:
         data = await _read_upload(document)
-        result = _document_checks(data, document_type, check_forgery)
-        result["verification_id"] = uuid.uuid4().hex
-        kind = result["detected_format"]
-        if _is_image_kind(kind) and docverification.DOCVERIFICATION_AVAILABLE:
-            # Full layered pipeline: local cv2 forensics -> OCR (when
-            # available) -> VLM structured extraction (when available), with
-            # per-layer provenance. The pipeline status drives the verdict.
-            verdict = docverification.pipeline.verify_document(
-                data, document_type, docverification.build_backends())
-            result["pipeline"] = verdict
-            result["status"] = verdict["status"]
-        else:
-            result["status"] = (
-                "manual_review" if result["structurally_valid"] else "rejected"
-            )
-        result["timestamp"] = _now()
-        _persist_document_verdict(db, result, data, principal)
-        return result
+        tenant = principal_tenant(principal)
+
+        def _compute() -> dict:
+            result = _document_checks(data, document_type, check_forgery)
+            result["verification_id"] = uuid.uuid4().hex
+            kind = result["detected_format"]
+            if _is_image_kind(kind) and docverification.DOCVERIFICATION_AVAILABLE:
+                # Full layered pipeline: local cv2 forensics -> OCR (when
+                # available) -> VLM structured extraction (when available), with
+                # per-layer provenance. The pipeline status drives the verdict.
+                verdict = docverification.pipeline.verify_document(
+                    data, document_type, docverification.build_backends())
+                result["pipeline"] = verdict
+                result["status"] = verdict["status"]
+            else:
+                result["status"] = (
+                    "manual_review" if result["structurally_valid"] else "rejected"
+                )
+            result["timestamp"] = _now()
+            _persist_document_verdict(db, result, data, principal)
+            # Webhook emission (shared emitter contract): hash-only payload —
+            # verification id, document type, verdict status, sha256. NO PII,
+            # NO raw fields. Fire-and-forget; never breaks the request.
+            webhooks.emit_event("kyc.verification.completed", tenant, {
+                "verification_id": result["verification_id"],
+                "document_type": result["document_type"],
+                "status": result["status"],
+                "sha256": hashlib.sha256(data).hexdigest(),
+            })
+            return result
+
+        body, replayed = _idempotent_run(
+            db, tenant, idempotency_key.strip(),
+            # The fingerprint covers the document bytes + the form fields.
+            _request_hash({"document_sha256": hashlib.sha256(data).hexdigest(),
+                           "document_type": document_type,
+                           "check_forgery": check_forgery}),
+            _compute)
+        if replayed:
+            response.headers["Idempotency-Replayed"] = "true"
+        return body
 
     @app.post("/api/v1/document/ocr")
     async def document_ocr(
         document: UploadFile = File(...),
         document_type: str = Form(...),
-        principal: Principal = Depends(get_current_principal),
+        principal: Principal = Depends(require_scope("kyc_verify")),
     ) -> dict:
         data = await _read_upload(document)
         kind = _sniff_type(data)
@@ -968,7 +1085,7 @@ def create_app() -> FastAPI:
     async def document_forgery_check(
         document: UploadFile = File(...),
         document_type: str = Form(...),
-        principal: Principal = Depends(get_current_principal),
+        principal: Principal = Depends(require_scope("kyc_verify")),
     ) -> dict:
         data = await _read_upload(document)
         result = _document_checks(data, document_type, check_forgery=True)
@@ -979,7 +1096,7 @@ def create_app() -> FastAPI:
     @app.post("/api/v1/document/quality-check")
     async def document_quality_check(
         document: UploadFile = File(...),
-        principal: Principal = Depends(get_current_principal),
+        principal: Principal = Depends(require_scope("kyc_verify")),
     ) -> dict:
         data = await _read_upload(document)
         kind = _sniff_type(data)
@@ -1018,7 +1135,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/screening/pep")
     def screen_pep(payload: ScreeningRequest,
-                   principal: Principal = Depends(get_current_principal),
+                   principal: Principal = Depends(require_scope("aml_score")),
                    db: Database = Depends(get_db)) -> dict:
         result = screening.screen_pep(db, payload.full_name, payload.date_of_birth,
                                       payload.nationality)
@@ -1026,7 +1143,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/screening/sanctions")
     def screen_sanctions(payload: ScreeningRequest,
-                         principal: Principal = Depends(get_current_principal),
+                         principal: Principal = Depends(require_scope("aml_score")),
                          db: Database = Depends(get_db)) -> dict:
         result = screening.screen_sanctions(db, payload.full_name, payload.date_of_birth,
                                             payload.nationality, payload.passport_number)
@@ -1034,7 +1151,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/screening/comprehensive")
     def screen_comprehensive(payload: ScreeningRequest,
-                             principal: Principal = Depends(get_current_principal),
+                             principal: Principal = Depends(require_scope("aml_score")),
                              db: Database = Depends(get_db)) -> dict:
         result = screening.comprehensive_screening(db, payload.full_name,
                                                    payload.date_of_birth,
@@ -1062,19 +1179,19 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/credit-bureau/check")
     def credit_bureau_check(payload: CreditBureauRequest,
-                            principal: Principal = Depends(get_current_principal)) -> dict:
+                            principal: Principal = Depends(require_scope("kyc_verify"))) -> dict:
         return _bureau_call(payload, score_only=False)
 
     @app.post("/api/v1/credit-bureau/score-only")
     def credit_bureau_score(payload: CreditBureauRequest,
-                            principal: Principal = Depends(get_current_principal)) -> dict:
+                            principal: Principal = Depends(require_scope("kyc_verify"))) -> dict:
         return _bureau_call(payload, score_only=True)
 
     # ------------------------- Risk ----------------------------------------
 
     @app.post("/api/v1/risk/assess")
     def risk_assess(payload: dict,
-                    principal: Principal = Depends(get_current_principal),
+                    principal: Principal = Depends(require_scope("fraud_score")),
                     db: Database = Depends(get_db)) -> dict:
         """Rule-based risk assessment (no ML model wired for this endpoint;
         the scoring basis is returned explicitly)."""
@@ -1123,7 +1240,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/risk/fraud-check")
     def fraud_check(payload: FraudCheckRequest,
-                    principal: Principal = Depends(get_current_principal),
+                    principal: Principal = Depends(require_scope("fraud_score")),
                     db: Database = Depends(get_db)) -> dict:
         txn = payload.transaction_data or {}
         history = payload.historical_data or []
@@ -1174,7 +1291,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/v1/risk/behavioral-analysis")
     def behavioral_analysis(payload: BehavioralAnalysisRequest,
-                            principal: Principal = Depends(get_current_principal)) -> dict:
+                            principal: Principal = Depends(require_scope("fraud_score"))) -> dict:
         data = payload.behavioral_data or {}
         score = 0.10
         factors = []

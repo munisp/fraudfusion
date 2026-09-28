@@ -15,6 +15,9 @@ class ApiKeyCreate(BaseModel):
     scopes: list[str] = Field(default_factory=list)
     rate_limit_rpm: int | None = Field(default=None, gt=0)
     expires_at: str | None = None
+    # "test" mints an ffk_test_ key: full data-plane access against the
+    # tenant's scopes but usage is audit-only (never billed).
+    key_type: str = "live"
 
     @field_validator("scopes")
     @classmethod
@@ -24,6 +27,13 @@ class ApiKeyCreate(BaseModel):
             raise ValueError(f"unknown scopes: {sorted(unknown)}")
         return value
 
+    @field_validator("key_type")
+    @classmethod
+    def key_type_known(cls, value: str) -> str:
+        if value not in ("live", "test"):
+            raise ValueError("key_type must be 'live' or 'test'")
+        return value
+
 
 class ApiKeyView(BaseModel):
     id: str
@@ -31,6 +41,7 @@ class ApiKeyView(BaseModel):
     name: str
     key_prefix: str
     scopes: list[str]
+    key_type: str = "live"
     rate_limit_rpm: int
     status: str
     expires_at: str | None
@@ -57,6 +68,11 @@ class UsageEventIn(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=255)
     occurred_at: str | None = None
     api_key_id: str | None = None
+
+
+class IntrospectRequest(BaseModel):
+    """Service-to-service API-key introspection (POST /internal/api-keys/introspect)."""
+    key: str = Field(min_length=1, max_length=128)
 
 
 class InvoiceTransition(BaseModel):

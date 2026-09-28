@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.conftest import ARTIFACT_DIR  # noqa: E402  (path setup)
+from tests.conftest import ARTIFACT_DIR, override_auth  # noqa: E402  (path setup)
 
 from app.main import SUPPRESS_MIN_N, create_app  # noqa: E402
 
@@ -16,7 +16,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def client():
-    return TestClient(create_app(artifact_dir=ARTIFACT_DIR))
+    return TestClient(override_auth(create_app(artifact_dir=ARTIFACT_DIR)))
 
 
 def test_health_ok(client):
@@ -28,7 +28,7 @@ def test_health_ok(client):
 
 
 def test_fail_closed_when_artifact_missing(tmp_path):
-    c = TestClient(create_app(artifact_dir=tmp_path / "nope"))
+    c = TestClient(override_auth(create_app(artifact_dir=tmp_path / "nope")))
     h = c.get("/health")
     assert h.status_code == 503                      # loud, not silent
     for path in ("/v1/intel/national/summary", "/v1/intel/states",

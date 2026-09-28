@@ -83,6 +83,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
     key_prefix     TEXT NOT NULL,
     key_hash       TEXT NOT NULL CHECK (length(key_hash) = 64),
     scopes         TEXT NOT NULL DEFAULT '[]',
+    -- live | test (ffk_test_ keys never meter revenue usage)
+    key_type       TEXT NOT NULL DEFAULT 'live'
+                   CHECK (key_type IN ('live', 'test')),
     rate_limit_rpm INTEGER NOT NULL DEFAULT 60 CHECK (rate_limit_rpm > 0),
     status         TEXT NOT NULL DEFAULT 'active'
                    CHECK (status IN ('active', 'suspended', 'revoked')),
@@ -105,6 +108,9 @@ CREATE TABLE IF NOT EXISTS usage_events (
     amount_kobo     INTEGER NOT NULL DEFAULT 0 CHECK (amount_kobo >= 0),
     idempotency_key TEXT NOT NULL,
     occurred_at     TEXT NOT NULL,
+    -- live | test: 'test' rows are audit-only, excluded from usage_rollups
+    environment     TEXT NOT NULL DEFAULT 'live'
+                    CHECK (environment IN ('live', 'test')),
     ingested_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 CREATE UNIQUE INDEX IF NOT EXISTS usage_events_tenant_idem_idx
@@ -213,11 +219,26 @@ class Database:
             self._conn.execute("PRAGMA foreign_keys = ON")
             with self._lock, self._conn:
                 self._conn.executescript(SQLITE_SCHEMA)
+                self._migrate_sqlite()
             self._seed_plans()
 
     @property
     def backend(self) -> str:
         return "postgres" if self._is_pg else "sqlite"
+
+    def _migrate_sqlite(self) -> None:
+        """Idempotent column adds for pre-existing SQLite dev databases
+        (canonical PG: database/20260930_api_key_types.sql)."""
+        for table, col, ddl in (
+            ("api_keys", "key_type",
+             "TEXT NOT NULL DEFAULT 'live' CHECK (key_type IN ('live', 'test'))"),
+            ("usage_events", "environment",
+             "TEXT NOT NULL DEFAULT 'live' CHECK (environment IN ('live', 'test'))"),
+        ):
+            existing = {row["name"] for row in
+                        self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
     def _seed_plans(self) -> None:
         with self._lock, self._conn:

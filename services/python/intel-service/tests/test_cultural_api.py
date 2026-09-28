@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from tests.conftest import override_auth
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CULTURAL_ARTIFACT = REPO_ROOT / "ml" / "artifacts" / "cultural_intelligence" / "v1"
@@ -30,7 +31,7 @@ FRAUD_RING = {"n_members": 9, "contribution_cv": 0.04, "cadence_cv": 0.55,
 
 @pytest.fixture(scope="module")
 def client():
-    return TestClient(create_app())
+    return TestClient(override_auth(create_app()))
 
 
 def test_calendar_christmas_vs_random_week(client):
@@ -221,7 +222,7 @@ def test_ethics_meta_endpoint_schema(client):
 
 def test_cultural_fail_closed_when_artifact_missing(tmp_path):
     app = create_app(cultural_artifact_dir=tmp_path / "nope")
-    c = TestClient(app)
+    c = TestClient(override_auth(app))
     r = c.get("/v1/intel/cultural/calendar",
               params={"date": "2026-12-25", "state": "lagos"})
     assert r.status_code == 503

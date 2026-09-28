@@ -30,7 +30,7 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query, status
 
 import json
 
-from app import kyb_verification
+from app import kyb_verification, webhook_emitter
 from app.auth import Principal, get_current_principal, require_admin
 from app.db import Database, get_db
 from app.schemas import (
@@ -535,6 +535,25 @@ def create_app() -> FastAPI:
         )
         logger.info("kyb verification: id=%s verdict=%s docs_with_content=%d",
                     app_id, verdict["verdict"], verdict["documents_with_content"])
+        # Round-9 webhook contract: kyb.verification.completed carries the
+        # application id, verdict and document sha256s ONLY — no PII (no
+        # business name / CAC number / extracted fields). Fire-and-forget.
+        row = db.query_one("SELECT tenant_id FROM kyb_applications WHERE id = :id",
+                           {"id": app_id})
+        webhook_emitter.emit_event(
+            "kyb.verification.completed",
+            (row or {}).get("tenant_id") or "default",
+            {
+                "application_id": app_id,
+                "verdict": verdict["verdict"],
+                "verified_at": verdict["verified_at"],
+                "documents_with_content": verdict["documents_with_content"],
+                "document_sha256s": [
+                    d["content_sha256"] for d in verdict.get("documents", [])
+                    if d.get("content_sha256")
+                ],
+            },
+        )
         return verdict
 
     def _merchant_view(row: dict) -> MerchantApplicationView:

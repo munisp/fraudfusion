@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS kyc_requests (
     risk_level   TEXT NOT NULL DEFAULT 'low',
     results_json TEXT NOT NULL DEFAULT '{}',
     actor_sub    TEXT NOT NULL DEFAULT '',
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -143,6 +144,21 @@ CREATE TABLE IF NOT EXISTS document_verifications (
 );
 CREATE INDEX IF NOT EXISTS document_verifications_sha_idx
     ON document_verifications (sha256);
+
+-- Idempotency keys for mutating verify endpoints (canonical PG:
+-- database/20260930_kyc_idempotency.sql). First-wins response replay:
+-- (tenant_id, key) stores the request hash + full response payload; a
+-- repeated key with the same payload replays, with a different payload
+-- conflicts (409). Rows older than 24h are treated as expired.
+CREATE TABLE IF NOT EXISTS kyc_idempotency_keys (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    key              TEXT NOT NULL,
+    tenant_id        TEXT NOT NULL DEFAULT 'default',
+    request_hash     TEXT NOT NULL CHECK (length(request_hash) = 64),
+    response_payload TEXT NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (tenant_id, key)
+);
 """
 
 # Columns added to kyc_requests for re-KYC + backoffice override (fresh DBs
@@ -158,6 +174,9 @@ KYC_REQUESTS_EXTRA_COLUMNS = {
     # database/20260928_kyc_rigor_agents.sql).
     "address_verification_method": "TEXT",
     "address_verified_at": "TEXT",
+    # Tenant owning the request (API-key data-plane principals; canonical PG
+    # column added by database/20260930_kyc_idempotency.sql).
+    "tenant_id": "TEXT NOT NULL DEFAULT 'default'",
 }
 
 # Demo seed so local/dev screening exercises a real match path. Production

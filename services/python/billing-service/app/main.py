@@ -19,6 +19,7 @@ mirror in app/db.py for local dev/tests).
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Path, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, status
 
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db
@@ -37,6 +38,7 @@ from app.keys import (
     UsageBuffer,
     SlidingWindowRateLimiter,
     generate_key,
+    hash_key,
     require_api_key,
     utcnow,
 )
@@ -45,6 +47,7 @@ from app.schemas import (
     ApiKeyCreate,
     ApiKeyIssued,
     ApiKeyView,
+    IntrospectRequest,
     InvoiceTransition,
     SubscriptionCreate,
     UsageEventIn,
@@ -58,6 +61,8 @@ SERVICE_NAME = "billing-service"
 PERIOD_RE = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
 INVOICE_DUE_DAYS = int(os.getenv("BILLING_INVOICE_DUE_DAYS", "14"))
 DUNNING_GRACE_DAYS = int(os.getenv("BILLING_DUNNING_GRACE_DAYS", "7"))
+# Service-to-service token guarding /internal/* (fail-closed when unset).
+BILLING_INTERNAL_TOKEN = os.getenv("BILLING_INTERNAL_TOKEN", "")
 
 
 def _decode_json_fields(row: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
@@ -96,7 +101,8 @@ def _key_view(row: dict[str, Any]) -> ApiKeyView:
     r = _decode_json_fields(row, ("scopes",))
     return ApiKeyView(
         id=r["id"], tenant_id=r["tenant_id"], name=r["name"], key_prefix=r["key_prefix"],
-        scopes=r["scopes"], rate_limit_rpm=r["rate_limit_rpm"], status=r["status"],
+        scopes=r["scopes"], key_type=r.get("key_type") or "live",
+        rate_limit_rpm=r["rate_limit_rpm"], status=r["status"],
         expires_at=r.get("expires_at"), last_used_at=r.get("last_used_at"),
         created_at=str(r["created_at"]),
     )
@@ -166,20 +172,21 @@ def create_app(db: Database | None = None, flush_threshold: int | None = None) -
                 status.HTTP_403_FORBIDDEN,
                 f"scopes {sorted(requested - allowed)} exceed plan '{plan['id']}' allowed scopes",
             )
-        plaintext, prefix, key_hash = generate_key()
+        plaintext, prefix, key_hash = generate_key(body.key_type)
         key_id = str(uuid.uuid4())
         rate_limit = body.rate_limit_rpm or int(plan.get("default_rate_limit_rpm") or 60)
         database.execute(
-            "INSERT INTO api_keys (id, tenant_id, name, key_prefix, key_hash, scopes, rate_limit_rpm, expires_at) "
-            "VALUES (:id, :t, :name, :prefix, :hash, :scopes, :rpm, :exp)",
+            "INSERT INTO api_keys (id, tenant_id, name, key_prefix, key_hash, scopes, key_type, rate_limit_rpm, expires_at) "
+            "VALUES (:id, :t, :name, :prefix, :hash, :scopes, :kt, :rpm, :exp)",
             {
                 "id": key_id, "t": body.tenant_id, "name": body.name, "prefix": prefix,
-                "hash": key_hash, "scopes": json.dumps(sorted(requested)), "rpm": rate_limit,
-                "exp": body.expires_at,
+                "hash": key_hash, "scopes": json.dumps(sorted(requested)), "kt": body.key_type,
+                "rpm": rate_limit, "exp": body.expires_at,
             },
         )
         row = database.query_one("SELECT * FROM api_keys WHERE id = :id", {"id": key_id})
-        log.info("issued api key %s (prefix %s) for tenant %s", key_id, prefix, body.tenant_id)
+        log.info("issued %s api key %s (prefix %s) for tenant %s",
+                 body.key_type, key_id, prefix, body.tenant_id)
         return ApiKeyIssued(**_key_view(row).model_dump(), plaintext_key=plaintext)
 
     @app.get("/v1/billing/api-keys", response_model=list[ApiKeyView])
@@ -197,7 +204,8 @@ def create_app(db: Database | None = None, flush_threshold: int | None = None) -
         principal.require_tenant(row["tenant_id"])
         if row["status"] == "revoked":
             raise HTTPException(status.HTTP_409_CONFLICT, "cannot rotate a revoked key")
-        plaintext, prefix, key_hash = generate_key()
+        # Rotation preserves the key's environment class (live|test).
+        plaintext, prefix, key_hash = generate_key(row.get("key_type") or "live")
         database.execute(
             "UPDATE api_keys SET key_prefix = :p, key_hash = :h, status = 'active', updated_at = :now WHERE id = :id",
             {"p": prefix, "h": key_hash, "now": utcnow(), "id": key_id},
@@ -216,6 +224,58 @@ def create_app(db: Database | None = None, flush_threshold: int | None = None) -
             {"now": utcnow(), "id": key_id},
         )
         return _key_view(database.query_one("SELECT * FROM api_keys WHERE id = :id", {"id": key_id}))
+
+    # -- internal service-to-service ------------------------------------------
+    @app.post("/internal/api-keys/introspect")
+    def introspect_api_key(body: IntrospectRequest,
+                           x_internal_token: str = Header(default="")) -> dict[str, Any]:
+        """API-key introspection for other services' data planes (kyc-api,
+        intel-service). Guarded by X-Internal-Token (BILLING_INTERNAL_TOKEN);
+        FAIL-CLOSED 503 when the token is not configured. Hash-only lookup —
+        the plaintext key is never stored here and never returned."""
+        if not BILLING_INTERNAL_TOKEN:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "internal token not configured (BILLING_INTERNAL_TOKEN unset); "
+                "introspect endpoint is fail-closed",
+            )
+        if not hmac.compare_digest(x_internal_token, BILLING_INTERNAL_TOKEN):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid internal token")
+
+        key = body.key.strip()
+        if not key.startswith(("ffk_live_", "ffk_test_", "ffk_dev_")):
+            return {"active": False, "reason": "malformed key"}
+        row = database.query_one(
+            "SELECT * FROM api_keys WHERE key_hash = :h", {"h": hash_key(key)})
+        if row is None:
+            return {"active": False, "reason": "unknown key"}
+        base = {"key_id": row["id"], "status": row["status"],
+                "key_type": row.get("key_type") or "live"}
+        if row["status"] == "revoked":
+            return {"active": False, "reason": "key revoked", **base}
+        if row["status"] == "suspended":
+            return {"active": False, "reason": "key suspended (billing)", **base}
+        expires_at = row.get("expires_at")
+        if expires_at:
+            try:
+                exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) >= exp:
+                    return {"active": False, "reason": "key expired", **base,
+                            "expires_at": str(expires_at)}
+            except ValueError:
+                return {"active": False, "reason": "key expiry unreadable", **base}
+        return {
+            "active": True,
+            "tenant_id": row["tenant_id"],
+            "scopes": _parse_str_list(row.get("scopes")),
+            "status": row["status"],
+            "expires_at": str(expires_at) if expires_at else None,
+            "key_id": row["id"],
+            "key_type": row.get("key_type") or "live",
+            "environment": row.get("key_type") or "live",
+        }
 
     # -- metered data-plane (API-key auth) ------------------------------------
     @app.post("/v1/billing/meter/{operation}")
