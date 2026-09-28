@@ -60,3 +60,38 @@ func TestIsFreeWebmailProvider(t *testing.T) {
 		t.Fatal("malformed email is not free webmail")
 	}
 }
+
+func TestLanguageAnomalyScoreHeuristic(t *testing.T) {
+	// Clean, professional text: low anomaly.
+	cleanRaw := "Dear Customer, Please find attached the monthly account statement for your review. Regards, Bank Support"
+	clean := languageAnomalyScore(cleanRaw, strings.ToLower(cleanRaw))
+	if !clean.Heuristic {
+		t.Fatal("language anomaly output must be labeled heuristic: true")
+	}
+	if clean.Score >= 0.5 {
+		t.Fatalf("clean text scored %.3f, want < 0.5", clean.Score)
+	}
+
+	// Scammy text: ALL CAPS SHOUTING + urgent-payment keywords + gibberish.
+	scamRaw := "URGENT PAYMENT REQUIRED ACT NOW. SEND THE PROCESSING FEE VIA WESTERN UNION WITHIN 24 HOURS. xqzplm vwkjdr bnmgty FOREVERMORE"
+	scam := languageAnomalyScore(scamRaw, strings.ToLower(scamRaw))
+	if scam.Score < 0.5 {
+		t.Fatalf("scam text scored %.3f, want >= 0.5 (caps=%.2f density=%.2f hits=%d)", scam.Score, scam.CapsRatio, scam.MisspellingDensity, scam.UrgentKeywordHits)
+	}
+	if scam.UrgentKeywordHits < 3 {
+		t.Fatalf("urgent keyword hits = %d, want >= 3", scam.UrgentKeywordHits)
+	}
+	if scam.CapsRatio <= 0 {
+		t.Fatal("caps ratio should be positive for all-caps text")
+	}
+	if scam.Score > 1.0 {
+		t.Fatalf("score must be capped at 1.0, got %.3f", scam.Score)
+	}
+}
+
+func TestLanguageAnomalyScoreEmpty(t *testing.T) {
+	got := languageAnomalyScore("", "")
+	if got.Score != 0 || !got.Heuristic {
+		t.Fatalf("empty text: score=%.3f heuristic=%t, want 0/true", got.Score, got.Heuristic)
+	}
+}

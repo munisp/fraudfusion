@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { api } from '../services/api';
+import { api, API_BASE_URL } from '../services/api';
+import { currentDataMode } from '../services/dataMode';
+import OutageState from '../components/OutageState';
+import MockDataBanner from '../components/MockDataBanner';
 import type { FraudAlert, FraudAlertAction } from '../types';
 import {
   Search,
@@ -24,9 +27,10 @@ import {
 } from 'lucide-react';
 
 /**
- * Built-in sample alerts, used only as a documented offline fallback when the
- * backoffice API (`GET /backoffice/fraud/alerts`) is unreachable. Status actions
- * taken against the fallback are applied locally and are not persisted.
+ * Dev-only sample alerts, rendered ONLY when the page is explicitly opened
+ * with `?mock=1` on a Vite dev build (see services/dataMode.ts). They are
+ * never used as a fallback for API failures: when the backoffice API is
+ * unreachable this page renders the outage state instead of fabricated rows.
  */
 const mockAlerts: FraudAlert[] = [
   {
@@ -175,8 +179,10 @@ const FraudAlerts: React.FC = () => {
   const [page, setPage] = useState(1);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionPending, setActionPending] = useState(false);
-  // Local overrides hold optimistic updates and fallback-mode edits.
+  // Local overrides hold optimistic updates (live mode) and mock-mode edits.
   const [localAlerts, setLocalAlerts] = useState<FraudAlert[] | null>(null);
+  // Dev-only mock opt-in (?mock=1). Never an implicit fallback.
+  const mockMode = currentDataMode() === 'mock';
 
   const {
     data: apiAlerts,
@@ -187,10 +193,13 @@ const FraudAlerts: React.FC = () => {
     queryKey: ['fraudAlerts'],
     queryFn: () => api.getFraudAlerts(),
     retry: false,
+    enabled: !mockMode,
   });
 
-  // Live API data wins; documented mock fallback when the API is unreachable.
-  const alerts = localAlerts ?? apiAlerts ?? mockAlerts;
+  // Live mode: only real API rows (empty until loaded; outage state on error).
+  // Mock mode: only the explicit dev opt-in samples.
+  const alerts = mockMode ? localAlerts ?? mockAlerts : localAlerts ?? apiAlerts ?? [];
+  const outage = !mockMode && apiUnreachable;
 
   const applyAction = async (alert: FraudAlert, action: FraudAlertAction) => {
     setActionError(null);
@@ -212,13 +221,14 @@ const FraudAlerts: React.FC = () => {
         current && current.id === alert.id ? { ...current, ...updated } : current,
       );
     } catch (cause) {
-      // Roll back the optimistic update.
-      if (apiUnreachable) {
-        // Fallback mode: keep the local edit, it is the best we can do offline.
+      if (mockMode) {
+        // Mock mode (?mock=1): keep the local edit, it is the best we can do
+        // without a backend; the permanent MOCK DATA banner stays visible.
         setActionError(
-          'Backoffice API unreachable — status change applied to local sample data only and will not persist.',
+          'Mock mode (?mock=1) — status change applied to sample data only and will not persist.',
         );
       } else {
+        // Live mode: roll back the optimistic update.
         setLocalAlerts(previous);
         setSelectedAlert(alert);
         setActionError(
@@ -254,12 +264,7 @@ const FraudAlerts: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      {apiUnreachable && (
-        <div className="rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-800">
-          Backoffice API unreachable — showing built-in sample data. Status changes will be applied
-          locally only.
-        </div>
-      )}
+      {mockMode && <MockDataBanner />}
       {actionError && (
         <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">
           {actionError}
@@ -293,6 +298,18 @@ const FraudAlerts: React.FC = () => {
         </div>
       </div>
 
+      {outage ? (
+        // Never render fabricated rows: the outage state replaces all data UI.
+        <OutageState
+          apiBaseUrl={API_BASE_URL}
+          onRetry={() => {
+            setLocalAlerts(null);
+            void refetch();
+          }}
+          retrying={isFetching}
+        />
+      ) : (
+      <>
       {showFilters && (
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -510,6 +527,8 @@ const FraudAlerts: React.FC = () => {
           </button>
         </div>
       </div>
+      </>
+      )}
 
       {selectedAlert && (
         <AlertDetailModal

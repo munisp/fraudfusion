@@ -22,6 +22,7 @@ artifacts/
 
 # Runtime SQLite databases / generated reports (local dev)
 services/python/onboarding-service/data/
+services/python/billing-service/data/
 services/land-verification-service/data/
 services/land-verification-service/reports/output/
 

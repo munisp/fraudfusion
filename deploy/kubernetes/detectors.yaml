@@ -70,7 +70,7 @@ spec:
               valueFrom:
                 secretKeyRef: {name: detector-db, key: keycloak-client-secret}
             - name: AML_ML_SERVICE_URL
-              value: http://aml-ml-service.fraudfusion-services.svc.cluster.local:8100
+              value: http://model-router.fraudfusion-services.svc.cluster.local:8200
           ports:
             - name: http
               containerPort: 8081

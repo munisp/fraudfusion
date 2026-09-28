@@ -1,0 +1,170 @@
+{
+  "v3": {
+    "model": "fraud_net",
+    "version": "v3",
+    "n_samples": 2000,
+    "defense": "smoothing sigma=0.1, eval_n=25",
+    "clean_smoothed": {
+      "auc_pr": 0.482422798139755,
+      "auc_roc": 0.8252837446163014
+    },
+    "attacks": [
+      {
+        "attack": "bpda_lite",
+        "epsilon": 0.5,
+        "auc_pr": 0.26011216542452875,
+        "auc_roc": 0.601249650116026,
+        "evasion@review": {
+          "threshold": 0.3,
+          "fraud_detected_clean": 23,
+          "evaded": 5,
+          "success_rate": 0.21739130434782608
+        },
+        "evasion@block": {
+          "threshold": 0.8,
+          "fraud_detected_clean": 10,
+          "evaded": 4,
+          "success_rate": 0.4
+        }
+      },
+      {
+        "attack": "eot",
+        "epsilon": 0.5,
+        "auc_pr": 0.26019813119559365,
+        "auc_roc": 0.599795938637123,
+        "evasion@review": {
+          "threshold": 0.3,
+          "fraud_detected_clean": 23,
+          "evaded": 5,
+          "success_rate": 0.21739130434782608
+        },
+        "evasion@block": {
+          "threshold": 0.8,
+          "fraud_detected_clean": 10,
+          "evaded": 4,
+          "success_rate": 0.4
+        }
+      },
+      {
+        "attack": "bpda_lite",
+        "epsilon": 1.0,
+        "auc_pr": 0.08529803311849721,
+        "auc_roc": 0.3791117010230156,
+        "evasion@review": {
+          "threshold": 0.3,
+          "fraud_detected_clean": 23,
+          "evaded": 12,
+          "success_rate": 0.5217391304347826
+        },
+        "evasion@block": {
+          "threshold": 0.8,
+          "fraud_detected_clean": 10,
+          "evaded": 6,
+          "success_rate": 0.6
+        }
+      },
+      {
+        "attack": "eot",
+        "epsilon": 1.0,
+        "auc_pr": 0.08503352499270499,
+        "auc_roc": 0.37132847558938514,
+        "evasion@review": {
+          "threshold": 0.3,
+          "fraud_detected_clean": 23,
+          "evaded": 12,
+          "success_rate": 0.5217391304347826
+        },
+        "evasion@block": {
+          "threshold": 0.8,
+          "fraud_detected_clean": 10,
+          "evaded": 6,
+          "success_rate": 0.6
+        }
+      }
+    ]
+  },
+  "v4": {
+    "model": "fraud_net",
+    "version": "v4",
+    "n_samples": 2000,
+    "defense": "smoothing sigma=0.1, eval_n=25",
+    "clean_smoothed": {
+      "auc_pr": 0.47829207100950355,
+      "auc_roc": 0.8150806764724472
+    },
+    "attacks": [
+      {
+        "attack": "bpda_lite",
+        "epsilon": 0.5,
+        "auc_pr": 0.2781261780222758,
+        "auc_roc": 0.715424691424908,
+        "evasion@review": {
+          "threshold": 0.3,
+          "fraud_detected_clean": 15,
+          "evaded": 3,
+          "success_rate": 0.2
+        },
+        "evasion@block": {
+          "threshold": 0.8,
+          "fraud_detected_clean": 4,
+          "evaded": 1,
+          "success_rate": 0.25
+        }
+      },
+      {
+        "attack": "eot",
+        "epsilon": 0.5,
+        "auc_pr": 0.27807708074152143,
+        "auc_roc": 0.7132576681023195,
+        "evasion@review": {
+          "threshold": 0.3,
+          "fraud_detected_clean": 15,
+          "evaded": 3,
+          "success_rate": 0.2
+        },
+        "evasion@block": {
+          "threshold": 0.8,
+          "fraud_detected_clean": 4,
+          "evaded": 1,
+          "success_rate": 0.25
+        }
+      },
+      {
+        "attack": "bpda_lite",
+        "epsilon": 1.0,
+        "auc_pr": 0.12291606267414763,
+        "auc_roc": 0.585358145750377,
+        "evasion@review": {
+          "threshold": 0.3,
+          "fraud_detected_clean": 15,
+          "evaded": 9,
+          "success_rate": 0.6
+        },
+        "evasion@block": {
+          "threshold": 0.8,
+          "fraud_detected_clean": 4,
+          "evaded": 1,
+          "success_rate": 0.25
+        }
+      },
+      {
+        "attack": "eot",
+        "epsilon": 1.0,
+        "auc_pr": 0.12285080005353782,
+        "auc_roc": 0.5819812010726766,
+        "evasion@review": {
+          "threshold": 0.3,
+          "fraud_detected_clean": 15,
+          "evaded": 9,
+          "success_rate": 0.6
+        },
+        "evasion@block": {
+          "threshold": 0.8,
+          "fraud_detected_clean": 4,
+          "evaded": 1,
+          "success_rate": 0.25
+        }
+      }
+    ]
+  }
+}

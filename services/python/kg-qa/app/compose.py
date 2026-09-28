@@ -61,7 +61,9 @@ def render_path_text(hops: list[dict[str, Any]],
 
 def template_answer(question: str, paths: list[dict[str, Any]],
                     entities: dict[str, dict[str, Any]],
-                    linked: list[dict[str, Any]]) -> str:
+                    linked: list[dict[str, Any]],
+                    window: Any = None) -> str:
+    scope = f" within {window.describe()} ('{window.phrase}')" if window else ""
     if not linked:
         return ("I could not link any part of your question to entities in the "
                 "fraud knowledge graph. Try mentioning a bank, state/city, alert "
@@ -69,6 +71,11 @@ def template_answer(question: str, paths: list[dict[str, Any]],
                 "customer_pii_…). No answer was generated.")
     if not paths:
         names = ", ".join(f"{l['label'] or 'Entity'} ({l['matched']})" for l in linked)
+        if window:
+            return (f"I linked your question to {names}, but found no "
+                    f"relationship paths {scope}. Only edges timestamped inside "
+                    f"the window were considered (undated edges are excluded); "
+                    f"the graph may hold connections outside this period.")
         return (f"I linked your question to {names}, but found no relationship "
                 f"paths within the hop bound. The graph may not (yet) contain "
                 f"connections for these entities.")
@@ -76,7 +83,7 @@ def template_answer(question: str, paths: list[dict[str, Any]],
     for i, p in enumerate(paths, 1):
         text = render_path_text(p["hops"], entities)
         lines.append(f"{i}. {text} (score {p['score']:.3f})")
-    header = (f"Based on the fraud knowledge graph, {len(paths)} relevant "
+    header = (f"Based on the fraud knowledge graph{scope}, {len(paths)} relevant "
               f"relationship path(s) were found:")
     return header + "\n" + "\n".join(lines)
 

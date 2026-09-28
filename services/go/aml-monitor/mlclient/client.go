@@ -2,7 +2,8 @@
 // ML inference service. It replaces the previous gRPC integration, which
 // referenced generated protobuf code that never existed.
 //
-// Base URL comes from AML_ML_SERVICE_URL (default http://localhost:8100);
+// Base URL comes from AML_ML_SERVICE_URL (default http://localhost:8200,
+// the A/B model router, which fronts champion/challenger AML models);
 // transaction scoring uses POST /v1/aml/score. Every call has a bounded
 // timeout and one retry; errors are returned so callers can fail closed to
 // manual review.
@@ -18,25 +19,40 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/munisp/fraudfusion/services/go/authcommon"
 )
 
 // Client is an HTTP client for the AML ML inference service.
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
+	breaker    *authcommon.Breaker
 }
 
 // NewClient validates the base URL.
 func NewClient(baseURL string) (*Client, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
-		baseURL = "http://localhost:8100"
+		// Default targets the A/B model router (port 8200), not a single
+		// model pod, so champion/challenger routing stays centralized.
+		baseURL = "http://localhost:8200"
 	}
 	if _, err := url.ParseRequestURI(baseURL); err != nil {
 		return nil, fmt.Errorf("invalid AML_ML_SERVICE_URL: %w", err)
 	}
-	return &Client{baseURL: baseURL, httpClient: &http.Client{Timeout: 10 * time.Second}}, nil
+	return &Client{
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		// Per-dependency breaker: 5 consecutive failures open the circuit
+		// for 30s; while open, calls fail fast with ErrBreakerOpen (no retry
+		// ladder burn against a down router).
+		breaker: authcommon.NewBreaker("aml-ml-service"),
+	}, nil
 }
+
+// BreakerState exposes the circuit breaker state for health endpoints.
+func (c *Client) BreakerState() string { return c.breaker.State() }
 
 // BaseURL returns the configured base URL (used by health checks).
 func (c *Client) BaseURL() string { return c.baseURL }
@@ -129,7 +145,16 @@ type SourceOfFundsResponse struct {
 }
 
 // post issues a JSON POST with one retry and decodes the response into out.
+// The whole call runs inside the dependency circuit breaker: when the
+// breaker is open it returns ErrBreakerOpen immediately instead of burning
+// the retry ladder against a down dependency.
 func (c *Client) post(ctx context.Context, path string, payload, out interface{}) error {
+	return c.breaker.Execute(func() error {
+		return c.postOnce(ctx, path, payload, out)
+	})
+}
+
+func (c *Client) postOnce(ctx context.Context, path string, payload, out interface{}) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("encode ML request: %w", err)
@@ -226,17 +251,19 @@ func (c *Client) VerifySourceOfFunds(ctx context.Context, req *SourceOfFundsRequ
 
 // Health probes the ML service root/liveness endpoint.
 func (c *Client) Health(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/healthz", nil)
-	if err != nil {
-		return err
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("ML service health: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 500 {
-		return fmt.Errorf("ML service unhealthy: status %d", resp.StatusCode)
-	}
-	return nil
+	return c.breaker.Execute(func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/healthz", nil)
+		if err != nil {
+			return err
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("ML service health: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			return fmt.Errorf("ML service unhealthy: status %d", resp.StatusCode)
+		}
+		return nil
+	})
 }

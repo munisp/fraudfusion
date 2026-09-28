@@ -42,7 +42,10 @@ logger = logging.getLogger("aml-service")
 
 SERVICE_NAME = "aml-ml-service"
 MODEL_NAME = os.getenv("AML_MODEL_NAME", "fraud_net")
-MODEL_VERSION = os.getenv("AML_MODEL_VERSION", "v1")
+# Default v3: the shipped Bayesian calibration artifact
+# (ml/artifacts/bayesian_calibration/v1) was fit on fraud_net/v3 score
+# distributions; serving v1 with it caused silent model/calibration skew.
+MODEL_VERSION = os.getenv("AML_MODEL_VERSION", "v3")
 def _default_artifact_dir() -> Path:
     rel = Path("ml") / "artifacts" / MODEL_NAME / MODEL_VERSION
     # Repo checkout: <repo>/mlops/serving/aml_service.py -> <repo>/ml/...
@@ -228,7 +231,48 @@ class ScoreCalibrator:
         self.calibration_mode = "uncalibrated_fallback"
         self.posterior_version: str | None = None
         self.load_error: str | None = None
+        # version of the base model the calibration posterior was fit on
+        # (from metrics.json), e.g. "v3"; None if unknown
+        self.base_model_version: str | None = None
+        # one of: ok | version_mismatch | unknown_base_version | unavailable
+        self.calibration_status = "unavailable"
         self._try_load()
+
+    @staticmethod
+    def _parse_base_model_version(metrics: dict[str, Any]) -> str | None:
+        """Extract the base model version from the calibration metrics.json
+        (accepts "base_model": "fraud_net/v3" or "base_model_version": "v3")."""
+        base = metrics.get("base_model_version") or metrics.get("base_model")
+        if not base:
+            return None
+        return str(base).rsplit("/", 1)[-1]
+
+    def check_consistency(self, model_version: str) -> str:
+        """Compare the calibration artifact's base model version against the
+        serving model version. A mismatch is LOUD (WARNING log + /health
+        carries calibration_status="version_mismatch") but never blocks
+        serving — the calibrated scores are honestly labeled."""
+        if self.samples is None:
+            self.calibration_status = "unavailable"
+        elif self.base_model_version is None:
+            self.calibration_status = "unknown_base_version"
+        elif self.base_model_version != model_version:
+            self.calibration_status = "version_mismatch"
+            logger.warning(
+                "CALIBRATION VERSION MISMATCH: calibration posterior %s was "
+                "fit on %s/%s score distributions, but the serving model is "
+                "%s/%s. Calibrated probabilities may be systematically off — "
+                "refit via `python -m ml.bayesian.fraud_calibration` or pin "
+                "AML_MODEL_VERSION=%s. Still serving (honestly labeled).",
+                self.posterior_version, MODEL_NAME, self.base_model_version,
+                MODEL_NAME, model_version, self.base_model_version,
+            )
+        else:
+            self.calibration_status = "ok"
+            logger.info(
+                "Calibration consistency check OK: posterior fit on "
+                "%s/%s matches serving version.", MODEL_NAME, model_version)
+        return self.calibration_status
 
     def _try_load(self) -> None:
         path = CALIBRATION_DIR / "posterior.npz"
@@ -249,6 +293,10 @@ class ScoreCalibrator:
             meta = json.loads(str(z["meta_json"])) if "meta_json" in z else {}
             self.samples = samples
             self.posterior_version = f"bayesian_calibration/{meta.get('version', CALIBRATION_DIR.name)}"
+            metrics_path = CALIBRATION_DIR / "metrics.json"
+            if metrics_path.exists():
+                metrics = json.loads(metrics_path.read_text())
+                self.base_model_version = self._parse_base_model_version(metrics)
             self.calibration_mode = "bayesian"
             logger.info("Loaded Bayesian calibration posterior from %s (%d draws, version %s)",
                         path, len(samples), self.posterior_version)
@@ -386,6 +434,9 @@ def risk_band(score: float) -> str:
 async def lifespan(app: FastAPI):
     app.state.model = FraudModel()
     app.state.calibrator = ScoreCalibrator()
+    # Startup consistency check: calibration posterior must have been fit on
+    # the model version being served (loud WARNING + health label if not).
+    app.state.calibrator.check_consistency(MODEL_VERSION)
     app.state.requests_served = 0
     app.state.total_latency_ms = 0.0
     yield
@@ -418,6 +469,8 @@ async def health(request: Request) -> dict[str, Any]:
     calibrator: ScoreCalibrator = request.app.state.calibrator
     payload["calibration_mode"] = calibrator.calibration_mode
     payload["calibration_posterior_version"] = calibrator.posterior_version
+    payload["calibration_status"] = calibrator.calibration_status
+    payload["calibration_base_model_version"] = calibrator.base_model_version
     if calibrator.load_error:
         payload["calibration_load_error"] = calibrator.load_error
     return payload

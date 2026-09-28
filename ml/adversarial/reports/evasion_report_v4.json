@@ -1,0 +1,249 @@
+{
+  "model": "fraud_net",
+  "version": "v4",
+  "n_samples": 4000,
+  "base_rate": 0.027499999850988388,
+  "epsilon_units": "L_inf in standardized (z-score) feature space",
+  "clean": {
+    "auc_pr": 0.415748878450295,
+    "auc_roc": 0.7848305678896939,
+    "evasion@review": {
+      "threshold": 0.3,
+      "fraud_detected_clean": 28,
+      "evaded": 0,
+      "success_rate": 0.0
+    },
+    "evasion@block": {
+      "threshold": 0.8,
+      "fraud_detected_clean": 8,
+      "evaded": 0,
+      "success_rate": 0.0
+    }
+  },
+  "thresholds": {
+    "review": 0.3,
+    "block": 0.8
+  },
+  "attacks": [
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 0.0,
+      "pgd_steps": 1,
+      "auc_pr": 0.415748878450295,
+      "auc_roc": 0.7848305678896939,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "mean_linf_z": 0.0,
+      "runtime_s": 0.01
+    },
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 0.1,
+      "pgd_steps": 1,
+      "auc_pr": 0.39361884159656757,
+      "auc_roc": 0.7619023136246785,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 3,
+        "success_rate": 0.10714285714285714
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 1,
+        "success_rate": 0.125
+      },
+      "mean_linf_z": 0.10000001639127731,
+      "runtime_s": 0.04
+    },
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 0.25,
+      "pgd_steps": 1,
+      "auc_pr": 0.3484121967517587,
+      "auc_roc": 0.7295629820051415,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 6,
+        "success_rate": 0.21428571428571427
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 1,
+        "success_rate": 0.125
+      },
+      "mean_linf_z": 0.25,
+      "runtime_s": 0.05
+    },
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 0.5,
+      "pgd_steps": 1,
+      "auc_pr": 0.26154137269001076,
+      "auc_roc": 0.6784903014723066,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 9,
+        "success_rate": 0.32142857142857145
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 2,
+        "success_rate": 0.25
+      },
+      "mean_linf_z": 0.5,
+      "runtime_s": 0.02
+    },
+    {
+      "engine": "torch",
+      "attack": "fgsm",
+      "epsilon": 1.0,
+      "pgd_steps": 1,
+      "auc_pr": 0.12366472465478665,
+      "auc_roc": 0.5868333722832438,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 18,
+        "success_rate": 0.6428571428571429
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 2,
+        "success_rate": 0.25
+      },
+      "mean_linf_z": 1.0,
+      "runtime_s": 0.03
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 0.0,
+      "pgd_steps": 20,
+      "auc_pr": 0.415748878450295,
+      "auc_roc": 0.7848305678896939,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 0,
+        "success_rate": 0.0
+      },
+      "mean_linf_z": 0.0,
+      "runtime_s": 0.01
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 0.1,
+      "pgd_steps": 20,
+      "auc_pr": 0.39349980969207654,
+      "auc_roc": 0.7615541014255667,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 3,
+        "success_rate": 0.10714285714285714
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 1,
+        "success_rate": 0.125
+      },
+      "mean_linf_z": 0.10000001639127731,
+      "runtime_s": 0.32
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 0.25,
+      "pgd_steps": 20,
+      "auc_pr": 0.3465869984490524,
+      "auc_roc": 0.7279270857677028,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 6,
+        "success_rate": 0.21428571428571427
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 1,
+        "success_rate": 0.125
+      },
+      "mean_linf_z": 0.25,
+      "runtime_s": 0.31
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 0.5,
+      "pgd_steps": 20,
+      "auc_pr": 0.2559491969996316,
+      "auc_roc": 0.6719735919607386,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 9,
+        "success_rate": 0.32142857142857145
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 2,
+        "success_rate": 0.25
+      },
+      "mean_linf_z": 0.4999048113822937,
+      "runtime_s": 0.32
+    },
+    {
+      "engine": "torch",
+      "attack": "pgd",
+      "epsilon": 1.0,
+      "pgd_steps": 20,
+      "auc_pr": 0.11281089911785348,
+      "auc_roc": 0.5512643140920777,
+      "evasion@review": {
+        "threshold": 0.3,
+        "fraud_detected_clean": 28,
+        "evaded": 18,
+        "success_rate": 0.6428571428571429
+      },
+      "evasion@block": {
+        "threshold": 0.8,
+        "fraud_detected_clean": 8,
+        "evaded": 2,
+        "success_rate": 0.25
+      },
+      "mean_linf_z": 0.9991871118545532,
+      "runtime_s": 0.3
+    }
+  ]
+}

@@ -167,6 +167,62 @@ class MerchantApplicationView(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class AgentSubmission(BaseModel):
+    """CBN agent-banking agent onboarding. The BVN is captured BY REFERENCE
+    ONLY: the service stores a salted SHA-256 hash, never the plaintext."""
+    agent_code: str = Field(min_length=3, max_length=100)
+    full_name: str = Field(min_length=2, max_length=200)
+    principal_fintech: str = Field(min_length=2, max_length=255)
+    principal_reference: str = Field(min_length=3, max_length=255)
+    bvn: str = Field(min_length=11, max_length=11)
+    float_account_number: str = Field(min_length=10, max_length=10)
+    float_account_bank: str = Field(min_length=3, max_length=10)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    cbn_tier: str = Field(pattern="^(tier_1|tier_2|tier_3)$")
+
+    @field_validator("bvn")
+    @classmethod
+    def _bvn_digits(cls, value: str) -> str:
+        if not value.isdigit():
+            raise ValueError("BVN must be 11 digits")
+        return value
+
+    @field_validator("float_account_number")
+    @classmethod
+    def _nuban(cls, value: str) -> str:
+        if not value.isdigit():
+            raise ValueError("float account must be a 10-digit NUBAN")
+        return value
+
+
+class AgentApplicationView(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    id: str
+    agent_code: str
+    full_name: str
+    principal_fintech: str
+    principal_reference: str
+    float_account_number: str
+    float_account_bank: str
+    latitude: float
+    longitude: float
+    cbn_tier: str = Field(serialization_alias="cbnTier")
+    status: str
+    screening_status: str = Field(serialization_alias="screeningStatus")
+    submitted_by: str = Field(serialization_alias="submittedBy")
+    reviewed_by: Optional[str] = Field(default=None, serialization_alias="reviewedBy")
+    approved_by: Optional[str] = Field(default=None, serialization_alias="approvedBy")
+    created_at: str = Field(serialization_alias="createdAt")
+    updated_at: str = Field(serialization_alias="updatedAt")
+
+
+class AgentApplicationPage(BaseModel):
+    items: list[AgentApplicationView]
+    next_cursor: Optional[str] = Field(default=None, serialization_alias="nextCursor")
+
+
 class RegulatorAccessRequest(BaseModel):
     regulator_org: str = Field(alias="regulatorOrg", min_length=2, max_length=100)
     principal_sub: str = Field(alias="principalSub", min_length=1, max_length=200)
@@ -186,3 +242,27 @@ class RegulatorAccessView(BaseModel):
     expires_at: str = Field(alias="expiresAt")
 
     model_config = {"populate_by_name": True}
+
+
+# ---------------------------------------------------------------------------
+# Keyset-paginated list envelopes. Hot list endpoints return one of these
+# instead of an unbounded array: `items` plus an opaque `next_cursor` that the
+# caller passes back as the `cursor` query param until it comes back null.
+# Keyset (WHERE (created_at, id) </> (cursor...)) keeps page cost O(limit)
+# regardless of depth, unlike OFFSET scans.
+# ---------------------------------------------------------------------------
+
+
+class ApiKeyRequestPage(BaseModel):
+    items: list[ApiKeyRequestView]
+    next_cursor: Optional[str] = None
+
+
+class KybApplicationPage(BaseModel):
+    items: list[KybApplicationView]
+    next_cursor: Optional[str] = None
+
+
+class MerchantApplicationPage(BaseModel):
+    items: list[MerchantApplicationView]
+    next_cursor: Optional[str] = None

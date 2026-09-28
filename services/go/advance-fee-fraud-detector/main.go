@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -37,13 +38,25 @@ type Message struct {
 
 // RiskAnalysis represents the fraud analysis result
 type RiskAnalysis struct {
-	MessageID      string   `json:"message_id"`
-	RiskScore      int      `json:"risk_score"`
-	RiskLevel      string   `json:"risk_level"`
-	ScamType       string   `json:"scam_type"`
-	Is419Scam      bool     `json:"is_419_scam"`
-	RedFlags       []string `json:"red_flags"`
-	Recommendation string   `json:"recommendation"`
+	MessageID       string          `json:"message_id"`
+	RiskScore       int             `json:"risk_score"`
+	RiskLevel       string          `json:"risk_level"`
+	ScamType        string          `json:"scam_type"`
+	Is419Scam       bool            `json:"is_419_scam"`
+	RedFlags        []string        `json:"red_flags"`
+	Recommendation  string          `json:"recommendation"`
+	LanguageAnomaly LanguageAnomaly `json:"language_anomaly"`
+}
+
+// LanguageAnomaly reports the language_anomaly_score. It is an explicit,
+// measurable-signal HEURISTIC (heuristic: true) — it is NOT a linguistic or
+// grammar model and makes no such claim.
+type LanguageAnomaly struct {
+	Score              float64 `json:"score"` // 0.0-1.0
+	Heuristic          bool    `json:"heuristic"`
+	MisspellingDensity float64 `json:"misspelling_density"`
+	CapsRatio          float64 `json:"caps_ratio"`
+	UrgentKeywordHits  int     `json:"urgent_payment_keyword_hits"`
 }
 
 // FeeRequest represents a detected fee request
@@ -70,6 +83,7 @@ func main() {
 	// All routes require a valid Keycloak token (fail-closed introspection);
 	// mutating actions additionally require fraud_analyst/admin.
 	router.Use(authMiddleware())
+	router.Use(tenantBindingMiddleware())
 
 	// API routes
 	v1 := router.Group("/api/v1/advance-fee-fraud")
@@ -178,7 +192,8 @@ func performAnalysis(message Message) RiskAnalysis {
 	redFlags := []string{}
 	scamTypes := []string{}
 
-	combinedText := strings.ToLower(message.Subject + " " + message.Content)
+	rawText := message.Subject + " " + message.Content
+	combinedText := strings.ToLower(rawText)
 
 	// Check for Nigerian prince / 419 patterns
 	if is419, flags := detect419Pattern(combinedText); is419 {
@@ -226,10 +241,14 @@ func performAnalysis(message Message) RiskAnalysis {
 		redFlags = append(redFlags, "Suspicious sender email pattern")
 	}
 
-	// Check for poor grammar (common in 419 scams)
-	if hasGrammarIssues(combinedText) {
+	// Language anomaly heuristic: measurable signals only (out-of-vocabulary
+	// density against a small embedded wordlist, excessive-caps ratio,
+	// urgent-payment keyword hits). This replaced a fake "grammar check"
+	// that matched greeting phrases and claimed to detect grammar issues.
+	anomaly := languageAnomalyScore(rawText, combinedText)
+	if anomaly.Score >= 0.5 {
 		riskScore += 15
-		redFlags = append(redFlags, "Poor grammar/spelling detected")
+		redFlags = append(redFlags, "Language anomalies detected (misspellings/caps/urgent-payment keywords)")
 	}
 
 	// Free webmail is never a standalone signal (it is the norm in Nigeria);
@@ -252,13 +271,14 @@ func performAnalysis(message Message) RiskAnalysis {
 	recommendation := generateRecommendation(riskScore, scamType)
 
 	return RiskAnalysis{
-		MessageID:      message.ID,
-		RiskScore:      min(riskScore, 100),
-		RiskLevel:      riskLevel,
-		ScamType:       scamType,
-		Is419Scam:      riskScore >= 60,
-		RedFlags:       redFlags,
-		Recommendation: recommendation,
+		MessageID:       message.ID,
+		RiskScore:       min(riskScore, 100),
+		RiskLevel:       riskLevel,
+		ScamType:        scamType,
+		Is419Scam:       riskScore >= 60,
+		RedFlags:        redFlags,
+		Recommendation:  recommendation,
+		LanguageAnomaly: anomaly,
 	}
 }
 
@@ -444,36 +464,99 @@ func verifySenderLegitimacy(email string) bool {
 	return !suspiciousLocalPart.MatchString(strings.ToLower(email))
 }
 
-func hasGrammarIssues(text string) bool {
-	// Simplified grammar check
-	issues := 0
-
-	// Multiple spaces
-	if strings.Contains(text, "  ") {
-		issues++
+// embeddedCommonWords is a small wordlist of frequent English words plus
+// legitimate finance vocabulary. It is deliberately small: the
+// misspelling_density signal is an out-of-vocabulary RATIO, not a
+// spellchecker, and is only one of three weighted signals.
+var embeddedCommonWords = func() map[string]struct{} {
+	words := []string{
+		"the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "for", "with", "is", "are", "was", "were",
+		"be", "been", "being", "i", "you", "he", "she", "it", "we", "they", "them", "his", "her", "its", "our",
+		"your", "my", "me", "him", "us", "this", "that", "these", "those", "there", "here", "as", "at", "by",
+		"from", "into", "about", "after", "before", "over", "under", "again", "once", "just", "also", "very",
+		"can", "could", "will", "would", "shall", "should", "may", "might", "must", "do", "does", "did", "done",
+		"have", "has", "had", "not", "no", "yes", "if", "then", "than", "so", "such", "when", "while", "where",
+		"which", "who", "whom", "what", "how", "why", "all", "any", "both", "each", "few", "more", "most",
+		"other", "some", "only", "own", "same", "too", "now", "out", "off", "up", "down", "dear", "sir", "madam",
+		"friend", "hello", "greetings", "mr", "mrs", "ms", "dr", "am", "pm", "please", "thank", "thanks",
+		"regards", "sincerely", "yours", "faithfully", "reply", "response", "email", "mail", "message", "write",
+		"writing", "contact", "contacting", "inform", "tell", "know", "let", "need", "want", "like", "help",
+		"give", "get", "got", "send", "sent", "receive", "received", "call", "phone", "name", "address", "date",
+		"time", "day", "days", "week", "month", "year", "today", "tomorrow", "soon", "new", "good", "great",
+		"well", "much", "many", "first", "last", "next", "kind", "information", "details", "account", "bank",
+		"banking", "transfer", "payment", "pay", "paid", "fund", "funds", "money", "amount", "sum", "balance",
+		"deposit", "withdraw", "credit", "debit", "transaction", "wire", "check", "cheque", "cash", "usd",
+		"dollar", "dollars", "naira", "euro", "euros", "pounds", "currency", "fee", "fees", "charge", "cost",
+		"price", "total", "percent", "number", "card", "code", "document", "documents", "form", "id",
+		"passport", "license", "company", "business", "office", "manager", "director", "president", "minister",
+		"government", "official", "legal", "lawyer", "attorney", "contract", "agreement", "proposal", "offer",
+		"deal", "partner", "client", "customer", "service", "security", "secure", "safe", "confidential",
+		"private", "personal", "urgent", "immediate", "immediately", "attention", "important", "verify",
+		"confirm", "confirmation", "process", "processing", "release", "claim", "claims", "winner", "winning",
+		"lottery", "prize", "award", "fund", "inheritance", "estate", "beneficiary", "heir", "kin", "relative",
+		"late", "deceased", "death", "died", "will", "left", "behalf", "sincerely", "await", "waiting",
+		"hearing", "hope", "hoping", "able", "enable", "necessary", "required", "require", "upon", "above",
+		"below", "between", "through", "during", "without", "within", "per", "via", "etc", "re", "ref",
 	}
-
-	// Excessive punctuation
-	if strings.Count(text, "!") > 3 || strings.Count(text, "?") > 3 {
-		issues++
+	set := make(map[string]struct{}, len(words))
+	for _, w := range words {
+		set[w] = struct{}{}
 	}
+	return set
+}()
 
-	// Common grammar errors in scams
-	grammarErrors := []string{
-		"i am writing you",
-		"i am contacting you",
-		"this is to inform you that",
-		"dear sir/madam",
-		"dear friend",
-	}
+// urgentPaymentKeywords are multi/single-word urgent-payment phrases whose
+// presence is a measurable scam signal (counted as hits).
+var urgentPaymentKeywords = []string{
+	"urgent payment", "urgent transfer", "act now", "act immediately", "immediately transfer",
+	"wire the", "send the fee", "pay the fee", "processing fee", "advance fee", "upfront fee",
+	"western union", "moneygram", "gift card", "itunes card", "within 24 hours", "within 48 hours",
+	"expire", "expires soon", "last chance", "final notice", "do not delay", "without delay",
+}
 
-	for _, error := range grammarErrors {
-		if strings.Contains(text, error) {
-			issues++
+var wordTokenPattern = regexp.MustCompile(`[a-zA-Z]{3,}`)
+
+// languageAnomalyScore computes an HONEST heuristic from three measurable
+// signals only. It makes no grammar/linguistic claims:
+//  1. misspelling_density: fraction of >=3-letter tokens absent from the
+//     small embedded wordlist (a crude out-of-vocabulary ratio — names and
+//     jargon count, which is why it is only weighted 0.4 and labeled
+//     heuristic).
+//  2. caps_ratio: fraction of >=3-letter tokens that are ALL CAPS in the
+//     original (un-lowercased) text; sustained SHOUTING is a scam tell.
+//  3. urgent_payment_keyword_hits: count of urgent-payment phrase hits.
+func languageAnomalyScore(rawText, lowerText string) LanguageAnomaly {
+	result := LanguageAnomaly{Heuristic: true}
+
+	tokens := wordTokenPattern.FindAllString(rawText, -1)
+	if len(tokens) > 0 {
+		unknown := 0
+		caps := 0
+		for _, tok := range tokens {
+			if len(tok) >= 3 && tok == strings.ToUpper(tok) {
+				caps++
+			}
+			if _, ok := embeddedCommonWords[strings.ToLower(tok)]; !ok {
+				unknown++
+			}
 		}
+		result.MisspellingDensity = float64(unknown) / float64(len(tokens))
+		result.CapsRatio = float64(caps) / float64(len(tokens))
+	}
+	for _, kw := range urgentPaymentKeywords {
+		result.UrgentKeywordHits += strings.Count(lowerText, kw)
 	}
 
-	return issues >= 2
+	// Weighted blend, capped at 1.0. Caps only count when the message is long
+	// enough for a ratio to be meaningful; keyword hits saturate at 3.
+	densityScore := math.Min(result.MisspellingDensity/0.6, 1.0) * 0.4
+	capsScore := 0.0
+	if len(tokens) >= 8 {
+		capsScore = math.Min(result.CapsRatio/0.25, 1.0) * 0.3
+	}
+	keywordScore := math.Min(float64(result.UrgentKeywordHits)/3.0, 1.0) * 0.3
+	result.Score = math.Round(math.Min(densityScore+capsScore+keywordScore, 1.0)*1000) / 1000
+	return result
 }
 
 func getRiskLevel(score int) string {

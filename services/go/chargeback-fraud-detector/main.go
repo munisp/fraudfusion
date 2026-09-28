@@ -74,6 +74,19 @@ type app struct {
 	db        *pgxpool.Pool
 	keycloak  *keycloakClient
 	serverURL string
+	// historyWindowDays is the SINGLE lookback window used for every
+	// customer/merchant history feature (count and decision aggregates).
+	// Default 90 days: card-scheme dispute windows are ~90-120 days, so 90
+	// covers the actionable chargeback history without diluting the recency
+	// signal with year-old disputes. Previously different features silently
+	// used different windows (some 365d), which made scores non-comparable.
+	historyWindowDays int
+}
+
+// historyInterval renders the configured window as a Postgres interval
+// string. historyWindowDays is a validated positive int, so this is safe.
+func (a *app) historyInterval() string {
+	return fmt.Sprintf("%d days", a.historyWindowDays)
 }
 
 func main() {
@@ -102,7 +115,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure Keycloak client: %v", err)
 	}
-	application := &app{db: pool, keycloak: keycloak, serverURL: ":8091"}
+	application := &app{db: pool, keycloak: keycloak, serverURL: ":8091", historyWindowDays: intEnv("HISTORY_WINDOW_DAYS", 90)}
 	if value := os.Getenv("LISTEN_ADDR"); value != "" {
 		application.serverURL = value
 	}
@@ -196,9 +209,9 @@ func (a *app) detectFriendlyFraud(c *gin.Context) {
 	var priorCases int
 	err := a.db.QueryRow(ctx, `
 		SELECT
-			(SELECT COUNT(*) FROM dispute_records WHERE tenant_id=$1 AND customer_id=$2 AND created_at >= NOW() - INTERVAL '365 days'),
-			(SELECT COUNT(*) FROM friendly_fraud_cases WHERE tenant_id=$1 AND customer_id=$2 AND created_at >= NOW() - INTERVAL '365 days')`,
-		req.TenantID, req.CustomerID).Scan(&chargebackCount, &priorCases)
+			(SELECT COUNT(*) FROM dispute_records WHERE tenant_id=$1 AND customer_id=$2 AND created_at >= NOW() - $3::interval),
+			(SELECT COUNT(*) FROM friendly_fraud_cases WHERE tenant_id=$1 AND customer_id=$2 AND created_at >= NOW() - $3::interval)`,
+		req.TenantID, req.CustomerID, a.historyInterval()).Scan(&chargebackCount, &priorCases)
 	if err != nil {
 		internalError(c, err)
 		return
@@ -261,9 +274,20 @@ func (a *app) detectChargebackAbuse(c *gin.Context) {
 	}
 	threshold := abuseThreshold(req.TimeWindow)
 	abuseDetected := count >= threshold
-	if _, err := a.db.Exec(ctx, `INSERT INTO chargeback_abuse_patterns (tenant_id, customer_id, chargeback_count, time_window) VALUES ($1,$2,$3,$4)`, req.TenantID, req.CustomerID, count, req.TimeWindow); err != nil {
+	// Pattern-log writes are gated: a row is only appended when the abuse
+	// DECISION flipped or the normalized abuse score moved by more than 0.1
+	// since the last logged evaluation. Logging every evaluation made the
+	// table an unbounded echo of traffic, drowning real trend changes.
+	shouldLog, err := a.shouldLogAbusePattern(ctx, req.TenantID, req.CustomerID, count, threshold, req.TimeWindow)
+	if err != nil {
 		internalError(c, err)
 		return
+	}
+	if shouldLog {
+		if _, err := a.db.Exec(ctx, `INSERT INTO chargeback_abuse_patterns (tenant_id, customer_id, chargeback_count, time_window) VALUES ($1,$2,$3,$4)`, req.TenantID, req.CustomerID, count, req.TimeWindow); err != nil {
+			internalError(c, err)
+			return
+		}
 	}
 	response := gin.H{"customer_id": req.CustomerID, "abuse_detected": abuseDetected, "chargeback_count": count, "time_window_days": req.TimeWindow, "abuse_threshold": threshold, "evaluated_at": time.Now().UTC().Format(time.RFC3339)}
 	if err := a.persistDecision(ctx, req.TenantID, req.CustomerID, "chargeback_abuse", ratioScore(count, threshold), response, actor(c)); err != nil {
@@ -325,7 +349,7 @@ func (a *app) analyzeDispute(c *gin.Context) {
 		return
 	}
 	var priorDisputes int
-	if err := a.db.QueryRow(ctx, `SELECT COUNT(*) FROM dispute_records WHERE tenant_id=$1 AND customer_id=$2 AND created_at >= NOW() - INTERVAL '365 days'`, req.TenantID, req.CustomerID).Scan(&priorDisputes); err != nil {
+	if err := a.db.QueryRow(ctx, `SELECT COUNT(*) FROM dispute_records WHERE tenant_id=$1 AND customer_id=$2 AND created_at >= NOW() - $3::interval`, req.TenantID, req.CustomerID, a.historyInterval()).Scan(&priorDisputes); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -359,7 +383,7 @@ func (a *app) getCustomerRiskScore(c *gin.Context) {
 	defer cancel()
 	var disputeCount int
 	var averageScore float64
-	if err := a.db.QueryRow(ctx, `SELECT COUNT(*), COALESCE(AVG(score),0) FROM chargeback_risk_decisions WHERE tenant_id=$1 AND subject_id=$2 AND created_at >= NOW() - INTERVAL '365 days'`, tenantID, customerID).Scan(&disputeCount, &averageScore); err != nil {
+	if err := a.db.QueryRow(ctx, `SELECT COUNT(*), COALESCE(AVG(score),0) FROM chargeback_risk_decisions WHERE tenant_id=$1 AND subject_id=$2 AND created_at >= NOW() - $3::interval`, tenantID, customerID, a.historyInterval()).Scan(&disputeCount, &averageScore); err != nil {
 		internalError(c, err)
 		return
 	}
@@ -420,7 +444,7 @@ func (a *app) persistDecision(ctx context.Context, tenantID, subjectID, decision
 func (a *app) lookupHistory(ctx context.Context, tenantID, customerID, merchantID string) (int, int, error) {
 	var customerCount int
 	var merchantCount int
-	err := a.db.QueryRow(ctx, `SELECT (SELECT COUNT(*) FROM dispute_records WHERE tenant_id=$1 AND customer_id=$2 AND created_at >= NOW() - INTERVAL '365 days'), (SELECT COUNT(*) FROM dispute_records d JOIN chargeback_transactions t ON t.tenant_id=d.tenant_id AND t.transaction_id=d.transaction_id WHERE t.tenant_id=$1 AND t.merchant_id=$3 AND d.created_at >= NOW() - INTERVAL '365 days')`, tenantID, customerID, merchantID).Scan(&customerCount, &merchantCount)
+	err := a.db.QueryRow(ctx, `SELECT (SELECT COUNT(*) FROM dispute_records WHERE tenant_id=$1 AND customer_id=$2 AND created_at >= NOW() - $4::interval), (SELECT COUNT(*) FROM dispute_records d JOIN chargeback_transactions t ON t.tenant_id=d.tenant_id AND t.transaction_id=d.transaction_id WHERE t.tenant_id=$1 AND t.merchant_id=$3 AND d.created_at >= NOW() - $4::interval)`, tenantID, customerID, merchantID, a.historyInterval()).Scan(&customerCount, &merchantCount)
 	return customerCount, merchantCount, err
 }
 
@@ -708,6 +732,31 @@ func abuseThreshold(window int) int {
 		return 5
 	}
 	return 8
+}
+
+// shouldLogAbusePattern compares the current evaluation against the most
+// recent logged pattern for this customer and reports whether it represents
+// a material change: no prior row, a decision flip, or a normalized score
+// delta > 0.1.
+func (a *app) shouldLogAbusePattern(ctx context.Context, tenantID, customerID string, count, threshold, window int) (bool, error) {
+	var priorCount, priorWindow int
+	err := a.db.QueryRow(ctx, `SELECT chargeback_count, time_window FROM chargeback_abuse_patterns WHERE tenant_id=$1 AND customer_id=$2 ORDER BY id DESC LIMIT 1`, tenantID, customerID).Scan(&priorCount, &priorWindow)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true, nil // first evaluation for this customer: establish baseline
+	}
+	if err != nil {
+		return false, err
+	}
+	return abusePatternChanged(priorCount, priorWindow, count, threshold), nil
+}
+
+// abusePatternChanged is the pure decision rule behind pattern-log gating.
+func abusePatternChanged(priorCount, priorWindow, count, threshold int) bool {
+	if (priorCount >= abuseThreshold(priorWindow)) != (count >= threshold) {
+		return true // decision changed
+	}
+	scoreDelta := math.Abs(ratioScore(count, threshold)/100 - ratioScore(priorCount, abuseThreshold(priorWindow))/100)
+	return scoreDelta > 0.1
 }
 
 func ratioScore(actual, threshold int) float64 {

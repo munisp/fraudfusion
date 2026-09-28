@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/munisp/fraudfusion/services/go/authcommon"
 
 	"github.com/munisp/fraudfusion/services/go/aml-monitor/mlclient"
 	"github.com/munisp/fraudfusion/services/go/aml-monitor/models"
@@ -43,6 +45,17 @@ func NewAMLHandler(repo *repository.AMLRepository, ml *mlclient.Client, watchlis
 // of being waved through.
 func manualReviewTransactionResponse(c *gin.Context, transactionID string, mlErr error) {
 	log.Printf("ML scoring unavailable for %s, routing to manual review: %v", transactionID, mlErr)
+	// Open circuit breaker: the dependency is known-down; signal 503 +
+	// dependency_degraded so callers retry later instead of treating this as
+	// an accepted-but-unscored transaction.
+	if errors.Is(mlErr, authcommon.ErrBreakerOpen) {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"transaction_id":      transactionID,
+			"error":               "ML scoring dependency circuit breaker open",
+			"dependency_degraded": true,
+		})
+		return
+	}
 	c.JSON(http.StatusAccepted, gin.H{
 		"transaction_id": transactionID,
 		"risk_score":     100,

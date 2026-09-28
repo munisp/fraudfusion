@@ -82,3 +82,34 @@ func TestDisputeRecommendationUsesLikelihoodBands(t *testing.T) {
 		}
 	}
 }
+
+func TestHistoryIntervalUsesConfiguredWindow(t *testing.T) {
+	a := &app{historyWindowDays: 90}
+	if got := a.historyInterval(); got != "90 days" {
+		t.Fatalf("historyInterval = %q, want \"90 days\"", got)
+	}
+	a.historyWindowDays = 30
+	if got := a.historyInterval(); got != "30 days" {
+		t.Fatalf("historyInterval = %q, want \"30 days\"", got)
+	}
+}
+
+func TestAbusePatternChangedGating(t *testing.T) {
+	// Identical evaluation: no new pattern row.
+	if abusePatternChanged(4, 90, 4, 5) {
+		t.Fatal("unchanged evaluation should not be logged")
+	}
+	// Decision flip (below -> at threshold) must be logged even with a small score move.
+	if !abusePatternChanged(4, 90, 5, 5) {
+		t.Fatal("decision flip should be logged")
+	}
+	// Same decision, score delta > 0.1 (4/5=0.8 -> 8/8=1.0 is a flip-free large move
+	// requires same decision: use window thresholds consistently below).
+	if !abusePatternChanged(1, 90, 4, 5) {
+		t.Fatal("score delta > 0.1 within same decision should be logged")
+	}
+	// Same decision, tiny delta: suppressed (1/5=0.2 vs 2/5... no: 2/5=0.4 delta=0.2 logs; use 1->1 count same).
+	if abusePatternChanged(1, 90, 1, 5) {
+		t.Fatal("identical score should not be logged")
+	}
+}

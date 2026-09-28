@@ -94,6 +94,8 @@ type journalRequest struct {
 	CreditAccountID string                 `json:"credit_account_id" binding:"required,uuid"`
 	Amount          string                 `json:"amount" binding:"required"`
 	Currency        string                 `json:"currency" binding:"required,len=3"`
+	FxRate          string                 `json:"fx_rate" binding:"omitempty"`
+	FxQuoteID       string                 `json:"fx_quote_id" binding:"omitempty,max=255"`
 	ExternalRef     string                 `json:"external_reference" binding:"max=255"`
 	Settlement      *settlementInstruction `json:"settlement"`
 }
@@ -143,7 +145,14 @@ func main() {
 	ledgerAPI := router.Group("/api/v1/ledger")
 	ledgerAPI.Use(application.authenticate("ledger:write"))
 	ledgerAPI.POST("/journals", application.createJournal)
+	ledgerAPI.POST("/journals/:id/reverse", application.reverseJournal)
 	ledgerAPI.GET("/journals/:id", application.getJournal)
+	// Read APIs: balance inquiry + keyset-paginated transaction history.
+	// Accept ledger:read or ledger:write.
+	ledgerReadAPI := router.Group("/api/v1/ledger")
+	ledgerReadAPI.Use(application.authenticateAny("ledger:read", "ledger:write"))
+	ledgerReadAPI.GET("/accounts/:id/balance", application.getAccountBalance)
+	ledgerReadAPI.GET("/accounts/:id/transactions", application.listAccountTransactions)
 	reconciliationAPI := router.Group("/api/v1/ledger")
 	reconciliationAPI.Use(application.authenticate("finance:reconcile"))
 	reconciliationAPI.POST("/reconciliation-runs", application.createReconciliationRun)
@@ -203,6 +212,10 @@ func (s *service) createJournal(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": "idempotency key was already used for a different command"})
 		case errors.Is(err, errForeignKey):
 			c.JSON(http.StatusBadRequest, gin.H{"error": "ledger account does not exist for authenticated tenant"})
+		case errors.Is(err, errCrossCurrency):
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "cross-currency journal requires an explicit fx_rate and fx_quote_id"})
+		case errors.Is(err, errJournalCurrency):
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "currency must be a valid ISO-4217 code matching the debit account currency"})
 		default:
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ledger command unavailable"})
 		}
@@ -219,9 +232,10 @@ func (s *service) getJournal(c *gin.Context) {
 	principal := requestPrincipal(c)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), requestTimeout)
 	defer cancel()
-	var journalID, journalType, status, externalRef string
+	var journalID, journalType, status, externalRef, currency string
+	var fxRate, fxQuoteID *string
 	var createdAt time.Time
-	err := s.db.QueryRow(ctx, `SELECT id::text, journal_type, status, COALESCE(external_reference,''), created_at FROM ledger_journals WHERE tenant_id=$1 AND id=$2::uuid`, principal.TenantID, c.Param("id")).Scan(&journalID, &journalType, &status, &externalRef, &createdAt)
+	err := s.db.QueryRow(ctx, `SELECT id::text, journal_type, status, COALESCE(external_reference,''), currency, fx_rate::text, fx_quote_id, created_at FROM ledger_journals WHERE tenant_id=$1 AND id=$2::uuid`, principal.TenantID, c.Param("id")).Scan(&journalID, &journalType, &status, &externalRef, &currency, &fxRate, &fxQuoteID, &createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "journal not found"})
 		return
@@ -230,7 +244,7 @@ func (s *service) getJournal(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ledger query unavailable"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"journal_id": journalID, "journal_type": journalType, "status": status, "external_reference": externalRef, "created_at": createdAt.UTC().Format(time.RFC3339Nano)})
+	c.JSON(http.StatusOK, gin.H{"journal_id": journalID, "journal_type": journalType, "status": status, "external_reference": externalRef, "currency": currency, "fx_rate": fxRate, "fx_quote_id": fxQuoteID, "created_at": createdAt.UTC().Format(time.RFC3339Nano)})
 }
 
 var (
@@ -271,9 +285,11 @@ func (s *service) postJournal(ctx context.Context, principal principal, request 
 		Credit      string                 `json:"credit_account_id"`
 		Amount      string                 `json:"amount"`
 		Currency    string                 `json:"currency"`
+		FxRate      string                 `json:"fx_rate,omitempty"`
+		FxQuoteID   string                 `json:"fx_quote_id,omitempty"`
 		ExternalRef string                 `json:"external_reference"`
 		Settlement  *settlementInstruction `json:"settlement,omitempty"`
-	}{request.JournalType, request.DebitAccountID, request.CreditAccountID, request.Amount, request.Currency, request.ExternalRef, request.Settlement})
+	}{request.JournalType, request.DebitAccountID, request.CreditAccountID, request.Amount, request.Currency, request.FxRate, request.FxQuoteID, request.ExternalRef, request.Settlement})
 	if err != nil {
 		return journalResponse{}, err
 	}
@@ -285,6 +301,27 @@ func (s *service) postJournal(ctx context.Context, principal principal, request 
 	// and the conflict path re-reads FOR KEY SHARE. SERIALIZABLE added
 	// predicate-lock overhead and spurious 40001s (returned to clients as
 	// 503) without protecting any additional invariant.
+	// Currency policy is resolved BEFORE opening the transaction: account
+	// currencies are looked up tenant-scoped, and cross-currency journals
+	// require an explicit fx_rate + fx_quote_id (recorded on the journal).
+	debitCurrency, creditCurrency, err := s.accountCurrencies(ctx, principal.TenantID, request.DebitAccountID, request.CreditAccountID)
+	if err != nil {
+		return journalResponse{}, err
+	}
+	fx, err := resolveCurrencyLegs(request, debitCurrency, creditCurrency)
+	if err != nil {
+		return journalResponse{}, err
+	}
+	var fxRateArg, fxQuoteArg *string
+	creditAmount := request.Amount
+	creditCurrencyOut := request.Currency
+	if fx != nil {
+		fxRateArg = &fx.rate
+		fxQuoteArg = &fx.quoteID
+		creditAmount = fx.creditAmount
+		creditCurrencyOut = fx.creditCurrency
+	}
+
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return journalResponse{}, err
@@ -296,7 +333,7 @@ func (s *service) postJournal(ctx context.Context, principal principal, request 
 	if err != nil {
 		return journalResponse{}, err
 	}
-	err = tx.QueryRow(ctx, `INSERT INTO ledger_journals (id, tenant_id, idempotency_key, command_sha256, journal_type, actor_id, external_reference) VALUES ($1::uuid,$2,$3,$4,$5,$6,NULLIF($7,'')) ON CONFLICT (tenant_id,idempotency_key) DO NOTHING RETURNING id::text`, newJournalID, principal.TenantID, request.IdempotencyKey, commandHash, request.JournalType, principal.ActorID, request.ExternalRef).Scan(&journalID)
+	err = tx.QueryRow(ctx, `INSERT INTO ledger_journals (id, tenant_id, idempotency_key, command_sha256, journal_type, actor_id, external_reference, currency, fx_rate, fx_quote_id) VALUES ($1::uuid,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9::numeric,$10) ON CONFLICT (tenant_id,idempotency_key) DO NOTHING RETURNING id::text`, newJournalID, principal.TenantID, request.IdempotencyKey, commandHash, request.JournalType, principal.ActorID, request.ExternalRef, request.Currency, fxRateArg, fxQuoteArg).Scan(&journalID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var existingHash string
 		if err = tx.QueryRow(ctx, `SELECT id::text, command_sha256 FROM ledger_journals WHERE tenant_id=$1 AND idempotency_key=$2 FOR KEY SHARE`, principal.TenantID, request.IdempotencyKey).Scan(&journalID, &existingHash); err != nil {
@@ -321,7 +358,7 @@ func (s *service) postJournal(ctx context.Context, principal principal, request 
 	if err != nil {
 		return journalResponse{}, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO ledger_postings (id,tenant_id,journal_id,account_id,direction,amount,currency) VALUES ($1::uuid,$2,$3::uuid,$4::uuid,'D',$5::numeric,$6),($7::uuid,$2,$3::uuid,$8::uuid,'C',$5::numeric,$6)`, debitPostingID, principal.TenantID, journalID, request.DebitAccountID, request.Amount, request.Currency, creditPostingID, request.CreditAccountID)
+	_, err = tx.Exec(ctx, `INSERT INTO ledger_postings (id,tenant_id,journal_id,account_id,direction,amount,currency) VALUES ($1::uuid,$2,$3::uuid,$4::uuid,'D',$5::numeric,$6),($7::uuid,$2,$3::uuid,$8::uuid,'C',$9::numeric,$10)`, debitPostingID, principal.TenantID, journalID, request.DebitAccountID, request.Amount, request.Currency, creditPostingID, request.CreditAccountID, creditAmount, creditCurrencyOut)
 	if err != nil {
 		if strings.Contains(err.Error(), "foreign key") {
 			return journalResponse{}, errForeignKey
@@ -351,6 +388,11 @@ func (s *service) postJournal(ctx context.Context, principal principal, request 
 }
 
 func (s *service) authenticate(requiredRole string) gin.HandlerFunc {
+	return s.authenticateAny(requiredRole)
+}
+
+// authenticateAny admits a principal holding ANY of the listed roles.
+func (s *service) authenticateAny(roles ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		header := c.GetHeader("Authorization")
 		if !strings.HasPrefix(header, "Bearer ") {
@@ -358,7 +400,17 @@ func (s *service) authenticate(requiredRole string) gin.HandlerFunc {
 			return
 		}
 		principal, err := s.keycloak.introspect(c.Request.Context(), strings.TrimPrefix(header, "Bearer "))
-		if err != nil || !hasRole(principal.Roles, requiredRole) {
+		authorized := err == nil
+		if authorized {
+			authorized = false
+			for _, role := range roles {
+				if hasRole(principal.Roles, role) {
+					authorized = true
+					break
+				}
+			}
+		}
+		if !authorized {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "ledger authorization denied"})
 			return
 		}

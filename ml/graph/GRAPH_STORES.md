@@ -22,6 +22,24 @@ round-trip path). Use **FalkorDB as an optional hot-path read replica** for
 latency-sensitive graph features at inference time — the same MERGE batches
 feed both.
 
+## License note (legal review required before any hosted offering)
+
+- **FalkorDB is SSPLv1** (Server Side Public License). Internal use —
+  including as a read replica inside our own platform — is fine. **Offering
+  FalkorDB itself as a hosted/managed service to third parties triggers SSPL
+  source-disclosure obligations**; a multi-tenant SaaS where tenants get
+  direct FalkorDB access needs either a FalkorDB commercial license or legal
+  sign-off. Our architecture keeps FalkorDB strictly internal (no
+  tenant-facing port in the k8s manifests), which stays clear of the trigger.
+- **Neo4j Community is GPLv3** — fine for internal use; network use does not
+  trigger copyleft for our separate services (they communicate over Bolt, not
+  by linking). Neo4j Enterprise (HA clustering) is commercial.
+- **Alternatives if legal review fails**: keep the in-memory parquet store
+  (already the default fallback), or evaluate Memgraph (BSL→Apache after 4
+  years) / Redis Stack graph (RSALv2 — similar hosted-use questions). The
+  `GraphStore` protocol in `services/python/kg-qa/app/graph_store.py` exists
+  precisely so a store swap is a one-class change.
+
 ## Local dev
 
 ```bash

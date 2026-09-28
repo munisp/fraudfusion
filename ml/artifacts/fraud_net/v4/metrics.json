@@ -1,0 +1,26 @@
+{
+  "auc_pr": 0.372663657571862,
+  "auc_roc": 0.7581643010563357,
+  "f1": 0.30978260869565216,
+  "base_rate": 0.029790114611387253,
+  "recall_at_fpr_0.01": 0.33766233766233766,
+  "init_version": "v3",
+  "epochs_trained": 6,
+  "batch_size": 2048,
+  "lr": 0.001,
+  "eps_train": 1.0,
+  "pgd_steps_train": 5,
+  "adv_weight": 0.5,
+  "train_runtime_s": 16.3,
+  "seed": 42,
+  "temperature": 0.4242826764211748,
+  "backend": "torch",
+  "n_test": 10339,
+  "onnx_exported": true,
+  "eval_clean_subset_auc_pr": 0.415748878450295,
+  "pgd_eps1": {
+    "auc_pr": 0.11281089911785348,
+    "evasion_at_review": 0.6428571428571429,
+    "evasion_at_block": 0.25
+  }
+}

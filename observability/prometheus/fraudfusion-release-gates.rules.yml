@@ -14,7 +14,7 @@ groups:
         annotations:
           summary: "FraudFusion dependency-security gate failed"
           description: "A CI run reported a production dependency vulnerability at or above the configured high threshold. Promotion must remain blocked until the audit passes."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/vulnerability-gate"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionVulnerabilityGateFailure.md"
 
       - alert: FraudFusionGoVulnerabilityGateFailure
         expr: increase(fraudfusion_release_gate_failures_total{environment="staging",gate="govulncheck"}[15m]) > 0
@@ -26,7 +26,7 @@ groups:
         annotations:
           summary: "FraudFusion Go vulnerability scan failed"
           description: "A reachable Go vulnerability was reported by govulncheck. Promotion must remain blocked until remediation and a clean rescan."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/go-vulnerability-gate"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionGoVulnerabilityGateFailure.md"
 
       - alert: FraudFusionIntegrationRegression
         expr: increase(fraudfusion_e2e_scenario_total{environment=~"staging|production",result="failure"}[15m]) > 0
@@ -38,7 +38,7 @@ groups:
         annotations:
           summary: "FraudFusion mobile-to-backend integration scenario failed"
           description: "An authenticated staging or production smoke scenario failed. Do not promote until the failed scenario is triaged and rerun successfully."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/integration-regression"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionIntegrationRegression.md"
 
       - alert: FraudFusionUnauthorizedSpike
         expr: sum(rate(fraudfusion_http_requests_total{environment="production",status=~"401|403"}[5m])) / clamp_min(sum(rate(fraudfusion_http_requests_total{environment="production"}[5m])), 0.001) > 0.20
@@ -49,7 +49,7 @@ groups:
         annotations:
           summary: "FraudFusion authorization-denial ratio elevated"
           description: "More than 20% of production requests returned 401 or 403 for 10 minutes. Investigate identity, tenant-policy, client-version, or attack traffic changes."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/auth-denial-spike"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionUnauthorizedSpike.md"
 
       - alert: FraudFusionTokenLeakSignal
         expr: increase(fraudfusion_log_sensitive_data_matches_total{environment="production",classification="credential_material"}[5m]) > 0
@@ -60,4 +60,4 @@ groups:
         annotations:
           summary: "Potential credential material detected in application logs"
           description: "A production log entry matched a token-bearing pattern. Restrict access, rotate affected credentials, preserve evidence, and investigate immediately."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/token-log-exposure"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionTokenLeakSignal.md"

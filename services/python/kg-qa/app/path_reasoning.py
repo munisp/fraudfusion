@@ -58,17 +58,22 @@ def path_score(hops: list[dict[str, Any]], now: datetime | None = None) -> float
 
 
 def enumerate_paths(store: GraphStore, linked_ids: list[str],
-                    max_hops: int = 3, max_paths: int = 5) -> list[dict[str, Any]]:
-    """BFS simple paths between linked entities (or context paths for one)."""
+                    max_hops: int = 3, max_paths: int = 5,
+                    window: Any = None) -> list[dict[str, Any]]:
+    """BFS simple paths between linked entities (or context paths for one).
+
+    When `window` (temporal.TimeWindow) is given, only edges whose timestamp
+    falls inside [window.start, window.end) are traversed; undated edges are
+    excluded (we cannot claim they happened inside the window)."""
     now = datetime.now(timezone.utc)
     targets = set(linked_ids)
     found: list[list[dict[str, Any]]] = []
 
     if len(linked_ids) >= 2:
         for start in linked_ids:
-            _bfs(store, start, targets - {start}, max_hops, found)
+            _bfs(store, start, targets - {start}, max_hops, found, window=window)
     elif len(linked_ids) == 1:
-        _bfs(store, linked_ids[0], None, max_hops, found)
+        _bfs(store, linked_ids[0], None, max_hops, found, window=window)
     if not found:
         return []
     scored = [{"score": path_score(p, now), "hops": p} for p in found]
@@ -89,7 +94,7 @@ def enumerate_paths(store: GraphStore, linked_ids: list[str],
 
 def _bfs(store: GraphStore, start: str, targets: set[str] | None,
          max_hops: int, found: list[list[dict[str, Any]]],
-         cap: int = 500) -> None:
+         cap: int = 500, window: Any = None) -> None:
     """BFS over simple paths from start. When targets is None, every
     frontier path (length >= 1) is collected as a context path."""
     queue: list[tuple[str, list[dict[str, Any]], set[str]]] = [(start, [], {start})]
@@ -98,6 +103,8 @@ def _bfs(store: GraphStore, start: str, targets: set[str] | None,
         if len(path) >= max_hops:
             continue
         for edge in store.neighbors(node):
+            if window is not None and not window.contains(edge.get("ts")):
+                continue
             # orient the edge from the perspective of the current node
             if edge["src"] == node:
                 nxt, hop = edge["dst"], edge

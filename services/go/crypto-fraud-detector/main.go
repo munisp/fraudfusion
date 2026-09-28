@@ -44,18 +44,22 @@ type CryptoRiskAnalysis struct {
 	RiskLevel       string   `json:"risk_level"`
 	Flagged         bool     `json:"flagged"`
 	RiskFactors     []string `json:"risk_factors"`
-	WalletRiskScore int      `json:"wallet_risk_score"`
-	Recommendation  string   `json:"recommendation"`
+	WalletRiskScore     int      `json:"wallet_risk_score"`
+	Recommendation      string   `json:"recommendation"`
+	CacheAgeSeconds     int64    `json:"cache_age_seconds"`
+	ReputationFromCache bool     `json:"reputation_from_cache"`
 }
 
 type WalletVerification struct {
-	WalletAddress string    `json:"wallet_address"`
-	Verified      bool      `json:"verified"`
-	RiskScore     int       `json:"risk_score"`
-	Blacklisted   bool      `json:"blacklisted"`
-	Exchanges     []string  `json:"exchanges"`
-	FirstSeen     time.Time `json:"first_seen"`
-	LastActivity  time.Time `json:"last_activity"`
+	WalletAddress    string    `json:"wallet_address"`
+	Verified         bool      `json:"verified"`
+	RiskScore        int       `json:"risk_score"`
+	Blacklisted      bool      `json:"blacklisted"`
+	Exchanges        []string  `json:"exchanges"`
+	FirstSeen        time.Time `json:"first_seen"`
+	LastActivity     time.Time `json:"last_activity"`
+	CacheAgeSeconds  int64     `json:"cache_age_seconds"`
+	ReputationCached bool      `json:"reputation_from_cache"`
 }
 
 type P2PTradingAlert struct {
@@ -85,6 +89,7 @@ func main() {
 	// Middleware
 	r.Use(corsMiddleware())
 	r.Use(authMiddleware())
+	r.Use(tenantBindingMiddleware())
 
 	// Routes
 	api := r.Group("/api/v1/crypto-fraud")
@@ -164,7 +169,7 @@ func performRiskAnalysis(ctx context.Context, txn *CryptoTransaction) *CryptoRis
 	riskFactors := []string{}
 
 	// Check wallet reputation
-	walletRisk := checkWalletReputation(ctx, txn.WalletAddress)
+	walletRisk, walletCacheAge, walletFromCache := checkWalletReputation(ctx, txn.WalletAddress)
 	riskScore += walletRisk
 
 	if walletRisk > 70 {
@@ -225,19 +230,55 @@ func performRiskAnalysis(ctx context.Context, txn *CryptoTransaction) *CryptoRis
 		RiskLevel:       riskLevel,
 		Flagged:         riskScore >= 60,
 		RiskFactors:     riskFactors,
-		WalletRiskScore: walletRisk,
-		Recommendation:  recommendation,
+		WalletRiskScore:        walletRisk,
+		Recommendation:         recommendation,
+		CacheAgeSeconds:        walletCacheAge,
+		ReputationFromCache:    walletFromCache,
 	}
 }
 
-func checkWalletReputation(ctx context.Context, address string) int {
+// reputationCacheTTL is the wallet-reputation cache TTL. It is explicitly
+// configurable (REPUTATION_CACHE_TTL_SECONDS, default 3600 = 1h) so operators
+// can trade freshness against DB load; responses stamp cache_age_seconds so
+// callers can see exactly how stale the reputation input is.
+func reputationCacheTTL() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("REPUTATION_CACHE_TTL_SECONDS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+		log.Printf("invalid REPUTATION_CACHE_TTL_SECONDS %q, using default 3600s", v)
+	}
+	return time.Hour
+}
+
+// reputationCacheEntry is the cached reputation payload. computed_at lets
+// every consumer report the true cache age instead of guessing from the TTL.
+type reputationCacheEntry struct {
+	Score      int   `json:"score"`
+	ComputedAt int64 `json:"computed_at"`
+}
+
+// checkWalletReputation returns the wallet risk score plus the age of the
+// cache entry it came from (0 when freshly computed) and whether it was
+// served from cache.
+func checkWalletReputation(ctx context.Context, address string) (score int, cacheAgeSeconds int64, fromCache bool) {
 	// Check cache first
 	cacheKey := fmt.Sprintf("wallet:risk:%s", address)
 
 	if val, err := redisClient.Get(ctx, cacheKey).Result(); err == nil {
-		var score int
-		fmt.Sscanf(val, "%d", &score)
-		return score
+		var entry reputationCacheEntry
+		// Legacy plain-integer values decode as age-unknown fresh entries.
+		if jsonErr := json.Unmarshal([]byte(val), &entry); jsonErr == nil && entry.ComputedAt > 0 {
+			age := time.Now().Unix() - entry.ComputedAt
+			if age < 0 {
+				age = 0
+			}
+			return entry.Score, age, true
+		}
+		var legacy int
+		if _, scanErr := fmt.Sscanf(val, "%d", &legacy); scanErr == nil {
+			return legacy, 0, true
+		}
 	}
 
 	// One round trip: blacklist check + wallet history aggregates.
@@ -254,11 +295,16 @@ func checkWalletReputation(ctx context.Context, address string) int {
 		log.Printf("wallet reputation query failed for %s: %v", address, err)
 	}
 
-	if blacklisted {
-		if err := redisClient.Set(ctx, cacheKey, "100", 24*time.Hour).Err(); err != nil {
+	writeCache := func(score int, ttl time.Duration) {
+		payload, _ := json.Marshal(reputationCacheEntry{Score: score, ComputedAt: time.Now().Unix()})
+		if err := redisClient.Set(ctx, cacheKey, payload, ttl).Err(); err != nil {
 			log.Printf("redis cache write failed for %s: %v", cacheKey, err)
 		}
-		return 100
+	}
+
+	if blacklisted {
+		writeCache(100, 24*time.Hour)
+		return 100, 0, false
 	}
 
 	riskScore := 0
@@ -273,12 +319,10 @@ func checkWalletReputation(ctx context.Context, address string) int {
 		riskScore += 20
 	}
 
-	// Cache result
-	if err := redisClient.Set(ctx, cacheKey, fmt.Sprintf("%d", riskScore), 1*time.Hour).Err(); err != nil {
-		log.Printf("redis cache write failed for %s: %v", cacheKey, err)
-	}
+	// Cache result with the explicitly configured TTL.
+	writeCache(riskScore, reputationCacheTTL())
 
-	return riskScore
+	return riskScore, 0, false
 }
 
 func isLegitimateExchange(platform string) bool {
@@ -422,7 +466,7 @@ func performWalletVerification(ctx context.Context, address string) *WalletVerif
 	`, address).Scan(&firstSeen, &lastActivity)
 
 	// Calculate risk score
-	riskScore := checkWalletReputation(ctx, address)
+	riskScore, cacheAge, fromCache := checkWalletReputation(ctx, address)
 
 	// Get associated exchanges
 	rows, _ := db.Query(`
@@ -445,9 +489,11 @@ func performWalletVerification(ctx context.Context, address string) *WalletVerif
 		Verified:      !blacklisted && riskScore < 60,
 		RiskScore:     riskScore,
 		Blacklisted:   blacklisted,
-		Exchanges:     exchanges,
-		FirstSeen:     firstSeen,
-		LastActivity:  lastActivity,
+		Exchanges:        exchanges,
+		FirstSeen:        firstSeen,
+		LastActivity:     lastActivity,
+		CacheAgeSeconds:  cacheAge,
+		ReputationCached: fromCache,
 	}
 }
 
@@ -474,7 +520,7 @@ func analyzeP2PTrade(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist P2P trade"})
 		return
 	}
-	alerts := detectP2PFraud(&req)
+	alerts, baseline := detectP2PFraud(&req)
 	if err := storeP2PAlerts(c.Request.Context(), alerts); err != nil {
 		log.Printf("failed to persist P2P alerts: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to persist P2P alerts"})
@@ -485,11 +531,30 @@ func analyzeP2PTrade(c *gin.Context) {
 		"trade_id": req.TradeID,
 		"alerts":   alerts,
 		"flagged":  len(alerts) > 0,
+		// Honest baseline disclosure: "insufficient_data" means the price
+		// deviation check was NOT performed (fewer than minBaselineSamples
+		// comparable offers), not that it passed.
+		"baseline":             baseline.Status,
+		"baseline_sample_size": baseline.SampleSize,
+		"baseline_median":      baseline.Median,
 	})
 }
 
-func detectP2PFraud(trade *p2pTradeRequest) []*P2PTradingAlert {
+// minBaselineSamples is the minimum number of comparable offers (excluding
+// the subject offer) required before a price-deviation baseline is
+// meaningful; below it we report baseline=insufficient_data instead of
+// silently comparing against a self-inclusive or tiny sample.
+const minBaselineSamples = 5
+
+type p2pBaseline struct {
+	Status     string  `json:"status"` // "ok" or "insufficient_data"
+	SampleSize int     `json:"sample_size"`
+	Median     float64 `json:"median"`
+}
+
+func detectP2PFraud(trade *p2pTradeRequest) ([]*P2PTradingAlert, p2pBaseline) {
 	alerts := []*P2PTradingAlert{}
+	baseline := p2pBaseline{Status: "insufficient_data"}
 
 	// Check seller reputation
 	var sellerTrades, sellerDisputes int
@@ -513,17 +578,25 @@ func detectP2PFraud(trade *p2pTradeRequest) []*P2PTradingAlert {
 		})
 	}
 
-	// Check for price manipulation
-	var avgPrice float64
+	// Check for price manipulation against the 24h median of OTHER offers.
+	// The subject offer (already persisted above) is excluded from its own
+	// baseline, and a median is used instead of a mean so a single outlier —
+	// including this trade — cannot drag the reference price.
+	var medianPrice float64
+	var sampleSize int
 	db.QueryRow(`
-		SELECT AVG(price_per_unit)
+		SELECT COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY price_per_unit), 0), COUNT(*)
 		FROM p2p_trades
 		WHERE currency = $1
+		AND id <> $2
 		AND created_at >= NOW() - INTERVAL '24 hours'
-	`, trade.Currency).Scan(&avgPrice)
+	`, trade.Currency, trade.TradeID).Scan(&medianPrice, &sampleSize)
+	baseline.SampleSize = sampleSize
+	baseline.Median = medianPrice
 
-	if avgPrice > 0 {
-		deviation := math.Abs(trade.PricePerUnit-avgPrice) / avgPrice
+	if sampleSize >= minBaselineSamples && medianPrice > 0 {
+		baseline.Status = "ok"
+		deviation := math.Abs(trade.PricePerUnit-medianPrice) / medianPrice
 		if deviation >= 0.25 {
 			severity := "medium"
 			if deviation >= 0.50 {
@@ -533,13 +606,13 @@ func detectP2PFraud(trade *p2pTradeRequest) []*P2PTradingAlert {
 				TradeID: trade.TradeID, SellerID: trade.SellerID, BuyerID: trade.BuyerID,
 				Amount: trade.Amount, Currency: trade.Currency, AlertType: "price_deviation",
 				Severity:    severity,
-				Description: fmt.Sprintf("P2P price %.8f deviates %.1f%% from 24-hour market average %.8f", trade.PricePerUnit, deviation*100, avgPrice),
+				Description: fmt.Sprintf("P2P price %.8f deviates %.1f%% from 24-hour market median %.8f (n=%d, subject excluded)", trade.PricePerUnit, deviation*100, medianPrice, sampleSize),
 				DetectedAt:  time.Now(),
 			})
 		}
 	}
 
-	return alerts
+	return alerts, baseline
 }
 
 func storeP2PTrade(trade *p2pTradeRequest) error {

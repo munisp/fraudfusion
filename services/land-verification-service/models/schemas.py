@@ -31,6 +31,7 @@ class VerificationStatus(str, enum.Enum):
     DOCUMENT_ANALYSIS = "document_analysis"
     REGISTRY_LOOKUP = "registry_lookup"
     SITE_INSPECTION = "site_inspection"
+    INSPECTION_REPORT = "inspection_report"
     FRAUD_REVIEW = "fraud_review"
     COMPLETED = "completed"
     REJECTED = "rejected"
@@ -50,7 +51,15 @@ ALLOWED_TRANSITIONS: dict[VerificationStatus, set[VerificationStatus]] = {
         VerificationStatus.COMPLETED,
         VerificationStatus.REJECTED,
     },
+    # SITE_INSPECTION is no longer a dead end: an inspection report must be
+    # filed (INSPECTION_REPORT) before a verdict; fraud escalation and outright
+    # rejection remain possible from the field.
     VerificationStatus.SITE_INSPECTION: {
+        VerificationStatus.INSPECTION_REPORT,
+        VerificationStatus.FRAUD_REVIEW,
+        VerificationStatus.REJECTED,
+    },
+    VerificationStatus.INSPECTION_REPORT: {
         VerificationStatus.FRAUD_REVIEW,
         VerificationStatus.COMPLETED,
         VerificationStatus.REJECTED,

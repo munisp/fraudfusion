@@ -1,0 +1,84 @@
+# intel-service — National Fraud Intelligence API (FastAPI, :8500).
+# Serves the hierarchical Bayesian artifact ml/artifacts/national_intelligence/v1.
+# FAIL-CLOSED: /health returns 503 when the artifact is missing, so the pod
+# goes NotReady instead of serving fabricated intelligence.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: intel-service
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: intel-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: intel-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: intel-service
+    spec:
+      containers:
+        - name: intel-service
+          image: ghcr.io/munisp/fraudfusion/intel-service:latest
+          env:
+            - name: PORT
+              value: "8500"
+            - name: INTEL_ARTIFACT_DIR
+              value: /artifacts/national_intelligence/v1
+            # k-anonymity floor: aggregate cells below this weekly volume
+            # are served as suppressed
+            - name: INTEL_SUPPRESS_MIN_N
+              value: "30"
+          ports:
+            - name: http
+              containerPort: 8500
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            - name: intel-artifacts
+              mountPath: /artifacts
+              readOnly: true
+      volumes:
+        - name: intel-artifacts
+          persistentVolumeClaim:
+            claimName: intel-artifacts
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: intel-artifacts
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: intel-service
+spec:
+  accessModes: ["ReadOnlyMany"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: intel-service
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: intel-service
+spec:
+  selector:
+    app.kubernetes.io/name: intel-service
+  ports:
+    - name: http
+      port: 8500
+      targetPort: http

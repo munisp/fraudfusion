@@ -22,11 +22,19 @@ from enum import Enum
 import base64
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
 import ipaddress
-import psycopg2
-from psycopg2.extras import RealDictCursor
+
+# psycopg2 is required only when the durable repository is actually used; the
+# import is deferred so role/permission, rate-limiter and JWT unit tests can
+# run without a database driver installed.
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except ImportError:  # pragma: no cover - environment without psycopg2
+    psycopg2 = None
+    RealDictCursor = None
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +60,23 @@ class Permission(Enum):
 
 @dataclass
 class SecurityConfig:
-    """Security configuration"""
-    jwt_secret: str = secrets.token_urlsafe(32)
+    """Security configuration.
+
+    JWT secrets are NEVER generated per-process: `jwt_secret` must come from
+    the JWT_SECRET environment variable (or be passed explicitly), otherwise
+    SecurityManager refuses to boot (fail-closed). A random per-process secret
+    would invalidate every token on restart and let each replica mint tokens
+    the others accept.
+
+    Rotation procedure (documented for operators):
+      1. Generate a new secret, deploy it as JWT_SECRET_PREVIOUS=<old>,
+         JWT_SECRET=<new> — verify_token accepts both during the window.
+      2. After the longest token lifetime (jwt_expiration_hours) has elapsed,
+         remove JWT_SECRET_PREVIOUS. Tokens minted with the old secret are
+         then rejected.
+    """
+    jwt_secret: str = ""
+    jwt_previous_secret: str = ""
     jwt_algorithm: str = "HS256"
     jwt_expiration_hours: int = 24
     password_min_length: int = 12
@@ -69,6 +92,15 @@ class SecurityConfig:
     rate_limit_requests: int = 100
     rate_limit_window_seconds: int = 60
     database_url: Optional[str] = None
+    redis_url: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.jwt_secret:
+            self.jwt_secret = os.getenv("JWT_SECRET", "").strip()
+        if not self.jwt_previous_secret:
+            self.jwt_previous_secret = os.getenv("JWT_SECRET_PREVIOUS", "").strip()
+        if not self.redis_url:
+            self.redis_url = os.getenv("REDIS_URL", "").strip() or None
 
 class PasswordValidator:
     """
@@ -171,20 +203,24 @@ class JWTManager:
         return token
 
     def verify_token(self, token: str) -> Optional[Dict[str, Any]]:
-        """Verify and decode JWT token"""
-        try:
-            payload = jwt.decode(
-                token,
-                self.config.jwt_secret,
-                algorithms=[self.config.jwt_algorithm]
-            )
-            return payload
-        except jwt.ExpiredSignatureError:
-            logger.warning("Token expired")
-            return None
-        except jwt.InvalidTokenError as e:
-            logger.warning(f"Invalid token: {e}")
-            return None
+        """Verify and decode JWT token.
+
+        During rotation (JWT_SECRET_PREVIOUS set) tokens signed with the
+        previous secret are still accepted until the rotation window closes.
+        """
+        secrets_to_try = [self.config.jwt_secret]
+        if self.config.jwt_previous_secret:
+            secrets_to_try.append(self.config.jwt_previous_secret)
+        for secret in secrets_to_try:
+            try:
+                return jwt.decode(token, secret, algorithms=[self.config.jwt_algorithm])
+            except jwt.ExpiredSignatureError:
+                logger.warning("Token expired")
+                return None
+            except jwt.InvalidTokenError:
+                continue  # try the previous secret, if any
+        logger.warning("Invalid token: signature rejected by all configured secrets")
+        return None
 
     def refresh_token(self, token: str) -> Optional[str]:
         """Refresh token if valid"""
@@ -235,7 +271,7 @@ class EncryptionManager:
     @staticmethod
     def derive_key(password: str, salt: bytes) -> bytes:
         """Derive encryption key from password"""
-        kdf = PBKDF2(
+        kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
@@ -315,15 +351,75 @@ class InputValidator:
 
 class RateLimiter:
     """
-    Rate limiting for API endpoints
+    Sliding-window rate limiting for API endpoints.
+
+    Backend selection (honest, reported via `backend` and health()):
+      * REDIS_URL configured and reachable -> Redis sorted-set sliding window
+        (shared across all replicas, survives restarts). Backend "redis".
+      * otherwise -> per-process in-memory window. Backend "memory"; this is
+        a degradation (limits are per-process) and is reported loudly in
+        health checks.
+    Redis errors fail CLOSED (request denied + error logged): a rate limiter
+    that silently opens up on outage is an auth-bruteforce enabler.
     """
 
-    def __init__(self, config: SecurityConfig):
+    REDIS_KEY_PREFIX = "ff:ratelimit:"
+
+    def __init__(self, config: SecurityConfig, redis_client=None):
         self.config = config
-        self.requests = {}  # {identifier: [(timestamp, count)]}
+        self.requests = {}  # {identifier: [(timestamp, count)]} (memory backend)
+        self._redis = None
+        self.backend = "memory"
+        if redis_client is not None:
+            self._redis = redis_client
+            self.backend = "redis"
+        elif config.redis_url:
+            try:
+                import redis as redis_lib
+
+                client = redis_lib.Redis.from_url(
+                    config.redis_url, socket_timeout=2.0, socket_connect_timeout=2.0
+                )
+                client.ping()
+                self._redis = client
+                self.backend = "redis"
+                logger.info("RateLimiter using Redis sliding window (%s)", config.redis_url)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "REDIS_URL is set (%s) but Redis is unusable: %s. "
+                    "Falling back to per-process in-memory rate limiting (backend: memory).",
+                    config.redis_url, exc,
+                )
 
     def is_allowed(self, identifier: str) -> bool:
         """Check if request is allowed"""
+        if self._redis is not None:
+            return self._is_allowed_redis(identifier)
+        return self._is_allowed_memory(identifier)
+
+    def _is_allowed_redis(self, identifier: str) -> bool:
+        import time as _time
+
+        key = self.REDIS_KEY_PREFIX + identifier
+        now_ms = int(_time.time() * 1000)
+        window_ms = self.config.rate_limit_window_seconds * 1000
+        try:
+            pipe = self._redis.pipeline(transaction=True)
+            pipe.zremrangebyscore(key, 0, now_ms - window_ms)
+            pipe.zcard(key)
+            pipe.zadd(key, {f"{now_ms}:{secrets.token_hex(4)}": now_ms})
+            pipe.expire(key, self.config.rate_limit_window_seconds + 1)
+            _, count, _, _ = pipe.execute()
+        except Exception as exc:  # noqa: BLE001
+            # Fail closed: deny the request rather than disabling the control.
+            logger.error("Redis rate limiter error for %s (%s) — denying request", identifier, exc)
+            return False
+        if count >= self.config.rate_limit_requests:
+            logger.warning(f"Rate limit exceeded for {identifier}")
+            return False
+        return True
+
+    def _is_allowed_memory(self, identifier: str) -> bool:
         now = datetime.utcnow()
         window_start = now - timedelta(seconds=self.config.rate_limit_window_seconds)
 
@@ -346,6 +442,15 @@ class RateLimiter:
         # Add current request
         self.requests[identifier].append((now, 1))
         return True
+
+    def health(self) -> Dict[str, Any]:
+        """Honest backend reporting for health endpoints."""
+        return {
+            "backend": self.backend,
+            "window_seconds": self.config.rate_limit_window_seconds,
+            "max_requests": self.config.rate_limit_requests,
+            "degraded": self.backend == "memory" and bool(self.config.redis_url),
+        }
 
 class IPWhitelist:
     """
@@ -377,11 +482,21 @@ class IPWhitelist:
 
 class AuditLogger:
     """
-    Security audit logging
+    Security audit logging.
+
+    Events are persisted to the `security_audit_log` table (see
+    database/20260901_python_services_caveats.sql) via the injected `persist`
+    callable, AND kept in a bounded in-memory ring buffer (last
+    `ring_capacity` events) which backs `get_events` reads. Persistence
+    failures are logged at ERROR (loud) but never drop the in-memory event.
     """
 
-    def __init__(self):
-        self.audit_log = []
+    def __init__(self, persist=None, ring_capacity: int = 1000, tenant_id: str = "default"):
+        from collections import deque
+
+        self.audit_log = deque(maxlen=ring_capacity)  # in-mem ring for reads
+        self._persist = persist
+        self.tenant_id = tenant_id
 
     def log_event(self, event_type: str, user_id: str,
                   details: Dict[str, Any], ip_address: str = None):
@@ -395,14 +510,24 @@ class AuditLogger:
         }
 
         self.audit_log.append(event)
+        if self._persist is not None:
+            try:
+                self._persist(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "AUDIT PERSISTENCE FAILED for event %s by %s: %s "
+                    "(event retained only in volatile ring buffer)",
+                    event_type, user_id, exc,
+                )
         logger.info(f"Security event: {event_type} by {user_id}")
 
     def get_events(self, user_id: str = None,
                    event_type: str = None,
                    start_time: datetime = None,
                    end_time: datetime = None) -> List[Dict[str, Any]]:
-        """Query audit log"""
-        filtered = self.audit_log
+        """Query the in-memory audit ring (durable history is in
+        security_audit_log; query that for anything older than the ring)."""
+        filtered = list(self.audit_log)
 
         if user_id:
             filtered = [e for e in filtered if e['user_id'] == user_id]
@@ -426,13 +551,16 @@ class AuthorizationManager:
     """
 
     def __init__(self):
+        # Role -> permission matrix. Audit remediation: ANALYST no longer holds
+        # TRAIN_MODELS (model training is an ML-engineering function; analysts
+        # consume models, they do not train them). A regression test pins this
+        # matrix (implementations/security/tests/test_security_manager.py).
         self.role_permissions = {
             Role.ADMIN: [Permission.ADMIN_ALL],
             Role.ANALYST: [
                 Permission.READ_TRANSACTIONS,
                 Permission.WRITE_TRANSACTIONS,
                 Permission.READ_MODELS,
-                Permission.TRAIN_MODELS,
                 Permission.READ_AUDIT
             ],
             Role.VIEWER: [
@@ -470,6 +598,16 @@ class SecurityManager:
     def __init__(self, config: SecurityConfig = None):
         self.config = config or SecurityConfig()
 
+        # Fail closed: booting without an operator-provided JWT secret would
+        # mean either a random per-process secret (tokens invalid across
+        # replicas/restarts) or an empty HMAC key. Neither is acceptable.
+        if not self.config.jwt_secret:
+            raise ValueError(
+                "JWT_SECRET must be configured for SecurityManager "
+                "(random per-process secrets are forbidden; see SecurityConfig "
+                "docstring for the rotation procedure via JWT_SECRET_PREVIOUS)"
+            )
+
         self.password_validator = PasswordValidator(self.config)
         self.password_hasher = PasswordHasher()
         self.jwt_manager = JWTManager(self.config)
@@ -477,15 +615,46 @@ class SecurityManager:
         self.input_validator = InputValidator()
         self.rate_limiter = RateLimiter(self.config)
         self.ip_whitelist = IPWhitelist(self.config.allowed_ip_ranges)
-        self.audit_logger = AuditLogger()
         self.authorization_manager = AuthorizationManager()
         self.database_url = self.config.database_url or os.getenv("DATABASE_URL", "").strip()
         self._conn_pool = None
         self._pool_lock = threading.Lock()
         if not self.database_url:
             raise ValueError("DATABASE_URL must be configured for SecurityManager")
+        self.audit_logger = AuditLogger(persist=self._persist_audit_event)
 
-        logger.info("Security Manager initialized with durable authentication repository")
+        logger.info(
+            "Security Manager initialized (durable auth repository, rate-limiter backend: %s)",
+            self.rate_limiter.backend,
+        )
+
+    def health(self) -> Dict[str, Any]:
+        """Honest component health: rate-limiter backend is reported loudly so
+        a memory fallback (per-process limits) is never silent."""
+        return {
+            "status": "healthy",
+            "rate_limiter": self.rate_limiter.health(),
+            "audit": {"backend": "postgres+memory-ring", "table": "security_audit_log"},
+            "jwt": {
+                "algorithm": self.config.jwt_algorithm,
+                "rotation_window_open": bool(self.config.jwt_previous_secret),
+            },
+        }
+
+    def _persist_audit_event(self, event: Dict[str, Any]) -> None:
+        """Write one audit event to the durable security_audit_log table."""
+        import json as _json
+
+        with self._connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO security_audit_log (event_type, user_id, ip_address, details)"
+                    " VALUES (%s, %s, %s, %s)",
+                    (
+                        event["event_type"], event["user_id"],
+                        event.get("ip_address"), _json.dumps(event.get("details") or {}),
+                    ),
+                )
 
     def register_user(self, username: str, password: str, email: str,
                      role: Role = Role.VIEWER) -> Dict[str, Any]:
@@ -587,6 +756,11 @@ class SecurityManager:
         """Lazily created thread-safe connection pool. Previously every
         operation opened a brand-new connection (TCP+TLS+auth handshake,
         ~5-30ms each; authenticate_user made up to 4 per login)."""
+        if psycopg2 is None:
+            raise RuntimeError(
+                "psycopg2 is not installed; SecurityManager's durable repository "
+                "requires psycopg2-binary (see service requirements)"
+            )
         if self._conn_pool is None:
             with self._pool_lock:
                 if self._conn_pool is None:
@@ -635,10 +809,19 @@ class SecurityManager:
                 )
 
     def _clear_failed_logins(self, username: str):
-        """Clear failure history only after a successful verified password check."""
+        """Tombstone (soft-clear) failure rows after a successful verified
+        password check. Anti-wipe policy: failed-login rows are attack evidence
+        and are never hard-deleted by this service; they are marked
+        cleared_at/cleared_by and stay in the table for forensics. Physical
+        removal is possible only via the dual-control deletion_approvals +
+        execute_approved_hard_delete path (database/20260825_antiwipe_soft_delete.sql)."""
         with self._connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute("DELETE FROM security_login_failures WHERE username=%s", (username,))
+                cursor.execute(
+                    "UPDATE security_login_failures SET cleared_at = NOW(), cleared_by = %s"
+                    " WHERE username = %s AND cleared_at IS NULL",
+                    (username, username),
+                )
 
     def _is_account_locked(self, username: str) -> bool:
         """Determine lockout from durable failures within the configured policy window."""
@@ -647,7 +830,8 @@ class SecurityManager:
                 cursor.execute(
                     """
                     SELECT COUNT(*) FROM security_login_failures
-                    WHERE username=%s AND attempted_at >= NOW() - (%s * INTERVAL '1 minute')
+                    WHERE username=%s AND cleared_at IS NULL
+                      AND attempted_at >= NOW() - (%s * INTERVAL '1 minute')
                     """,
                     (username, self.config.lockout_duration_minutes),
                 )

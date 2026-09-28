@@ -242,7 +242,7 @@ spec:
           annotations:
             summary: FraudFusion dependency-security gate failed
             description: A staging CI run reported a high or critical production dependency vulnerability. Promotion remains blocked.
-            runbook_url: https://runbooks.example.invalid/fraudfusion/vulnerability-gate
+            runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionVulnerabilityGateFailure.md"
         - alert: FraudFusionGoVulnerabilityGateFailure
           expr: increase(fraudfusion_release_gate_failures_total{environment="staging",gate="govulncheck"}[15m]) > 0
           for: 0m
@@ -253,7 +253,7 @@ spec:
           annotations:
             summary: FraudFusion Go vulnerability scan failed
             description: A reachable Go vulnerability was reported. Promotion remains blocked.
-            runbook_url: https://runbooks.example.invalid/fraudfusion/go-vulnerability-gate
+            runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionGoVulnerabilityGateFailure.md"
         - alert: FraudFusionIntegrationRegression
           expr: increase(fraudfusion_e2e_scenario_total{environment="staging",result="failure"}[15m]) > 0
           for: 0m
@@ -264,7 +264,7 @@ spec:
           annotations:
             summary: FraudFusion mobile-to-backend integration scenario failed
             description: An authenticated staging scenario failed. Promotion remains blocked pending a successful rerun.
-            runbook_url: https://runbooks.example.invalid/fraudfusion/integration-regression
+            runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionIntegrationRegression.md"
 ---
 apiVersion: monitoring.coreos.com/v1alpha1
 kind: AlertmanagerConfig

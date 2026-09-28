@@ -1,13 +1,34 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/mock"
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/testsuite"
 )
+
+// registerWorkflowTestActivities registers stub activities under their
+// contract names so OnActivity mocks can intercept them.
+func registerWorkflowTestActivities(env *testsuite.TestWorkflowEnvironment) {
+	env.RegisterActivityWithOptions(
+		func(ctx context.Context, params map[string]interface{}) (map[string]interface{}, error) {
+			return map[string]interface{}{"ok": true}, nil
+		},
+		activity.RegisterOptions{Name: "land_verification_service.GenerateReport"})
+	env.RegisterActivityWithOptions(
+		func(ctx context.Context, params map[string]interface{}) (map[string]interface{}, error) {
+			return map[string]interface{}{"status": "completed"}, nil
+		},
+		activity.RegisterOptions{Name: "journey_result_store.PersistJourneyResult"})
+}
 
 // TestWorkflowContractPinsNameAndQueue locks the cross-service contract: the
 // orchestrator must start "ExecuteJourneyWorkflow" on "fraud-fusion-task-queue".
@@ -92,5 +113,69 @@ func TestEvaluateCondition(t *testing.T) {
 		if got := evaluateCondition(tc.condition, ctx); got != tc.want {
 			t.Errorf("evaluateCondition(%q) = %v, want %v", tc.condition, got, tc.want)
 		}
+	}
+}
+
+// TestExecuteJourneyWorkflowPersistsResultDurably proves the workflow writes
+// the completed outcome to the journey_result_store activity (Postgres is
+// the system of record) and fails closed when persistence fails.
+func TestExecuteJourneyWorkflowPersistsResultDurably(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	registerWorkflowTestActivities(env)
+
+	journey := JourneyWorkflow{
+		JourneyID: "journey-persist-test",
+		UserID:    "user-1",
+		Context:   map[string]interface{}{"tenant_id": "tenant-x"},
+		Steps: []JourneyStep{{
+			ID: "step-1", Name: "noop", Service: "land_verification_service", Method: "GenerateReport",
+			StepType: "SEQUENTIAL", Parameters: map[string]interface{}{}, Required: true,
+		}},
+	}
+	persisted := make(chan map[string]interface{}, 1)
+	env.OnActivity("land_verification_service.GenerateReport", mock.Anything, mock.Anything).
+		Return(map[string]interface{}{"ok": true}, nil)
+	env.OnActivity("journey_result_store.PersistJourneyResult", mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, params map[string]interface{}) (map[string]interface{}, error) {
+			persisted <- params
+			return map[string]interface{}{"status": "completed"}, nil
+		})
+
+	env.ExecuteWorkflow(ExecuteJourneyWorkflow, journey)
+	if !env.IsWorkflowCompleted() || env.GetWorkflowError() != nil {
+		t.Fatalf("workflow should complete: %v", env.GetWorkflowError())
+	}
+	select {
+	case params := <-persisted:
+		if params["journey_id"] != "journey-persist-test" || params["status"] != "completed" || params["tenant_id"] != "tenant-x" {
+			t.Fatalf("persisted params = %v", params)
+		}
+	default:
+		t.Fatal("journey result was never persisted")
+	}
+}
+
+// TestExecuteJourneyWorkflowFailsWhenPersistenceFails: a completed journey
+// whose outcome cannot be written to Postgres must surface as a workflow
+// error (Temporal retries) rather than being lost with only a 1h Redis copy.
+func TestExecuteJourneyWorkflowFailsWhenPersistenceFails(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	registerWorkflowTestActivities(env)
+	env.OnActivity("journey_result_store.PersistJourneyResult", mock.Anything, mock.Anything).
+		Return(map[string]interface{}(nil), fmt.Errorf("db down"))
+	journey := JourneyWorkflow{
+		JourneyID: "journey-persist-fail",
+		UserID:    "user-1",
+		Context:   map[string]interface{}{},
+		Steps: []JourneyStep{{
+			ID: "step-1", Name: "noop", Service: "land_verification_service", Method: "GenerateReport",
+			StepType: "SEQUENTIAL", Parameters: map[string]interface{}{}, Required: true,
+		}},
+	}
+	env.ExecuteWorkflow(ExecuteJourneyWorkflow, journey)
+	if env.GetWorkflowError() == nil {
+		t.Fatal("workflow must fail when durable persistence fails")
 	}
 }

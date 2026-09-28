@@ -37,6 +37,8 @@ from app import bureau, identity, screening, tiers
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db
 from app.schemas import (
+    AppealDecisionRequest,
+    AppealRequest,
     BasicKYCRequest,
     BehavioralAnalysisRequest,
     BiometricVerifyRequest,
@@ -45,6 +47,7 @@ from app.schemas import (
     FraudCheckRequest,
     KYCResponse,
     PremiumKYCRequest,
+    RekycRequest,
     ScreeningRequest,
 )
 
@@ -52,6 +55,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(nam
 logger = logging.getLogger("kyc-api")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB per document/image
+
+# Periodic re-verification cadence by CBN tier (higher tiers review more often).
+REVIEW_INTERVAL_DAYS = {"tier_1": 365, "tier_2": 180, "tier_3": 90}
+DEFAULT_REKYC_DEADLINE_DAYS = 30
 
 IMAGE_MAGIC = {
     b"\xff\xd8\xff": "jpeg",
@@ -184,6 +191,7 @@ def _run_verification(db: Database, principal: Principal, level: str,
             "actor": principal.sub, "now": now,
         },
     )
+    _schedule_periodic_review(db, payload.customer_id, tier_limits.tier)
     logger.info("kyc verification: id=%s level=%s decision=%s risk=%.2f by=%s",
                 request_id, level, decision, risk, principal.sub)
     return KYCResponse(
@@ -197,6 +205,29 @@ def _run_verification(db: Database, principal: Principal, level: str,
         verification_results=results,
         timestamp=now,
         processing_time_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
+
+
+def _schedule_periodic_review(db: Database, customer_id: str, tier: str) -> None:
+    """Periodic review scheduler: every completed verification enrolls the
+    customer for their tier's next periodic review (tier_1: 12mo, tier_2: 6mo,
+    tier_3: 3mo). Idempotent per (customer, type, due date)."""
+    days = REVIEW_INTERVAL_DAYS.get(tier, 365)
+    due = datetime.now(timezone.utc).timestamp() + days * 86400
+    due_iso = datetime.fromtimestamp(due, timezone.utc).isoformat()
+    db.execute(
+        ("INSERT OR IGNORE INTO kyc_review_schedule (customer_id, review_type, tier, due_at)"
+         " VALUES (:cid, 'periodic', :tier, :due)" if not db._is_pg else
+         "INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at)"
+         " VALUES (:cid, 'periodic', :tier, :due) ON CONFLICT DO NOTHING"),
+        {"cid": customer_id, "tier": tier, "due": due_iso},
+    )
+
+
+def _latest_request(db: Database, customer_id: str) -> dict | None:
+    return db.query_one(
+        "SELECT * FROM kyc_requests WHERE customer_id = :cid ORDER BY created_at DESC LIMIT 1",
+        {"cid": customer_id},
     )
 
 
@@ -328,6 +359,182 @@ def create_app() -> FastAPI:
             "verification_results": json.loads(row["results_json"]),
             "timestamp": str(row.get("updated_at") or ""),
         }
+
+    # ------------------------- re-KYC / periodic review / appeals ---------
+
+    @app.get("/api/v1/kyc/reviews/due")
+    def reviews_due(limit: int = 100,
+                    principal: Principal = Depends(get_current_principal),
+                    db: Database = Depends(get_db)) -> dict:
+        """Periodic review scheduler read path: pending reviews whose due date
+        has arrived. Overdue pending rows are marked 'overdue' (loudly, so a
+        missed SLA is visible rather than silently pending forever)."""
+        now = _now()
+        db.execute(
+            "UPDATE kyc_review_schedule SET status = 'overdue' WHERE status = 'pending'"
+            " AND due_at < :now",
+            {"now": now},
+        )
+        rows = db.query(
+            "SELECT * FROM kyc_review_schedule WHERE status IN ('pending', 'overdue')"
+            " AND due_at <= :now ORDER BY due_at LIMIT :lim",
+            {"now": now, "lim": max(1, min(limit, 500))},
+        )
+        return {
+            "due": [
+                {
+                    "id": r["id"], "customer_id": r["customer_id"],
+                    "review_type": r["review_type"], "tier": r.get("tier"),
+                    "due_at": str(r["due_at"]), "status": r["status"],
+                    "reason": r.get("reason"),
+                }
+                for r in rows
+            ],
+            "count": len(rows),
+            "as_of": now,
+        }
+
+    @app.post("/api/v1/kyc/{customer_id}/rekyc", status_code=201)
+    def trigger_rekyc(customer_id: str, payload: RekycRequest,
+                      principal: Principal = Depends(get_current_principal),
+                      db: Database = Depends(get_db)) -> dict:
+        """Trigger a re-KYC: the customer's current verification is superseded
+        (a new request row in 'received'/'pending' state with a deadline) and
+        a 'rekyc' review is scheduled at the deadline."""
+        original = _latest_request(db, customer_id)
+        if not original:
+            raise HTTPException(status_code=404, detail="no existing kyc request for customer")
+        now = _now()
+        deadline = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() + payload.deadline_days * 86400,
+            timezone.utc,
+        ).isoformat()
+        rekyc_id = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO kyc_requests (id, customer_id, level, tier, status, decision,"
+            " risk_score, risk_level, results_json, actor_sub, rekyc_of, rekyc_reason,"
+            " rekyc_deadline, created_at, updated_at)"
+            " VALUES (:id, :cid, :level, :tier, 'received', 'pending', 0, 'low', '{}', :actor,"
+            " :of, :reason, :deadline, :now, :now)",
+            {"id": rekyc_id, "cid": customer_id, "level": original["level"],
+             "tier": original["tier"], "actor": principal.sub, "of": original["id"],
+             "reason": payload.reason, "deadline": deadline, "now": now},
+        )
+        db.execute(
+            ("INSERT OR IGNORE INTO kyc_review_schedule (customer_id, review_type, tier, due_at,"
+             " reason) VALUES (:cid, 'rekyc', :tier, :due, :reason)" if not db._is_pg else
+             "INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at, reason)"
+             " VALUES (:cid, 'rekyc', :tier, :due, :reason) ON CONFLICT DO NOTHING"),
+            {"cid": customer_id, "tier": original["tier"], "due": deadline,
+             "reason": payload.reason},
+        )
+        logger.info("rekyc triggered: customer=%s rekyc=%s of=%s by=%s deadline=%s",
+                    customer_id, rekyc_id, original["id"], principal.sub, deadline)
+        return {
+            "rekyc_id": rekyc_id,
+            "customer_id": customer_id,
+            "supersedes": original["id"],
+            "status": "pending",
+            "tier": original["tier"],
+            "reason": payload.reason,
+            "deadline": deadline,
+            "timestamp": now,
+        }
+
+    # ------------------------- appeals (independent reviewer) --------------
+
+    def _appeal_view(row: dict) -> dict:
+        return {
+            "appeal_id": row["id"],
+            "customer_id": row["customer_id"],
+            "kyc_request_id": row.get("kyc_request_id"),
+            "grounds": row["grounds"],
+            "status": row["status"],
+            "submitted_by": row["submitted_by"],
+            "original_reviewer": row.get("original_reviewer"),
+            "decided_by": row.get("decided_by"),
+            "decision_reason": row.get("decision_reason"),
+            "created_at": str(row.get("created_at") or ""),
+            "updated_at": str(row.get("updated_at") or ""),
+        }
+
+    @app.post("/api/v1/kyc/{customer_id}/appeals", status_code=201)
+    def submit_appeal(customer_id: str, payload: AppealRequest,
+                      principal: Principal = Depends(get_current_principal),
+                      db: Database = Depends(get_db)) -> dict:
+        target = None
+        if payload.kyc_request_id:
+            target = db.query_one(
+                "SELECT * FROM kyc_requests WHERE id = :id AND customer_id = :cid",
+                {"id": payload.kyc_request_id, "cid": customer_id},
+            )
+        else:
+            target = _latest_request(db, customer_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="no kyc request to appeal")
+        if target["decision"] not in ("rejected", "manual_review"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"only rejected/manual_review decisions can be appealed (current: {target['decision']})",
+            )
+        appeal_id = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO kyc_appeals (id, customer_id, kyc_request_id, grounds, submitted_by,"
+            " original_reviewer, status, created_at, updated_at)"
+            " VALUES (:id, :cid, :rid, :grounds, :by, :orig, 'pending', :now, :now)",
+            {"id": appeal_id, "cid": customer_id, "rid": target["id"],
+             "grounds": payload.grounds, "by": principal.sub,
+             "orig": target.get("actor_sub") or None, "now": _now()},
+        )
+        logger.info("appeal submitted: id=%s customer=%s request=%s by=%s",
+                    appeal_id, customer_id, target["id"], principal.sub)
+        return _appeal_view(db.query_one("SELECT * FROM kyc_appeals WHERE id = :id",
+                                         {"id": appeal_id}))
+
+    @app.get("/api/v1/kyc/appeals/{appeal_id}")
+    def get_appeal(appeal_id: str,
+                   principal: Principal = Depends(get_current_principal),
+                   db: Database = Depends(get_db)) -> dict:
+        row = db.query_one("SELECT * FROM kyc_appeals WHERE id = :id", {"id": appeal_id})
+        if not row:
+            raise HTTPException(status_code=404, detail="appeal not found")
+        return _appeal_view(row)
+
+    @app.post("/api/v1/kyc/appeals/{appeal_id}/decision")
+    def decide_appeal(appeal_id: str, payload: AppealDecisionRequest,
+                      principal: Principal = Depends(get_current_principal),
+                      db: Database = Depends(get_db)) -> dict:
+        """Decide an appeal. Independence rule (also enforced by the
+        kyc_appeals_independence_guard Postgres trigger): the decider can
+        never be the reviewer who made the original decision."""
+        row = db.query_one("SELECT * FROM kyc_appeals WHERE id = :id", {"id": appeal_id})
+        if not row:
+            raise HTTPException(status_code=404, detail="appeal not found")
+        if row["status"] not in ("pending", "under_review"):
+            raise HTTPException(status_code=409, detail=f"appeal already {row['status']}")
+        if row.get("original_reviewer") and principal.sub == row["original_reviewer"]:
+            raise HTTPException(
+                status_code=409,
+                detail="appeal independence: the original reviewer cannot decide this appeal",
+            )
+        db.execute(
+            "UPDATE kyc_appeals SET status = :st, decision_reason = :reason,"
+            " decided_by = :by, updated_at = :now WHERE id = :id",
+            {"st": payload.decision, "reason": payload.reason, "by": principal.sub,
+             "now": _now(), "id": appeal_id},
+        )
+        if payload.decision == "overturned" and row.get("kyc_request_id"):
+            # The original adverse decision no longer stands; route the
+            # customer back to manual review for a fresh decision.
+            db.execute(
+                "UPDATE kyc_requests SET decision = 'manual_review', updated_at = :now"
+                " WHERE id = :rid",
+                {"now": _now(), "rid": row["kyc_request_id"]},
+            )
+        logger.info("appeal decided: id=%s decision=%s by=%s", appeal_id,
+                    payload.decision, principal.sub)
+        return _appeal_view(db.query_one("SELECT * FROM kyc_appeals WHERE id = :id",
+                                         {"id": appeal_id}))
 
     # ------------------------- Biometric ----------------------------------
 

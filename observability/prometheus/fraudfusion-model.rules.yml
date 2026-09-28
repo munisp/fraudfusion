@@ -27,7 +27,7 @@ groups:
         annotations:
           summary: "FraudFusion input drift threshold breached"
           description: "One or more scored-transaction features breached the PSI/KS drift threshold vs the reference window (see fraudfusion_drift_psi / fraudfusion_drift_ks). Investigate upstream data quality before trusting model scores."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-drift"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionModelDriftAlert.md"
 
       - alert: FraudFusionFeaturePSIDrift
         expr: max(fraudfusion_drift_psi) > 0.25
@@ -40,7 +40,7 @@ groups:
         annotations:
           summary: "FraudFusion feature PSI above 0.25 for 30m"
           description: "Sustained population stability index breach on at least one model feature. Review the per-feature fraudfusion_drift_psi series and consider retraining via mlops/cron/retrain.sh."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-drift"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionFeaturePSIDrift.md"
 
       - alert: FraudFusionModelPerformanceDegraded
         expr: fraudfusion_model_degraded == 1
@@ -53,7 +53,7 @@ groups:
         annotations:
           summary: "FraudFusion model performance below degradation threshold"
           description: "Rolling precision/recall/F1 on confirmed labels breached degradation thresholds (fraudfusion_model_f1). Escalate to the ML oncall; consider champion rollback or expedited retraining."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-degradation"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionModelPerformanceDegraded.md"
 
       - alert: FraudFusionModelF1Low
         expr: fraudfusion_model_f1 < 0.5
@@ -66,7 +66,7 @@ groups:
         annotations:
           summary: "FraudFusion rolling F1 below 0.5 for 1h"
           description: "Sustained low F1 on labeled outcomes. Check label lag (fraud labels arrive 7-30 days late) before concluding true degradation."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-degradation"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionModelF1Low.md"
 
       - alert: FraudFusionChallengerPromotion
         expr: fraudfusion_model_promotion == 1
@@ -79,4 +79,4 @@ groups:
         annotations:
           summary: "FraudFusion challenger promoted over champion"
           description: "The continuous-training gate promoted a challenger model version. Verify the model-router ConfigMap and registry alias (champion) were updated, and watch drift/performance alerts for regression."
-          runbook_url: "https://runbooks.example.invalid/fraudfusion/model-promotion"
+          runbook_url: "https://github.com/munisp/fraudfusion/blob/main/docs/runbooks/FraudFusionChallengerPromotion.md"

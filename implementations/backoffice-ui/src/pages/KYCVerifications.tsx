@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { api } from '../services/api';
+import { api, API_BASE_URL } from '../services/api';
+import { currentDataMode } from '../services/dataMode';
+import OutageState from '../components/OutageState';
+import MockDataBanner from '../components/MockDataBanner';
 import type { KYCVerification as ApiKYCVerification } from '../types';
 import {
   Search,
@@ -47,10 +50,10 @@ interface KYCVerification {
 }
 
 /**
- * Built-in sample verifications, used only as a documented offline fallback when
- * the backoffice API (`GET /backoffice/kyc/verifications`) is unreachable.
- * Approve/Reject decisions against the fallback are applied locally and are not
- * persisted.
+ * Dev-only sample verifications, rendered ONLY when the page is explicitly
+ * opened with `?mock=1` on a Vite dev build (see services/dataMode.ts). They
+ * are never used as a fallback for API failures: when the backoffice API is
+ * unreachable this page renders the outage state instead of fabricated rows.
  */
 const mockVerifications: KYCVerification[] = [
   {
@@ -235,8 +238,10 @@ const KYCVerifications: React.FC = () => {
   const [page, setPage] = useState(1);
   const [decisionError, setDecisionError] = useState<string | null>(null);
   const [decisionPending, setDecisionPending] = useState(false);
-  // Local overrides hold optimistic updates and fallback-mode decisions.
+  // Local overrides hold optimistic updates (live mode) and mock-mode decisions.
   const [localVerifications, setLocalVerifications] = useState<KYCVerification[] | null>(null);
+  // Dev-only mock opt-in (?mock=1). Never an implicit fallback.
+  const mockMode = currentDataMode() === 'mock';
 
   const {
     data: apiVerifications,
@@ -250,10 +255,15 @@ const KYCVerifications: React.FC = () => {
       return response.data.map(mapApiVerification);
     },
     retry: false,
+    enabled: !mockMode,
   });
 
-  // Live API data wins; documented mock fallback when the API is unreachable.
-  const verifications = localVerifications ?? apiVerifications ?? mockVerifications;
+  // Live mode: only real API rows (empty until loaded; outage state on error).
+  // Mock mode: only the explicit dev opt-in samples.
+  const verifications = mockMode
+    ? localVerifications ?? mockVerifications
+    : localVerifications ?? apiVerifications ?? [];
+  const outage = !mockMode && apiUnreachable;
 
   const submitDecision = async (
     verification: KYCVerification,
@@ -281,12 +291,14 @@ const KYCVerifications: React.FC = () => {
         reason || `Back-office ${decision === 'approved' ? 'approval' : 'rejection'}`,
       );
     } catch (cause) {
-      if (apiUnreachable) {
+      if (mockMode) {
+        // Mock mode (?mock=1): keep the local decision; the permanent MOCK
+        // DATA banner stays visible and nothing is persisted.
         setDecisionError(
-          'Backoffice API unreachable — decision applied to local sample data only and will not persist.',
+          'Mock mode (?mock=1) — decision applied to sample data only and will not persist.',
         );
       } else {
-        // Roll back the optimistic update.
+        // Live mode: roll back the optimistic update.
         setLocalVerifications(previous);
         setSelectedVerification(verification);
         setDecisionError(
@@ -314,12 +326,7 @@ const KYCVerifications: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      {apiUnreachable && (
-        <div className="rounded-lg border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-800">
-          Backoffice API unreachable — showing built-in sample data. Decisions will be applied
-          locally only.
-        </div>
-      )}
+      {mockMode && <MockDataBanner />}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-900">KYC Verifications</h1>
         <div className="flex items-center space-x-3">
@@ -348,6 +355,18 @@ const KYCVerifications: React.FC = () => {
         </div>
       </div>
 
+      {outage ? (
+        // Never render fabricated rows: the outage state replaces all data UI.
+        <OutageState
+          apiBaseUrl={API_BASE_URL}
+          onRetry={() => {
+            setLocalVerifications(null);
+            void refetch();
+          }}
+          retrying={isFetching}
+        />
+      ) : (
+      <>
       {showFilters && (
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -589,6 +608,8 @@ const KYCVerifications: React.FC = () => {
           </button>
         </div>
       </div>
+      </>
+      )}
 
       {selectedVerification && (
         <KYCDetailModal

@@ -30,12 +30,19 @@ class Citation(BaseModel):
     role: str = "path-node"
 
 
+class TimeWindowOut(BaseModel):
+    start: str
+    end: str
+    phrase: str
+
+
 class AskResponse(BaseModel):
     question: str
     answer: str
     llm_used: bool
     llm_model: str | None = None
     store_mode: str
+    time_window: TimeWindowOut | None = None
     linked_entities: list[Citation]
     citations: list[Citation]
     paths: list[ScoredPath]

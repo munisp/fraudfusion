@@ -28,11 +28,27 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, Field
+
+try:
+    from identity_store import IdentityStore, get_store
+    from registry import get_bvn_adapter, get_nin_adapter
+    from cross_reference import cross_reference
+except ImportError:  # when imported as a package from the repo root
+    sys_path_added = str(Path(__file__).resolve().parent)
+    import sys
+
+    if sys_path_added not in sys.path:
+        sys.path.insert(0, sys_path_added)
+    from identity_store import IdentityStore, get_store
+    from registry import get_bvn_adapter, get_nin_adapter
+    from cross_reference import cross_reference
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+ADMIN_ROLES = {"admin", "identity_admin"}
 
 SERVICE_NAME = "identity-theft-detector"
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -261,6 +277,7 @@ class CrossReferenceRequest(BaseModel):
     bvn: Optional[str] = None
     phone_number: Optional[str] = None
     email: Optional[str] = None
+    device_id: Optional[str] = None
 
 
 # Nigerian document validation patterns
@@ -318,19 +335,25 @@ app = FastAPI(title="Identity Theft Detector", version="2.0.0", lifespan=lifespa
 
 
 @app.get("/health")
-async def health_check(request: Request, _: dict = Depends(authenticate)):
+async def health_check(request: Request, _: dict = Depends(authenticate),
+                       store: IdentityStore = Depends(get_store)):
     model = get_model(request)
     return {
         "status": "healthy",
         "service": SERVICE_NAME,
         "model_mode": model.mode,
         "model_path": str(MODEL_PATH),
+        "registries": {
+            "bvn": get_bvn_adapter(store).name,
+            "nin": get_nin_adapter(store).name,
+        },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 @app.post("/verify-identity")
-async def verify_identity(request: IdentityVerificationRequest, _: dict = Depends(authenticate)):
+async def verify_identity(request: IdentityVerificationRequest, _: dict = Depends(authenticate),
+                          store: IdentityStore = Depends(get_store)):
     """Format-level identity verification. Registry lookups fail closed."""
     logger.info("Identity verification request for user %s", request.user_id)
 
@@ -338,33 +361,62 @@ async def verify_identity(request: IdentityVerificationRequest, _: dict = Depend
     verification_results: Dict[str, Any] = {}
     red_flags: List[str] = []
 
+    nin_adapter = get_nin_adapter(store)
+    bvn_adapter = get_bvn_adapter(store)
+    registry_statuses: List[str] = []
+
     if request.nin:
         verification_results['nin_valid'] = validate_nin(request.nin)
         if not verification_results['nin_valid']:
             risk_score += 30
             red_flags.append('invalid_nin_format')
-        # Registry verification requires NIMC connectivity (not configured here).
-        verification_results['nin_registry'] = 'unavailable'
+        else:
+            nin_lookup = nin_adapter.lookup(request.nin)
+            registry_statuses.append(nin_lookup['status'])
+            verification_results['nin_registry'] = nin_lookup['status']
+            verification_results['nin_registry_adapter'] = nin_lookup.get('adapter')
+            if nin_lookup['status'] == 'not_found':
+                risk_score += 25
+                red_flags.append('nin_not_in_registry')
+            elif nin_lookup['status'] == 'found':
+                record = nin_lookup.get('record') or {}
+                if record.get('is_synthetic') or nin_lookup.get('is_synthetic'):
+                    verification_results['nin_registry_synthetic'] = True
 
     if request.bvn:
         verification_results['bvn_valid'] = validate_bvn(request.bvn)
         if not verification_results['bvn_valid']:
             risk_score += 30
             red_flags.append('invalid_bvn_format')
-        verification_results['bvn_registry'] = 'unavailable'
+        else:
+            bvn_lookup = bvn_adapter.lookup(request.bvn)
+            registry_statuses.append(bvn_lookup['status'])
+            verification_results['bvn_registry'] = bvn_lookup['status']
+            verification_results['bvn_registry_adapter'] = bvn_lookup.get('adapter')
+            if bvn_lookup['status'] == 'not_found':
+                risk_score += 25
+                red_flags.append('bvn_not_in_registry')
 
     verification_results['phone_valid'] = validate_phone(request.phone_number)
     if not verification_results['phone_valid']:
         risk_score += 10
         red_flags.append('invalid_phone_format')
 
-    verification_results['stolen_identity_registry'] = 'unavailable'
+    # Stolen-identity check: real query against the alerts store.
+    alerts = store.query(
+        "SELECT id FROM identity_theft_alerts WHERE user_id = :u LIMIT 1",
+        {"u": request.user_id},
+    )
+    verification_results['stolen_identity_registry'] = 'flagged' if alerts else 'clear'
+    if alerts:
+        risk_score += 40
+        red_flags.append('prior_identity_theft_alert')
     identity_hash = calculate_identity_hash(request.model_dump())
     verification_results['identity_hash'] = identity_hash
 
-    # Fail-closed posture: without registry access we cannot "verify", only
-    # confirm format validity.
-    registry_available = False
+    # Fail-closed posture: "verified" requires at least one registry to have
+    # actually confirmed the identifier; unavailable/not_found never verify.
+    registry_available = bool(registry_statuses) and all(s == 'found' for s in registry_statuses)
     if risk_score >= 70:
         risk_level = 'critical'
     elif risk_score >= 40:
@@ -376,8 +428,12 @@ async def verify_identity(request: IdentityVerificationRequest, _: dict = Depend
 
     return {
         'user_id': request.user_id,
-        'is_verified': False if not registry_available else risk_score < 40,
-        'verification_status': 'registry_unavailable',
+        'is_verified': registry_available and risk_score < 40,
+        'verification_status': (
+            'registry_verified' if registry_available else
+            ('registry_unavailable' if any(s == 'unavailable' for s in registry_statuses) or not registry_statuses
+             else 'registry_checked')
+        ),
         'risk_score': risk_score,
         'risk_level': risk_level,
         'verification_results': verification_results,
@@ -514,28 +570,130 @@ async def detect_synthetic_identity(request: SyntheticIdentityRequest, _: dict =
 
 
 @app.post("/cross-reference-check")
-async def cross_reference_check(request: CrossReferenceRequest, _: dict = Depends(authenticate)):
-    """Cross-reference identity. Unconfigured sources are 'unavailable', not 'found'."""
+async def cross_reference_check(request: CrossReferenceRequest, _: dict = Depends(authenticate),
+                                  store: IdentityStore = Depends(get_store)):
+    """Real cross-reference over customer_identifiers + BVN/NIN registries +
+    identity_theft_alerts. Returns matched identity clusters with evidence
+    links; `searched_sources` always lists every consulted source so an empty
+    result demonstrably means "no matches", never "didn't look"."""
     logger.info("Cross-reference check for user %s", request.user_id)
 
-    cross_reference_results: Dict[str, Any] = {}
-    for source, provided in (
-        ('nin', request.nin), ('bvn', request.bvn),
-        ('phone', request.phone_number), ('email', request.email),
-    ):
-        if provided:
-            # External registries (NIMC/NIBSS/telco) are not configured in
-            # this deployment; fail closed instead of fabricating matches.
-            cross_reference_results[source] = {'status': 'unavailable'}
+    result = await asyncio.to_thread(
+        cross_reference,
+        store,
+        get_bvn_adapter(store),
+        get_nin_adapter(store),
+        user_id=request.user_id,
+        nin=request.nin,
+        bvn=request.bvn,
+        phone=request.phone_number,
+        email=request.email,
+        device=request.device_id,
+    )
 
     return {
         'user_id': request.user_id,
-        'cross_reference_results': cross_reference_results,
-        'inconsistencies': [],
-        'risk_score': 0,
-        'all_checks_passed': False,
-        'checks_status': 'registry_unavailable',
+        'matched_customers': result['matched_customers'],
+        'clusters': result['clusters'],
+        'alerts': result['alerts'],
+        'cross_reference_results': result['source_results'],
+        'inconsistencies': result['inconsistencies'],
+        'risk_score': result['risk_score'],
+        'all_checks_passed': not result['clusters'] and not result['alerts']
+                             and not result['inconsistencies'],
+        'searched_sources': result['searched_sources'],
+        'checks_status': result['checks_status'],
         'timestamp': datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.post("/admin/registry/import")
+async def import_registry(
+    registry: str = Form(...),
+    file: UploadFile = File(...),
+    claims: dict = Depends(authenticate),
+    store: IdentityStore = Depends(get_store),
+):
+    """Admin CSV import for the local BVN/NIN registries.
+
+    CSV header: `<bvn|nin>,full_name,date_of_birth,phone_number,email`
+    Rows are upserted with provenance `admin-import:<filename>` and the
+    importing principal recorded. Requires the admin or identity_admin realm
+    role. Rows imported here are REAL data (is_synthetic=false) — unlike the
+    clearly-marked synthetic seed rows.
+    """
+    roles = set((claims.get("realm_access") or {}).get("roles") or [])
+    if not roles & ADMIN_ROLES:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail=f"requires one of: {sorted(ADMIN_ROLES)}")
+    if registry not in ("bvn", "nin"):
+        raise HTTPException(status_code=400, detail="registry must be 'bvn' or 'nin'")
+    raw = await file.read()
+    if len(raw) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="CSV exceeds 20MB limit")
+    if not raw.strip():
+        raise HTTPException(status_code=422, detail="empty CSV")
+
+    import csv
+    import io
+
+    table = f"{registry}_registry"
+    provenance = f"admin-import:{file.filename or 'upload.csv'}"
+    imported_by = claims.get("sub", "unknown")
+    reader = csv.DictReader(io.StringIO(raw.decode("utf-8", errors="replace")))
+    required = {registry, "full_name"}
+    if not reader.fieldnames or not required <= {f.strip() for f in reader.fieldnames}:
+        raise HTTPException(status_code=422,
+                            detail=f"CSV header must include {sorted(required)}")
+
+    imported, rejected = 0, []
+    validator = validate_bvn if registry == "bvn" else validate_nin
+    for i, row in enumerate(reader, start=2):  # header is line 1
+        id_value = (row.get(registry) or "").strip()
+        full_name = (row.get("full_name") or "").strip()
+        if not id_value or not full_name:
+            rejected.append({"line": i, "reason": "missing id or full_name"})
+            continue
+        if not validator(id_value):
+            rejected.append({"line": i, "reason": f"invalid {registry} format"})
+            continue
+        if store._is_pg:
+            store.execute(
+                f"INSERT INTO {table} ({registry}, full_name, date_of_birth, phone_number, email,"
+                f" is_synthetic, provenance, imported_by) VALUES (:idv, :name, :dob, :phone, :email,"
+                f" FALSE, :prov, :by) ON CONFLICT (tenant_id, {registry}) DO UPDATE SET"
+                f" full_name = EXCLUDED.full_name, date_of_birth = EXCLUDED.date_of_birth,"
+                f" phone_number = EXCLUDED.phone_number, email = EXCLUDED.email,"
+                f" provenance = EXCLUDED.provenance, imported_by = EXCLUDED.imported_by",
+                {"idv": id_value, "name": full_name, "dob": (row.get("date_of_birth") or "").strip() or None,
+                 "phone": (row.get("phone_number") or "").strip() or None,
+                 "email": (row.get("email") or "").strip() or None,
+                 "prov": provenance, "by": imported_by},
+            )
+        else:
+            store.execute(
+                f"INSERT INTO {table} ({registry}, full_name, date_of_birth, phone_number, email,"
+                f" is_synthetic, provenance, imported_by) VALUES (:idv, :name, :dob, :phone, :email,"
+                f" 0, :prov, :by) ON CONFLICT (tenant_id, {registry}) DO UPDATE SET"
+                f" full_name = excluded.full_name, date_of_birth = excluded.date_of_birth,"
+                f" phone_number = excluded.phone_number, email = excluded.email,"
+                f" provenance = excluded.provenance, imported_by = excluded.imported_by",
+                {"idv": id_value, "name": full_name, "dob": (row.get("date_of_birth") or "").strip() or None,
+                 "phone": (row.get("phone_number") or "").strip() or None,
+                 "email": (row.get("email") or "").strip() or None,
+                 "prov": provenance, "by": imported_by},
+            )
+        imported += 1
+    logger.info("registry import: table=%s imported=%d rejected=%d by=%s",
+                table, imported, len(rejected), imported_by)
+    return {
+        "registry": table,
+        "imported": imported,
+        "rejected": rejected[:100],
+        "rejected_count": len(rejected),
+        "provenance": provenance,
+        "imported_by": imported_by,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 

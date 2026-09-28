@@ -102,6 +102,13 @@ func ExecuteJourneyWorkflow(ctx workflow.Context, journey JourneyWorkflow) (map[
 		if err != nil {
 			if step.Required {
 				logger.Error("Required step failed", "stepID", step.ID, "error", err)
+				// Record the failed outcome durably before propagating.
+				failCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+					StartToCloseTimeout: 30 * time.Second,
+					RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 5, InitialInterval: 500 * time.Millisecond, BackoffCoefficient: 2.0},
+				})
+				_ = workflow.ExecuteActivity(failCtx, "journey_result_store.PersistJourneyResult",
+					journeyResultInput(journey, "failed", results, fmt.Sprintf("required step %s failed: %v", step.ID, err))).Get(failCtx, nil)
 				return nil, fmt.Errorf("required step %s failed: %w", step.ID, err)
 			}
 			logger.Warn("Optional step failed", "stepID", step.ID, "error", err)
@@ -114,7 +121,48 @@ func ExecuteJourneyWorkflow(ctx workflow.Context, journey JourneyWorkflow) (map[
 	}
 
 	logger.Info("Journey completed", "journeyID", journey.JourneyID)
+
+	// Persist the completed outcome durably (Postgres journey_results is the
+	// system of record; the orchestrator's Redis copy is only a 1h cache).
+	// Fail-closed: a journey whose outcome cannot be persisted is reported as
+	// failed so Temporal retries rather than losing the result.
+	persistCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 30 * time.Second,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts:    5,
+			InitialInterval:    500 * time.Millisecond,
+			BackoffCoefficient: 2.0,
+		},
+	})
+	persistErr := workflow.ExecuteActivity(persistCtx, "journey_result_store.PersistJourneyResult", journeyResultInput(journey, "completed", results, "")).Get(persistCtx, nil)
+	if persistErr != nil {
+		return nil, fmt.Errorf("persist journey %s result durably: %w", journey.JourneyID, persistErr)
+	}
 	return results, nil
+}
+
+// journeyResultInput builds the PersistJourneyResult activity payload.
+func journeyResultInput(journey JourneyWorkflow, status string, outcome map[string]interface{}, failureReason string) map[string]interface{} {
+	tenantID := "default"
+	if raw, ok := journey.Context["tenant_id"]; ok {
+		if s, ok := raw.(string); ok && strings.TrimSpace(s) != "" {
+			tenantID = s
+		}
+	}
+	if outcome == nil {
+		outcome = map[string]interface{}{}
+	}
+	if failureReason != "" {
+		outcome["failure_reason"] = failureReason
+	}
+	return map[string]interface{}{
+		"journey_id":   journey.JourneyID,
+		"journey_type": "ExecuteJourneyWorkflow",
+		"tenant_id":    tenantID,
+		"user_id":      journey.UserID,
+		"status":       status,
+		"outcome":      outcome,
+	}
 }
 
 // executeSequentialStep executes a single step
@@ -377,6 +425,14 @@ func main() {
 		temporalHost = "localhost:7233"
 	}
 
+	// Journey results are persisted durably to Postgres (system of record);
+	// a worker without a database connection must not start.
+	resultPool, err := newJourneyResultPool(context.Background())
+	if err != nil {
+		log.Fatalln("Unable to initialize journey result persistence:", err)
+	}
+	defer resultPool.Close()
+
 	// Create Temporal client
 	c, err := client.Dial(client.Options{
 		HostPort: temporalHost,
@@ -404,6 +460,7 @@ func main() {
 	w.RegisterActivityWithOptions(&IntegrationActivities{}, activity.RegisterOptions{Name: "integration_service."})
 	w.RegisterActivityWithOptions(&NotificationActivities{}, activity.RegisterOptions{Name: "notification_service."})
 	w.RegisterActivityWithOptions(&FraudDetectionActivities{}, activity.RegisterOptions{Name: "fraud_detection_service."})
+	w.RegisterActivityWithOptions(&JourneyResultActivities{pool: resultPool}, activity.RegisterOptions{Name: "journey_result_store."})
 
 	// Start worker
 	log.Printf("Starting Temporal worker on task queue: %s", TaskQueue)

@@ -71,3 +71,18 @@ class FraudCheckRequest(BaseModel):
 class BehavioralAnalysisRequest(BaseModel):
     customer_id: str = Field(min_length=1, max_length=100)
     behavioral_data: dict[str, Any]
+
+
+class RekycRequest(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+    deadline_days: int = Field(default=30, ge=1, le=180)
+
+
+class AppealRequest(BaseModel):
+    kyc_request_id: Optional[str] = None  # defaults to the customer's latest request
+    grounds: str = Field(min_length=10, max_length=2000)
+
+
+class AppealDecisionRequest(BaseModel):
+    decision: str = Field(pattern="^(upheld|overturned|dismissed)$")
+    reason: str = Field(min_length=3, max_length=2000)

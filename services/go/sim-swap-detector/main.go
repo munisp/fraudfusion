@@ -109,6 +109,7 @@ func main() {
 	// All routes require a valid Keycloak token (fail-closed introspection);
 	// destructive actions additionally require fraud_analyst/admin.
 	router.Use(authMiddleware())
+	router.Use(tenantBindingMiddleware())
 
 	// API routes
 	v1 := router.Group("/api/v1/sim-swap")

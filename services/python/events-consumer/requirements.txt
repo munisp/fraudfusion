@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+# Kafka source (KAFKA_BOOTSTRAP_SERVERS). Without it, EVENTS_SOURCE=filetail
+# tails the lakehouse jsonl export — the source is honestly reported in /health.
+kafka-python==3.0.11
+# PostgreSQL sink; without DATABASE_URL a local SQLite mirror is used for
+# local dev/tests.
+psycopg[binary]==3.2.3

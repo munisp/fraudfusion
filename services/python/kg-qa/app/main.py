@@ -32,10 +32,11 @@ for _cand in (_THIS.parents[3], Path("/app")):  # services/python/kg-qa/app -> r
 
 from fastapi import FastAPI
 
-from app import compose, entity_linking, path_reasoning
+from app import compose, entity_linking, path_reasoning, temporal
 from app.graph_store import InMemoryGraphStore, get_store
 from app.schemas import (AskRequest, AskResponse, Citation, Hop,
-                         RefreshRequest, RefreshResponse, ScoredPath)
+                         RefreshRequest, RefreshResponse, ScoredPath,
+                         TimeWindowOut)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -69,12 +70,15 @@ def _collect_entities(store_obj, paths) -> dict[str, dict[str, Any]]:
 @app.post("/v1/kgqa/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     s = store()
+    window = temporal.parse_temporal(req.question)
     linked = entity_linking.link_entities(req.question, s)
     linked_ids = [l["entity_id"] for l in linked]
-    paths = path_reasoning.enumerate_paths(s, linked_ids, req.max_hops, req.max_paths)
+    paths = path_reasoning.enumerate_paths(s, linked_ids, req.max_hops,
+                                           req.max_paths, window=window)
     entities = _collect_entities(s, paths)
 
-    answer = compose.template_answer(req.question, paths, entities, linked)
+    answer = compose.template_answer(req.question, paths, entities, linked,
+                                     window=window)
     llm_text = compose.ollama_rephrase(req.question, answer)
     llm_used = llm_text is not None
     if llm_used:
@@ -103,6 +107,9 @@ def ask(req: AskRequest) -> AskResponse:
         llm_used=llm_used,
         llm_model=compose.OLLAMA_MODEL if llm_used else None,
         store_mode=s.mode,
+        time_window=TimeWindowOut(start=window.start.isoformat(),
+                                  end=window.end.isoformat(),
+                                  phrase=window.phrase) if window else None,
         linked_entities=[Citation(entity_id=l["entity_id"],
                                   label=l.get("label") or "Unknown",
                                   role="linked") for l in linked],

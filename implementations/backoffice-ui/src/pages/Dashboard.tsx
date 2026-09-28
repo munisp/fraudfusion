@@ -1,6 +1,6 @@
 import React from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { api } from '../services/api';
+import { api, API_BASE_URL } from '../services/api';
 import {
   FileCheck,
   FileX,
@@ -71,8 +71,10 @@ const Dashboard: React.FC = () => {
 
   if (isError || !stats) {
     return (
-      <div className="rounded-lg border border-red-200 bg-red-50 p-6 text-red-800">
-        Dashboard metrics are unavailable. Confirm that the authenticated backoffice API is reachable and retry.
+      <div className="rounded-lg border border-red-200 bg-red-50 p-6 text-red-800" role="alert">
+        Live data unavailable — backend unreachable at{' '}
+        <code className="font-mono font-semibold">{API_BASE_URL}</code>. Confirm that the
+        backoffice-api service is running and retry.
       </div>
     );
   }

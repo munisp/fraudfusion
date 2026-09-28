@@ -13,7 +13,17 @@ import {
   PaginatedResponse,
 } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api/v1';
+/**
+ * Base URL of the backoffice-api service (lane P), env-driven via
+ * VITE_BACKOFFICE_API_URL. Defaults to the in-cluster Service DNS name
+ * (deploy/kubernetes — backoffice-api:8087). VITE_API_BASE_URL is still
+ * honored as a legacy override for existing local dev setups.
+ * Exported so outage states can tell operators exactly what was unreachable.
+ */
+export const API_BASE_URL =
+  (import.meta.env.VITE_BACKOFFICE_API_URL as string | undefined) ||
+  (import.meta.env.VITE_API_BASE_URL as string | undefined) ||
+  'http://backoffice-api:8087';
 
 class ApiService {
   private client: AxiosInstance;

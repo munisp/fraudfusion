@@ -1,6 +1,6 @@
 module github.com/munisp/fraudfusion/services/go/aml-monitor
 
-go 1.22
+go 1.25
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
@@ -45,3 +45,7 @@ require (
 	google.golang.org/protobuf v1.34.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+require github.com/munisp/fraudfusion/services/go/authcommon v0.0.0
+
+replace github.com/munisp/fraudfusion/services/go/authcommon => ../authcommon

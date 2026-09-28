@@ -16,9 +16,10 @@ epsilon grid):
 3. **Randomized smoothing-lite** — the score is averaged over N Gaussian
    noise draws (sigma in standardized space), approximating a smoothed
    classifier (Cohen et al. 2019, without certification). Deterministic seed.
-4. **Adversarial training** — documented as the recommended next step
-   (retraining lives in ml/train, outside the scope of this module); not
-   executed here.
+4. **Adversarial training** — now implemented in
+   ``ml/adversarial/adv_train.py`` (constrained PGD training from v3 init ->
+   fraud_net v4 artifact); measured v3-vs-v4 results and residual risk in
+   ``docs/ADVERSARIAL_TRAINING.md``.
 
 Usage
 -----
@@ -40,7 +41,8 @@ from ml.data.synthetic_nigeria import NUMERIC_FEATURES  # noqa: E402
 from ml.adversarial.evasion_eval import (  # noqa: E402
     BINARY_FEATURES, BLOCK_THRESHOLD, DEFAULT_EPSILON_GRID, REPORT_DIR,
     REVIEW_THRESHOLD, NumericOnlyWrapper, evasion_success_rate,
-    evaluate_probs, load_test_split, pgd, standardized_bounds)
+    evaluate_probs, load_test_split, pgd, project_constraints,
+    standardized_bounds)
 
 DEFAULT_DEFENSE_EPSILONS = (0.0, 0.25, 0.5, 1.0)
 
@@ -88,6 +90,127 @@ def smoothed_probs(wrapper: NumericOnlyWrapper, x_std: torch.Tensor,
             noise = torch.randn(x_std.shape, generator=g) * sigma
             total += wrapper.prob(x_std + noise)
     return total / n_samples
+
+
+# ---------------------------------------------------------------------------
+# Gradient-masking-aware attacks: BPDA-lite and EOT
+# ---------------------------------------------------------------------------
+
+def smoothed_logits(wrapper: NumericOnlyWrapper, x_std: torch.Tensor,
+                    sigma: float, n_samples: int,
+                    seed: int = 0) -> torch.Tensor:
+    """Differentiable Monte-Carlo smoothed logits: mean over N noise draws
+    of the model's calibrated logit. EOT attacks differentiate through this.
+    Noise is fixed by ``seed`` so the attack is deterministic."""
+    g = torch.Generator().manual_seed(seed)
+    total = torch.zeros(len(x_std))
+    for _ in range(n_samples):
+        noise = torch.randn(x_std.shape, generator=g) * sigma
+        total = total + wrapper(x_std + noise)
+    return total / n_samples
+
+
+def bpda_lite_pgd(wrapper: NumericOnlyWrapper, x: torch.Tensor,
+                  y: torch.Tensor, eps: float, steps: int, lo, hi, mean,
+                  std, random_start: bool = True) -> torch.Tensor:
+    """BPDA-lite (Athalye et al. 2018, sec. 4.2): attack the *smoothed*
+    score while approximating the smoothing transform's gradient with the
+    identity — i.e. the gradient is taken through the raw model only,
+    exactly the plain PGD gradient, while success is measured against the
+    defended (smoothed) output. The perturbation returned here is therefore
+    identical to plain PGD; the difference vs the oblivious eval is purely
+    which score the evasion metric is computed on."""
+    return pgd(wrapper, x, y, eps, steps, lo, hi, mean, std,
+               random_start=random_start)
+
+
+def eot_pgd(wrapper: NumericOnlyWrapper, x: torch.Tensor, y: torch.Tensor,
+            eps: float, steps: int, lo, hi, mean, std,
+            sigma: float = 0.1, n_samples: int = 10, seed: int = 0,
+            random_start: bool = True) -> torch.Tensor:
+    """EOT-PGD (Athalye et al. 2018, sec. 5): gradient of the *expectation
+    over the random transformation* — differentiate through the mean of
+    ``n_samples`` noisy forward passes (a small-sample estimate of the true
+    smoothed gradient). This is the correct adaptive attack against the
+    smoothing defense; BPDA-lite is the cheaper approximation."""
+    if eps <= 0:
+        return x.clone()
+    alpha = max(eps / max(steps // 2, 1), eps / 10)
+    x_adv = x.clone()
+    if random_start:
+        x_adv = x_adv + torch.empty_like(x_adv).uniform_(-eps, eps)
+        x_adv = project_constraints(x_adv, x, eps, lo, hi, mean, std)
+    for t in range(steps):
+        x_adv = x_adv.detach().requires_grad_(True)
+        logits = smoothed_logits(wrapper, x_adv, sigma, n_samples,
+                                 seed=seed + t)
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, y)
+        grad = torch.autograd.grad(loss, x_adv)[0]
+        x_adv = project_constraints(x_adv.detach() + alpha * grad.sign(),
+                                    x, eps, lo, hi, mean, std)
+    return x_adv.detach()
+
+
+def evaluate_gradient_masking(version: str = "v3",
+                              max_samples: int | None = 2000,
+                              epsilon_grid=(0.5, 1.0), pgd_steps: int = 20,
+                              sigma: float = 0.1, smoothing_eval_n: int = 25,
+                              eot_n: int = 10, seed: int = 0) -> dict:
+    """Adaptive-attack evaluation of the smoothing defense for ``version``.
+
+    Compares, per epsilon:
+      * oblivious:  plain PGD scored against the smoothed output == BPDA-lite
+        (identity-approximation gradient) — same perturbation;
+      * EOT:        gradient through the Monte-Carlo smoothed logits.
+
+    If EOT evasion >> BPDA-lite evasion, the defense's robustness is
+    gradient masking, not true robustness.
+    """
+    torch.manual_seed(seed)
+    x_std, x_cat, y, x_raw, model, mean_np, std_np = load_test_split(
+        version, max_samples=max_samples, seed=seed)
+    wrapper = NumericOnlyWrapper(model, x_cat)
+    mean_t, std_t = torch.from_numpy(mean_np), torch.from_numpy(std_np)
+    lo, hi = standardized_bounds(mean_np, std_np)
+    y_np = y.numpy()
+
+    clean_smooth = smoothed_probs(wrapper, x_std, sigma=sigma,
+                                  n_samples=smoothing_eval_n, seed=seed)
+    results = {
+        "model": "fraud_net", "version": version,
+        "n_samples": len(y_np),
+        "defense": f"smoothing sigma={sigma}, eval_n={smoothing_eval_n}",
+        "clean_smoothed": evaluate_probs(clean_smooth.numpy(), y_np),
+        "attacks": [],
+    }
+    for eps in epsilon_grid:
+        for attack_name, attack_fn in (
+                ("bpda_lite", lambda: bpda_lite_pgd(
+                    wrapper, x_std, y, eps, pgd_steps, lo, hi,
+                    mean_t, std_t)),
+                ("eot", lambda: eot_pgd(
+                    wrapper, x_std, y, eps, pgd_steps, lo, hi, mean_t, std_t,
+                    sigma=sigma, n_samples=eot_n, seed=seed))):
+            x_adv = attack_fn() if eps > 0 else x_std.clone()
+            probs = smoothed_probs(wrapper, x_adv, sigma=sigma,
+                                   n_samples=smoothing_eval_n, seed=seed)
+            row = {
+                "attack": attack_name, "epsilon": eps,
+                **evaluate_probs(probs.numpy(), y_np),
+                "evasion@review": evasion_success_rate(
+                    clean_smooth.numpy(), probs.numpy(), y_np,
+                    REVIEW_THRESHOLD),
+                "evasion@block": evasion_success_rate(
+                    clean_smooth.numpy(), probs.numpy(), y_np,
+                    BLOCK_THRESHOLD),
+            }
+            results["attacks"].append(row)
+            print(f"[{version}/{attack_name}] eps={eps:<5} "
+                  f"auc_pr={row['auc_pr']:.4f} "
+                  f"evade@0.3={row['evasion@review']['success_rate']:.3f}",
+                  flush=True)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -224,11 +347,10 @@ def render_report(results: dict) -> str:
     for name, meta in results["defenses"].items():
         lines.append(f"- **{name}** — {meta['description']}")
     lines += [
-        "- **adversarial_training** — *not executed here* (retraining lives "
-        "in `ml/train`, outside this module's scope). Recommended: augment "
-        "fraud_net training with PGD-generated examples using the exact "
-        "constraint projection in `evasion_eval.project_constraints` so the "
-        "model sees only physically plausible adversarial transactions.",
+        "- **adversarial_training** — implemented in "
+        "`ml/adversarial/adv_train.py` (constrained PGD training from v3 "
+        "init -> fraud_net v4); measured comparison in "
+        "`docs/ADVERSARIAL_TRAINING.md`.",
         "",
         "## Results (AUC-PR / evasion success under constrained PGD)",
         "",
@@ -280,10 +402,12 @@ def render_report(results: dict) -> str:
         "look benign (low velocity, aged devices, no fan-in). Defenses here "
         "only cover numeric perturbation, not behavioural mimicry; that is "
         "covered by the velocity/rule layer and GNN mule detection.",
-        "4. **Next steps.** Adversarial training with the constrained PGD "
-        "above; certify with randomized smoothing at the review threshold; "
-        "re-run this evaluation on every model promotion (wire into "
-        "registry promotion gates).",
+        "4. **Next steps.** Adversarial training is now implemented "
+        "(`ml/adversarial/adv_train.py`, v4 artifact) — see "
+        "`docs/ADVERSARIAL_TRAINING.md` for the measured (mixed) outcome; "
+        "certify with randomized smoothing at the review threshold; re-run "
+        "this evaluation on every model promotion (wire into registry "
+        "promotion gates).",
         "",
     ]
     return "\n".join(lines)

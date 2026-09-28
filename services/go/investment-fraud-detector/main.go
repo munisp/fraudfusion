@@ -1,25 +1,109 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/csv"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	_ "github.com/lib/pq"
+	"github.com/munisp/fraudfusion/services/go/authcommon"
 )
 
 var (
 	db          *sql.DB
 	redisClient *redis.Client
 )
+
+// secRegistryBreaker protects the SEC Nigeria registry dependency (the
+// seeded DB table). After 5 consecutive failures the breaker opens for 30s
+// and lookups fail fast (503 dependency_degraded) instead of stacking
+// queries against a struggling database.
+var secRegistryBreaker = authcommon.NewBreaker("sec-registry")
+
+// secFileRegistry holds the SEC Nigeria licensee registry loaded from a CSV
+// file (SEC_REGISTRY_CSV or POST /sec/registry/import). When non-nil it is
+// the authoritative source and responses report registry_source=file.
+var secFileRegistry atomic.Pointer[map[string]secRegistryEntry]
+
+type secRegistryEntry struct {
+	Name               string
+	PromoterID         string
+	RegistrationNumber string
+	EntityType         string
+}
+
+// registrySource reports which registry backing is active: "file" (a real
+// SEC Nigeria licensee CSV was loaded) or "seed" (the bundled sample table).
+func registrySource() string {
+	if secFileRegistry.Load() != nil {
+		return "file"
+	}
+	return "seed"
+}
+
+// loadSECRegistryCSV parses a SEC Nigeria licensee CSV with a header row
+// containing at least a "name" column; optional columns: promoter_id,
+// registration_number, entity_type. Fail-closed: any structural error
+// rejects the whole file — a partial registry is worse than none.
+func loadSECRegistryCSV(r io.Reader) (map[string]secRegistryEntry, error) {
+	reader := csv.NewReader(r)
+	reader.TrimLeadingSpace = true
+	header, err := reader.Read()
+	if err != nil {
+		return nil, fmt.Errorf("read CSV header: %w", err)
+	}
+	columns := map[string]int{}
+	for i, col := range header {
+		columns[strings.ToLower(strings.TrimSpace(col))] = i
+	}
+	nameIdx, ok := columns["name"]
+	if !ok {
+		return nil, fmt.Errorf("CSV must have a 'name' column, got %v", header)
+	}
+	entries := make(map[string]secRegistryEntry)
+	line := 1
+	for {
+		record, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		line++
+		if err != nil {
+			return nil, fmt.Errorf("CSV line %d: %w", line, err)
+		}
+		if nameIdx >= len(record) || strings.TrimSpace(record[nameIdx]) == "" {
+			return nil, fmt.Errorf("CSV line %d: empty name", line)
+		}
+		entry := secRegistryEntry{Name: strings.TrimSpace(record[nameIdx])}
+		if idx, ok := columns["promoter_id"]; ok && idx < len(record) {
+			entry.PromoterID = strings.TrimSpace(record[idx])
+		}
+		if idx, ok := columns["registration_number"]; ok && idx < len(record) {
+			entry.RegistrationNumber = strings.TrimSpace(record[idx])
+		}
+		if idx, ok := columns["entity_type"]; ok && idx < len(record) {
+			entry.EntityType = strings.TrimSpace(record[idx])
+		}
+		entries[strings.ToLower(entry.Name)] = entry
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("CSV contained no licensee rows")
+	}
+	return entries, nil
+}
 
 type InvestmentScheme struct {
 	ID              string    `json:"id"`
@@ -73,12 +157,32 @@ func main() {
 	initRedis()
 	defer redisClient.Close()
 
+	// SEC Nigeria registry: when SEC_REGISTRY_CSV is configured the licensee
+	// CSV MUST load — a configured-but-unreadable registry fails closed at
+	// startup rather than silently falling back to the sample seed data.
+	if path := strings.TrimSpace(os.Getenv("SEC_REGISTRY_CSV")); path != "" {
+		file, err := os.Open(path)
+		if err != nil {
+			log.Fatalf("SEC_REGISTRY_CSV %s unreadable (fail-closed): %v", path, err)
+		}
+		entries, err := loadSECRegistryCSV(file)
+		file.Close()
+		if err != nil {
+			log.Fatalf("SEC_REGISTRY_CSV %s invalid (fail-closed): %v", path, err)
+		}
+		secFileRegistry.Store(&entries)
+		log.Printf("SEC Nigeria registry loaded from %s: %d licensees (registry_source=file)", path, len(entries))
+	} else {
+		log.Printf("SEC_REGISTRY_CSV not configured: using bundled SAMPLE registry seed (registry_source=seed); sync the full SEC Nigeria register for production (see SEC_REGISTRY_SYNC.md)")
+	}
+
 	// Initialize Gin router
 	r := gin.Default()
 
 	// Middleware
 	r.Use(corsMiddleware())
 	r.Use(authMiddleware())
+	r.Use(tenantBindingMiddleware())
 
 	// Routes
 	api := r.Group("/api/v1/investment-fraud")
@@ -110,6 +214,7 @@ func main() {
 		// Regulatory compliance
 		api.POST("/sec/check-compliance", checkSECCompliance)
 		api.POST("/sec/file-report", requireRole("compliance_officer", "admin"), fileSECReport)
+		api.POST("/sec/registry/import", requireRole("compliance_officer", "admin"), importSECRegistry)
 
 		// Reporting
 		api.GET("/reports/daily", getDailyReport)
@@ -281,21 +386,38 @@ func performSchemeAnalysis(scheme *InvestmentScheme) *InvestmentAnalysis {
 	}
 }
 
-// checkSECRegistration queries the SEC Nigeria registered-entities table
-// (seeded by database/20260827_service_base_tables.sql) with a
-// case-insensitive name match. The error is returned so callers can
+// checkSECRegistration verifies an entity against the SEC Nigeria registry.
+// Source precedence: a loaded licensee CSV file (registry_source=file) wins;
+// otherwise the seeded DB table (registry_source=seed) is queried through
+// the sec-registry circuit breaker. The error is returned so callers can
 // distinguish "definitively not registered" from "registry unavailable".
 func checkSECRegistration(schemeName, promoterId string) (bool, error) {
+	if fileRegistryPtr := secFileRegistry.Load(); fileRegistryPtr != nil {
+		fileRegistry := *fileRegistryPtr
+		if _, found := fileRegistry[strings.ToLower(strings.TrimSpace(schemeName))]; found {
+			return true, nil
+		}
+		if promoterId != "" {
+			for _, entry := range fileRegistry {
+				if entry.PromoterID == promoterId {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	}
 	if db == nil {
 		return false, fmt.Errorf("database not initialized")
 	}
 	var registered bool
-	err := db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM sec_registered_entities
-			WHERE LOWER(name) = LOWER($1) OR ($2 <> '' AND promoter_id = $2)
-		)
-	`, schemeName, promoterId).Scan(&registered)
+	err := secRegistryBreaker.Execute(func() error {
+		return db.QueryRow(`
+			SELECT EXISTS(
+				SELECT 1 FROM sec_registered_entities
+				WHERE LOWER(name) = LOWER($1) OR ($2 <> '' AND promoter_id = $2)
+			)
+		`, schemeName, promoterId).Scan(&registered)
+	})
 	if err != nil {
 		return false, fmt.Errorf("SEC registry lookup: %w", err)
 	}
@@ -563,16 +685,52 @@ func verifySECRegistration(c *gin.Context) {
 	if err != nil {
 		log.Printf("SEC registry lookup failed: %v", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error":       "SEC registry unavailable",
-			"disposition": "manual_review",
+			"error":               "SEC registry unavailable",
+			"disposition":         "manual_review",
+			"dependency_degraded": true,
+			"registry_source":     registrySource(),
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"entity_name":    req.EntityName,
-		"sec_registered": registered,
-		"verified":       registered,
+		"entity_name":     req.EntityName,
+		"sec_registered":  registered,
+		"verified":        registered,
+		"registry_source": registrySource(),
+	})
+}
+
+// importSECRegistry loads a real SEC Nigeria licensee CSV (raw CSV request
+// body) into the in-memory file registry, and persists it to
+// SEC_REGISTRY_CSV when that path is configured so a restart reloads it.
+// Fail-closed: malformed CSV rejects the whole import; the previous
+// registry stays active.
+func importSECRegistry(c *gin.Context) {
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 8<<20))
+	if err != nil || len(body) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "CSV body required"})
+		return
+	}
+	entries, err := loadSECRegistryCSV(bytes.NewReader(body))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid SEC licensee CSV: %v", err)})
+		return
+	}
+	secFileRegistry.Store(&entries)
+	persisted := false
+	if path := strings.TrimSpace(os.Getenv("SEC_REGISTRY_CSV")); path != "" {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			log.Printf("SEC registry CSV persist to %s failed (in-memory only): %v", path, err)
+		} else {
+			persisted = true
+		}
+	}
+	log.Printf("SEC Nigeria registry imported from CSV: %d licensees (persisted=%t)", len(entries), persisted)
+	c.JSON(http.StatusOK, gin.H{
+		"imported":        len(entries),
+		"persisted":       persisted,
+		"registry_source": registrySource(),
 	})
 }
 
@@ -716,22 +874,41 @@ func checkSECCompliance(c *gin.Context) {
 		return
 	}
 
+	// sec_registered is checked against the actual configured registry
+	// (file CSV or seed table). The remaining items have no real data source
+	// yet and stay false (unknown), so "compliant" remains false until
+	// license/audit feeds exist — no fake compliance claims.
+	var schemeName string
+	if err := db.QueryRow(`SELECT name FROM investment_schemes WHERE id = $1`, req.SchemeID).Scan(&schemeName); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "investment scheme not found"})
+		return
+	}
+	secRegistered, secErr := checkSECRegistration(schemeName, "")
+	if secErr != nil {
+		log.Printf("SEC registry lookup failed for compliance check: %v", secErr)
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error":               "SEC registry unavailable",
+			"disposition":         "manual_review",
+			"dependency_degraded": true,
+			"registry_source":     registrySource(),
+		})
+		return
+	}
+
 	compliance := map[string]bool{
-		"sec_registered":      false,
+		"sec_registered":      secRegistered,
 		"license_valid":       false,
 		"annual_report_filed": false,
 		"audit_completed":     false,
 	}
 
-	// Check compliance items
-	// (Simplified - would check actual SEC database)
-
 	compliant := compliance["sec_registered"] && compliance["license_valid"]
 
 	c.JSON(http.StatusOK, gin.H{
-		"scheme_id":  req.SchemeID,
-		"compliant":  compliant,
-		"compliance": compliance,
+		"scheme_id":       req.SchemeID,
+		"compliant":       compliant,
+		"compliance":      compliance,
+		"registry_source": registrySource(),
 	})
 }
 

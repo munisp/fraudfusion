@@ -117,7 +117,8 @@ class TestStaffApprovalDualControl:
         admin_b = make_client(db, ADMIN_B)
 
         listed = admin_a.get("/api/v1/onboarding/admin/requests").json()
-        assert [r["keyId"] for r in listed] == [key_id]
+        assert [r["keyId"] for r in listed["items"]] == [key_id]
+        assert listed["next_cursor"] is None
 
         # approve before review is rejected
         assert admin_b.post(f"/api/v1/onboarding/admin/requests/{key_id}/approve").status_code == 409
@@ -165,7 +166,7 @@ class TestStaffApprovalDualControl:
         assert resp.json()["status"] == "rejected"
         assert resp.json()["rejectionReason"] == "incomplete KYB documents"
         # rejected requests leave the queue
-        assert admin.get("/api/v1/onboarding/admin/requests").json() == []
+        assert admin.get("/api/v1/onboarding/admin/requests").json()["items"] == []
         # tenant drops back to in_progress
         status = make_client(db, TENANT).get("/api/v1/onboarding/status").json()
         assert status["state"] == "in_progress"
@@ -302,9 +303,9 @@ class TestKyb:
     def test_kyb_visibility_isolated_per_submitter(self, db):
         make_client(db, TENANT).post("/api/v1/onboarding/kyb", json=kyb_payload())
         other = make_client(db, TENANT2).get("/api/v1/onboarding/kyb")
-        assert other.json() == []
+        assert other.json()["items"] == []
         admin = make_client(db, ADMIN_A).get("/api/v1/onboarding/kyb")
-        assert len(admin.json()) == 1
+        assert len(admin.json()["items"]) == 1
 
     def test_kyb_requires_staff_role_for_admin_endpoints(self, db):
         tenant_client = make_client(db, TENANT)
@@ -337,7 +338,7 @@ class TestMerchantOnboarding:
         assert admin_a.post(f"/api/v1/onboarding/admin/merchants/{app_id}/review").status_code == 200
         assert admin_b.post(f"/api/v1/onboarding/admin/merchants/{app_id}/approve").status_code == 200
         listing = make_client(db, MERCHANT).get("/api/v1/onboarding/merchants").json()
-        assert listing[0]["status"] == "approved"
+        assert listing["items"][0]["status"] == "approved"
 
     def test_nuban_account_validated(self, db):
         client = make_client(db, MERCHANT)
@@ -416,3 +417,71 @@ class TestRegulatorAccess:
                           json=self.payload(expiresInDays=0)).status_code == 422
         assert admin.post("/api/v1/onboarding/admin/regulator-access",
                           json=self.payload(expiresInDays=366)).status_code == 422
+
+
+class TestKeysetPagination:
+    """Hot list endpoints page by (created_at, id) keyset, not OFFSET."""
+
+    def test_admin_requests_keyset_pages_cover_queue(self, db):
+        tenant = make_client(db, TENANT)
+        ids = [request_key(tenant, organization=f"Org {i}").json()["keyId"] for i in range(5)]
+        admin = make_client(db, ADMIN_A)
+
+        seen: list[str] = []
+        cursor = None
+        pages = 0
+        while True:
+            params = {"limit": 2}
+            if cursor:
+                params["cursor"] = cursor
+            body = admin.get("/api/v1/onboarding/admin/requests", params=params).json()
+            seen.extend(r["keyId"] for r in body["items"])
+            pages += 1
+            cursor = body["next_cursor"]
+            if cursor is None:
+                break
+            assert pages <= 5, "pagination did not terminate"
+        assert sorted(seen) == sorted(ids)  # no duplicates, no skips
+        assert pages == 3  # 2 + 2 + 1
+
+    def test_kyb_keyset_pagination_newest_first(self, db):
+        client = make_client(db, TENANT)
+        for i in range(3):
+            resp = client.post("/api/v1/onboarding/kyb", json=kyb_payload(businessName=f"Biz {i}"))
+            assert resp.status_code == 201, resp.text
+
+        first = client.get("/api/v1/onboarding/kyb", params={"limit": 2}).json()
+        assert len(first["items"]) == 2 and first["next_cursor"]
+        second = client.get(
+            "/api/v1/onboarding/kyb",
+            params={"limit": 2, "cursor": first["next_cursor"]},
+        ).json()
+        assert len(second["items"]) == 1 and second["next_cursor"] is None
+        names = [i["businessName"] for i in first["items"] + second["items"]]
+        assert sorted(names) == ["Biz 0", "Biz 1", "Biz 2"]
+
+    def test_merchants_keyset_pagination(self, db):
+        client = make_client(db, MERCHANT)
+        for i in range(3):
+            resp = client.post("/api/v1/onboarding/merchants",
+                               json=TestMerchantOnboarding().merchant_payload(
+                                   businessName=f"Shop {i}"))
+            assert resp.status_code == 201, resp.text
+
+        first = client.get("/api/v1/onboarding/merchants", params={"limit": 2}).json()
+        assert len(first["items"]) == 2 and first["next_cursor"]
+        second = client.get(
+            "/api/v1/onboarding/merchants",
+            params={"limit": 2, "cursor": first["next_cursor"]},
+        ).json()
+        assert len(second["items"]) == 1 and second["next_cursor"] is None
+
+    def test_invalid_cursor_rejected(self, db):
+        admin = make_client(db, ADMIN_A)
+        resp = admin.get("/api/v1/onboarding/admin/requests", params={"cursor": "not-a-cursor"})
+        assert resp.status_code == 400
+
+    def test_limit_bounds_enforced(self, db):
+        admin = make_client(db, ADMIN_A)
+        assert admin.get("/api/v1/onboarding/admin/requests", params={"limit": 0}).status_code == 422
+        assert admin.get("/api/v1/onboarding/admin/requests", params={"limit": 501}).status_code == 422

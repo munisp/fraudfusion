@@ -206,6 +206,278 @@ def nuts_lite(
 
 
 # ---------------------------------------------------------------------------
+# Full NUTS (multinomial, recursive tree building)
+# ---------------------------------------------------------------------------
+class _TreeState:
+    """State of one (sub-)tree in the NUTS recursion (mirrors Stan's
+    ``base_nuts::build_tree`` outputs).
+
+    Carries the integration-direction endpoints (position, momentum,
+    gradient) for continuation, the junction/outer endpoint momenta for the
+    generalized U-turn criterion, the summed momentum ``rho`` over all
+    visited non-divergent states, the log-sum-exp trajectory weight
+    (``H0 - H`` per state), the multinomial candidate drawn from the
+    subtree, stop/divergence flags, and the Metropolis-acceptance
+    accumulators used by dual averaging.
+    """
+
+    __slots__ = ("x_end", "p_end", "g_end", "p_beg_out", "p_end_out",
+                 "rho", "w", "cand", "s", "divergent", "alpha_sum", "n_lf")
+
+    def __init__(self, x_end, p_end, g_end, p_beg_out, p_end_out, rho, w,
+                 cand, s, divergent, alpha_sum, n_lf):
+        self.x_end = x_end          # continuation state (integration end)
+        self.p_end = p_end
+        self.g_end = g_end
+        self.p_beg_out = p_beg_out  # momentum at subtree beginning (junction)
+        self.p_end_out = p_end_out  # momentum at subtree end (outer)
+        self.rho = rho              # summed momentum of visited states
+        self.w = w                  # log-sum-exp of (joint - joint0) weights
+        self.cand = cand            # multinomial candidate from the subtree
+        self.s = s                  # False -> stop doubling
+        self.divergent = divergent
+        self.alpha_sum = alpha_sum  # sum of min(1, exp(joint - joint0))
+        self.n_lf = n_lf            # number of leapfrog steps taken
+
+
+def _nuts_leapfrog(fn, x: Array, p: Array, g: Array, eps: float
+                   ) -> tuple[Array, Array, Array, float]:
+    """One leapfrog step; returns (x', p', g', logpost'). Non-finite results
+    are returned as-is and handled by the caller (divergence)."""
+    p_half = p + 0.5 * eps * np.clip(g, -1e6, 1e6)
+    x_new = x + eps * p_half
+    lp_new, g_new = fn(x_new)
+    p_new = p_half + 0.5 * eps * np.clip(g_new, -1e6, 1e6)
+    return x_new, p_new, g_new, lp_new
+
+
+def _logaddexp(a: float, b: float) -> float:
+    if a == -np.inf:
+        return b
+    if b == -np.inf:
+        return a
+    m = max(a, b)
+    return m + float(np.log(np.exp(a - m) + np.exp(b - m)))
+
+
+def _nuts_criterion(p_a: Array, p_b: Array, rho: Array) -> bool:
+    """Generalized U-turn criterion (Stan's ``compute_criterion``):
+    continue only while both endpoint momenta point along the summed
+    trajectory momentum."""
+    return float(p_a @ rho) > 0.0 and float(p_b @ rho) > 0.0
+
+
+def _nuts_build_tree(fn, x: Array, p: Array, g: Array, depth: int,
+                     sign: int, eps: float, joint0: float,
+                     max_delta_h: float,
+                     rng: np.random.Generator) -> _TreeState:
+    """Recursive tree doubling (Hoffman & Gelman 2014 Fig. 3 recursion with
+    Stan's multinomial weighting and generalized U-turn criterion).
+
+    Every visited state contributes weight exp(joint - joint0) to the
+    subtree weight (multinomial-over-trajectory formulation, equivalent to
+    slice sampling). A state with energy error ``joint0 - joint >
+    max_delta_h`` (or non-finite) is a divergence: it stops the tree.
+    """
+    if depth == 0:
+        # Base case: single leapfrog in direction `sign`.
+        x1, p1, g1, lp1 = _nuts_leapfrog(fn, x, p, g, sign * eps)
+        joint1 = lp1 - 0.5 * float(p1 @ p1)
+        if not (np.isfinite(joint1) and np.all(np.isfinite(x1))):
+            joint1 = -np.inf
+        d_e = joint1 - joint0  # = H0 - H1
+        divergent = d_e < -max_delta_h  # includes -inf
+        alpha = min(1.0, float(np.exp(d_e))) if np.isfinite(d_e) else 0.0
+        return _TreeState(x1, p1, g1, p1.copy(), p1.copy(), p1.copy(),
+                          d_e, x1, not divergent, divergent, alpha, 1)
+
+    # Recursion: build the initial half, then the final half.
+    left = _nuts_build_tree(fn, x, p, g, depth - 1, sign, eps, joint0,
+                            max_delta_h, rng)
+    if not left.s:
+        return left
+    right = _nuts_build_tree(fn, left.x_end, left.p_end, left.g_end,
+                             depth - 1, sign, eps, joint0, max_delta_h, rng)
+    if not right.s:
+        # propagate the stop; keep acceptance accumulators from both halves
+        right.alpha_sum += left.alpha_sum
+        right.n_lf += left.n_lf
+        right.divergent = right.divergent or left.divergent
+        return right
+
+    # Multinomial candidate: draw the final half's candidate with
+    # probability proportional to its total weight.
+    w = _logaddexp(left.w, right.w)
+    if right.w > w or np.log(rng.uniform()) < right.w - w:
+        cand = right.cand
+    else:
+        cand = left.cand
+    rho = left.rho + right.rho
+    # Generalized U-turn: around the merged subtree and between the halves.
+    s = _nuts_criterion(left.p_beg_out, right.p_end_out, rho)
+    s &= _nuts_criterion(left.p_beg_out, right.p_beg_out,
+                         left.rho + right.p_beg_out)
+    s &= _nuts_criterion(left.p_end_out, right.p_end_out,
+                         right.rho + left.p_end_out)
+    return _TreeState(right.x_end, right.p_end, right.g_end,
+                      left.p_beg_out, right.p_end_out, rho, w, cand, s,
+                      left.divergent or right.divergent,
+                      left.alpha_sum + right.alpha_sum,
+                      left.n_lf + right.n_lf)
+
+
+def nuts_sample(
+    logpost_and_grad: Callable[[Array], tuple[float, Array]],
+    x0: Array,
+    n_samples: int = 1000,
+    n_chains: int = 4,
+    burn: int = 500,
+    step_size: float = 1.0,
+    max_depth: int = 10,
+    max_delta_h: float = 1000.0,
+    target_accept: float = 0.8,
+    seed: int = 0,
+) -> dict:
+    """Full NUTS: multinomial No-U-Turn Sampler with recursive tree building.
+
+    Unlike :func:`nuts_lite` (fixed random leapfrog count), this implements
+    the actual NUTS algorithm, mirroring Stan's ``base_nuts``:
+
+    * recursive binary-tree doubling (:func:`_nuts_build_tree`) up to
+      ``max_depth`` (default 10 -> trajectories of up to 2**10 leapfrogs),
+    * generalized U-turn termination on momentum dot products:
+      ``p_endpoint . rho > 0`` where ``rho`` is the summed momentum over the
+      (sub-)trajectory (Betancourt 2017; required for the multinomial
+      variant — the endpoint-momentum criterion of the original paper is
+      only valid with uniform-over-slice candidate selection),
+    * multinomial candidate selection over the trajectory with weights
+      ``exp(joint - joint0)``,
+    * divergence tracking: states with energy error above ``max_delta_h``
+      stop the tree and are counted in ``n_divergent``,
+    * dual-averaging step-size adaptation towards ``target_accept`` during
+      warmup (Hoffman & Gelman 2014, sec. 3.2.1); after warmup the chain
+      runs at the shrunk (averaged) step size.
+
+    Returns dict with ``samples`` (n_chains, n_samples, dim),
+    ``accept_stat`` (per-chain mean Metropolis accept statistic),
+    ``n_divergent`` (per chain, post-warmup), ``step_size`` (final adapted
+    per chain), ``n_leapfrog`` (mean per iteration), ``max_depth`` and
+    ``sampler="nuts"``. Deterministic given ``seed``.
+    """
+    x0 = np.asarray(x0, dtype=np.float64)
+    dim = x0.size
+
+    def one_chain(c: int) -> tuple[Array, float, int, float, float]:
+        r = np.random.default_rng(seed + 7000 + c)
+        x = x0 + r.normal(0, 0.05, size=dim)
+        eps = step_size
+        # dual-averaging state (Hoffman & Gelman 2014)
+        mu = np.log(10 * eps)
+        h_bar, log_eps_bar = 0.0, np.log(eps)
+        gamma, t0, kappa = 0.05, 10.0, 0.75
+        kept = np.empty((n_samples, dim))
+        alpha_stats: list[float] = []
+        lf_counts: list[int] = []
+        n_div = 0
+        k = 0
+        for it in range(burn + n_samples):
+            lp_cur, g_cur = logpost_and_grad(x)
+            p0 = r.normal(0, 1, size=dim)
+            joint0 = lp_cur - 0.5 * float(p0 @ p0)
+            e = eps if it < burn else float(np.exp(np.clip(
+                log_eps_bar, np.log(1e-6), np.log(10.0))))
+
+            # forward/backward endpoints of the accumulated trajectory
+            x_fwd = x_bck = x.copy()
+            g_fwd = g_bck = g_cur.copy()
+            p_ff = p0.copy()   # momentum at outer end of forward part
+            p_fb = p0.copy()   # momentum at junction of forward part
+            p_bb = p0.copy()   # momentum at outer end of backward part
+            p_bf = p0.copy()   # momentum at junction of backward part
+            rho = p0.copy()    # summed momentum over the whole trajectory
+            w_total = 0.0      # log(exp(joint0 - joint0)) = 0
+            cand = x.copy()
+            alpha_sum, n_lf = 0.0, 0
+            divergent_iter = False
+            for depth in range(max_depth):
+                if r.uniform() > 0.5:
+                    # extend forward
+                    rho_bck = rho.copy()
+                    p_bf = p_ff.copy()
+                    sub = _nuts_build_tree(
+                        logpost_and_grad, x_fwd, p_ff, g_fwd, depth, 1, e,
+                        joint0, max_delta_h, r)
+                    alpha_sum += sub.alpha_sum
+                    n_lf += sub.n_lf
+                    divergent_iter = divergent_iter or sub.divergent
+                    if not sub.s:
+                        break
+                    x_fwd, p_fb, p_ff, g_fwd =                         sub.x_end, sub.p_beg_out, sub.p_end_out, sub.g_end
+                    rho_fwd = sub.rho
+                else:
+                    # extend backward
+                    rho_fwd = rho.copy()
+                    p_fb = p_bb.copy()
+                    sub = _nuts_build_tree(
+                        logpost_and_grad, x_bck, p_bb, g_bck, depth, -1, e,
+                        joint0, max_delta_h, r)
+                    alpha_sum += sub.alpha_sum
+                    n_lf += sub.n_lf
+                    divergent_iter = divergent_iter or sub.divergent
+                    if not sub.s:
+                        break
+                    x_bck, p_bf, p_bb, g_bck =                         sub.x_end, sub.p_beg_out, sub.p_end_out, sub.g_end
+                    rho_bck = sub.rho
+
+                # multinomial accept of the subtree's candidate
+                if sub.w > w_total or np.log(r.uniform()) < sub.w - w_total:
+                    cand = sub.cand
+                w_total = _logaddexp(w_total, sub.w)
+                rho = rho_bck + rho_fwd
+                # generalized U-turn on the merged trajectory
+                persist = _nuts_criterion(p_bb, p_ff, rho)
+                persist &= _nuts_criterion(p_bb, p_fb, rho_bck + p_fb)
+                persist &= _nuts_criterion(p_bf, p_ff, rho_fwd + p_bf)
+                if not persist:
+                    break
+
+            x = cand
+            accept_stat = alpha_sum / n_lf if n_lf else 0.0
+            alpha_stats.append(accept_stat)
+            lf_counts.append(n_lf)
+            if divergent_iter and it >= burn:
+                n_div += 1
+            if it < burn:
+                eta = 1.0 / (it + 1 + t0)
+                h_bar = (1 - eta) * h_bar + eta * (target_accept - accept_stat)
+                log_eps = mu - np.sqrt(it + 1) / gamma * h_bar
+                log_eps_bar = (it + 1) ** -kappa * log_eps + \
+                    (1 - (it + 1) ** -kappa) * log_eps_bar
+                eps = float(np.exp(np.clip(log_eps, np.log(1e-6),
+                                           np.log(10.0))))
+            else:
+                kept[k] = x
+                k += 1
+        final_eps = float(np.exp(np.clip(log_eps_bar, np.log(1e-6),
+                                         np.log(10.0))))
+        return (kept, float(np.mean(alpha_stats)), n_div, final_eps,
+                float(np.mean(lf_counts)))
+
+    chains, accs, divs, epss, lfs = [], [], [], [], []
+    for c in range(n_chains):
+        s, a, nd, e, lf = one_chain(c)
+        chains.append(s)
+        accs.append(a)
+        divs.append(nd)
+        epss.append(e)
+        lfs.append(lf)
+    return {"samples": np.stack(chains), "accept_stat": np.array(accs),
+            "n_divergent": np.array(divs), "step_size": np.array(epss),
+            "n_leapfrog": np.array(lfs), "max_depth": max_depth,
+            "sampler": "nuts"}
+
+
+# ---------------------------------------------------------------------------
 # Diagnostics
 # ---------------------------------------------------------------------------
 def rhat(chains: Array) -> Array:

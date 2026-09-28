@@ -18,6 +18,7 @@ in app/db.py for local dev/tests).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 import os
@@ -25,7 +26,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Path, status
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, status
 
 import json
 
@@ -34,13 +35,16 @@ from app.db import Database, get_db
 from app.schemas import (
     ApiKeyGrant,
     ApiKeyRequest,
+    ApiKeyRequestPage,
     ApiKeyRequestView,
     ApprovalDecision,
     ChecklistItem,
     ChecklistUpdate,
+    KybApplicationPage,
     KybApplicationView,
     KybSubmission,
     KycTierSelection,
+    MerchantApplicationPage,
     MerchantApplicationView,
     MerchantSubmission,
     OnboardingStatus,
@@ -65,6 +69,53 @@ DEFAULT_CHECKLIST: list[tuple[str, str, bool]] = [
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# --------------------- Keyset pagination helpers ---------------------------
+# Hot list endpoints page by (created_at, id) keyset instead of OFFSET: page
+# cost stays O(limit) at any depth and concurrent inserts/deletes cannot
+# duplicate or skip rows between pages. The cursor is an opaque
+# base64("created_at|id") token; `next_cursor` is null on the last page.
+
+def _encode_cursor(created_at, row_id: str) -> str:
+    return base64.urlsafe_b64encode(f"{created_at}|{row_id}".encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+        created_at, row_id = raw.rsplit("|", 1)
+        if not created_at or not row_id:
+            raise ValueError("empty cursor component")
+        return created_at, row_id
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid pagination cursor")
+
+
+def _keyset_where(cursor: str | None, alias: str = "", descending: bool = True) -> tuple[str, dict]:
+    """Return (sql_fragment, params) filtering rows strictly past the cursor.
+
+    Pairs with ORDER BY created_at {DESC|ASC}, id {DESC|ASC}. Both SQLite
+    (tests) and Postgres (psycopg sends the ISO string as an untyped literal,
+    coerced to timestamptz) accept the comparison.
+    """
+    if not cursor:
+        return "", {}
+    col = f"{alias}created_at" if alias else "created_at"
+    idcol = f"{alias}id" if alias else "id"
+    op = "<" if descending else ">"
+    cts, cid = _decode_cursor(cursor)
+    return (
+        f" AND ({col} {op} :cur_ts OR ({col} = :cur_ts AND {idcol} {op} :cur_id))",
+        {"cur_ts": cts, "cur_id": cid},
+    )
+
+
+def _page(rows: list[dict], limit: int, view) -> dict:
+    """Trim a limit+1 fetch to a page and derive next_cursor."""
+    page_rows = rows[:limit]
+    next_cursor = _encode_cursor(page_rows[-1]["created_at"], page_rows[-1]["id"]) if len(rows) > limit else None
+    return {"items": [view(r) for r in page_rows], "next_cursor": next_cursor}
 
 
 def _hash_key(plaintext: str) -> str:
@@ -179,7 +230,10 @@ def _key_view(row: dict) -> ApiKeyRequestView:
 # ---------------------------------------------------------------------------
 
 def create_app() -> FastAPI:
+    from app.agents import router as agents_router
+
     app = FastAPI(title="FraudFusion Onboarding Service", version="1.0.0")
+    app.include_router(agents_router)
 
     @app.get("/health")
     def health() -> dict:
@@ -302,20 +356,24 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="api key request not found")
         return row
 
-    @app.get("/api/v1/onboarding/admin/requests", response_model=list[ApiKeyRequestView],
+    @app.get("/api/v1/onboarding/admin/requests", response_model=ApiKeyRequestPage,
              response_model_by_alias=True)
     def list_requests(
         status_filter: str = "pending",
+        limit: int = Query(default=50, ge=1, le=500),
+        cursor: str | None = None,
         principal: Principal = Depends(get_current_principal),
         db: Database = Depends(get_db),
-    ) -> list[ApiKeyRequestView]:
+    ) -> dict:
         require_admin(principal)
+        # Keyset over (created_at, id), oldest-first (staff process the queue FIFO).
+        where, cur_params = _keyset_where(cursor, alias="k.", descending=False)
         rows = db.query(
             "SELECT k.*, t.organization FROM tenant_api_keys k JOIN tenants t ON t.id = k.tenant_id"
-            " WHERE k.status = :st ORDER BY k.created_at",
-            {"st": status_filter},
+            f" WHERE k.status = :st{where} ORDER BY k.created_at, k.id LIMIT :lim",
+            {"st": status_filter, "lim": limit + 1, **cur_params},
         )
-        return [_key_view(r) for r in rows]
+        return _page(rows, limit, _key_view)
 
     @app.post("/api/v1/onboarding/admin/requests/{key_id}/review", response_model=ApiKeyRequestView,
               response_model_by_alias=True)
@@ -511,20 +569,30 @@ def create_app() -> FastAPI:
         logger.info("kyb submitted: id=%s business=%s by=%s", row["id"], row["business_name"], principal.sub)
         return _kyb_view(row)
 
-    @app.get("/api/v1/onboarding/kyb", response_model=list[KybApplicationView],
+    @app.get("/api/v1/onboarding/kyb", response_model=KybApplicationPage,
              response_model_by_alias=True)
     def list_kyb(
+        limit: int = Query(default=50, ge=1, le=500),
+        cursor: str | None = None,
         principal: Principal = Depends(get_current_principal),
         db: Database = Depends(get_db),
-    ) -> list[KybApplicationView]:
+    ) -> dict:
+        # Keyset over (created_at DESC, id DESC); scoped to the submitter
+        # unless staff.
+        where, cur_params = _keyset_where(cursor, descending=True)
         if principal.is_admin:
-            rows = db.query("SELECT * FROM kyb_applications ORDER BY created_at DESC")
+            rows = db.query(
+                f"SELECT * FROM kyb_applications WHERE TRUE{where}"
+                " ORDER BY created_at DESC, id DESC LIMIT :lim",
+                {"lim": limit + 1, **cur_params},
+            )
         else:
             rows = db.query(
-                "SELECT * FROM kyb_applications WHERE submitted_by = :sub ORDER BY created_at DESC",
-                {"sub": principal.sub},
+                f"SELECT * FROM kyb_applications WHERE submitted_by = :sub{where}"
+                " ORDER BY created_at DESC, id DESC LIMIT :lim",
+                {"sub": principal.sub, "lim": limit + 1, **cur_params},
             )
-        return [_kyb_view(r) for r in rows]
+        return _page(rows, limit, _kyb_view)
 
     @app.get("/api/v1/onboarding/kyb/{app_id}", response_model=KybApplicationView,
              response_model_by_alias=True)
@@ -581,20 +649,30 @@ def create_app() -> FastAPI:
                     row["id"], row["business_name"], principal.sub)
         return _merchant_view(row)
 
-    @app.get("/api/v1/onboarding/merchants", response_model=list[MerchantApplicationView],
+    @app.get("/api/v1/onboarding/merchants", response_model=MerchantApplicationPage,
              response_model_by_alias=True)
     def list_merchants(
+        limit: int = Query(default=50, ge=1, le=500),
+        cursor: str | None = None,
         principal: Principal = Depends(get_current_principal),
         db: Database = Depends(get_db),
-    ) -> list[MerchantApplicationView]:
+    ) -> dict:
+        # Keyset over (created_at DESC, id DESC); scoped to the submitter
+        # unless staff.
+        where, cur_params = _keyset_where(cursor, descending=True)
         if principal.is_admin:
-            rows = db.query("SELECT * FROM merchant_applications ORDER BY created_at DESC")
+            rows = db.query(
+                f"SELECT * FROM merchant_applications WHERE TRUE{where}"
+                " ORDER BY created_at DESC, id DESC LIMIT :lim",
+                {"lim": limit + 1, **cur_params},
+            )
         else:
             rows = db.query(
-                "SELECT * FROM merchant_applications WHERE submitted_by = :sub ORDER BY created_at DESC",
-                {"sub": principal.sub},
+                f"SELECT * FROM merchant_applications WHERE submitted_by = :sub{where}"
+                " ORDER BY created_at DESC, id DESC LIMIT :lim",
+                {"sub": principal.sub, "lim": limit + 1, **cur_params},
             )
-        return [_merchant_view(r) for r in rows]
+        return _page(rows, limit, _merchant_view)
 
     @app.post("/api/v1/onboarding/admin/merchants/{app_id}/review",
               response_model=MerchantApplicationView, response_model_by_alias=True)

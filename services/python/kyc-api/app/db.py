@@ -70,7 +70,55 @@ CREATE TABLE IF NOT EXISTS watchlist (
     source       TEXT NOT NULL DEFAULT 'local',
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Re-KYC / periodic review scheduling (canonical PG: database/20260901_python_services_caveats.sql)
+CREATE TABLE IF NOT EXISTS kyc_review_schedule (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id        TEXT NOT NULL DEFAULT 'default',
+    customer_id      TEXT NOT NULL,
+    review_type      TEXT NOT NULL DEFAULT 'periodic'
+                     CHECK (review_type IN ('periodic', 'rekyc', 'triggered')),
+    tier             TEXT,
+    due_at           TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'in_progress', 'completed', 'overdue')),
+    reason           TEXT,
+    last_reviewed_at TEXT,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (tenant_id, customer_id, review_type, due_at)
+);
+
+-- Appeals against KYC decisions; independence rule (decider != original
+-- reviewer) is enforced in app/main.py and by the PG trigger
+-- kyc_appeals_independence_guard in the canonical schema.
+CREATE TABLE IF NOT EXISTS kyc_appeals (
+    id                 TEXT PRIMARY KEY,
+    tenant_id          TEXT NOT NULL DEFAULT 'default',
+    customer_id        TEXT NOT NULL,
+    kyc_request_id     TEXT,
+    grounds            TEXT NOT NULL,
+    submitted_by       TEXT NOT NULL,
+    original_reviewer  TEXT,
+    assigned_reviewer  TEXT,
+    status             TEXT NOT NULL DEFAULT 'pending'
+                       CHECK (status IN ('pending', 'under_review', 'upheld', 'overturned', 'dismissed')),
+    decision_reason    TEXT,
+    decided_by         TEXT,
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
+
+# Columns added to kyc_requests for re-KYC + backoffice override (fresh DBs
+# get them from ALTERs below; the canonical PG table has them built in).
+KYC_REQUESTS_EXTRA_COLUMNS = {
+    "rekyc_of": "TEXT",
+    "rekyc_reason": "TEXT",
+    "rekyc_deadline": "TEXT",
+    "override_by": "TEXT",
+    "override_reason": "TEXT",
+    "override_at": "TEXT",
+}
 
 # Demo seed so local/dev screening exercises a real match path. Production
 # rows are loaded by compliance batch jobs into the Postgres tables.
@@ -108,7 +156,16 @@ class Database:
             self._conn.execute("PRAGMA foreign_keys = ON")
             with self._lock, self._conn:
                 self._conn.executescript(SQLITE_SCHEMA)
+                self._migrate_sqlite()
                 self._seed_pep()
+
+    def _migrate_sqlite(self) -> None:
+        """Idempotent column adds for pre-existing SQLite dev databases."""
+        existing = {row["name"] for row in
+                    self._conn.execute("PRAGMA table_info(kyc_requests)").fetchall()}
+        for col, ddl in KYC_REQUESTS_EXTRA_COLUMNS.items():
+            if col not in existing:
+                self._conn.execute(f"ALTER TABLE kyc_requests ADD COLUMN {col} {ddl}")
 
     def _seed_pep(self) -> None:
         count = self._conn.execute("SELECT COUNT(*) AS c FROM pep_list").fetchone()["c"]

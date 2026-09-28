@@ -257,7 +257,7 @@ func (a *app) detectAuthorizationAbuse(c *gin.Context) {
 		score += 25
 		factors = append(factors, "multiple_source_ips")
 	}
-	if event.Timestamp.Hour() < 6 || event.Timestamp.Hour() > 22 {
+	if loadAfterHoursPolicy().isAfterHours(event.Timestamp) {
 		score += 20
 		factors = append(factors, "after_hours_privileged_action")
 	}
@@ -381,10 +381,85 @@ func (a *app) getEmployeeRiskScore(c *gin.Context) {
 
 type history struct{ total, afterHours, privileged int }
 
+// --- After-hours policy (time-zone explicit, weekend-aware, configurable) ---
+//
+// Previously "after hours" meant Hour() < 6 || Hour() > 22 evaluated in
+// whatever timezone the timestamp/server/DB session happened to carry, and
+// weekends were ignored. The policy is now explicit:
+//   - timezone: AFTER_HOURS_TIMEZONE (default Africa/Lagos — the platform's
+//     primary operations timezone; WAT, UTC+1, no DST)
+//   - business window: [AFTER_HOURS_BUSINESS_START, AFTER_HOURS_BUSINESS_END)
+//     local hours, defaults 06:00-22:00; outside that window = after hours
+//   - weekends: AFTER_HOURS_WEEKEND_ALL_DAY (default true) treats Saturday
+//     and Sunday (local) as after hours all day
+// The same policy is applied in Go (event timestamps) and in SQL (history
+// aggregates) via AT TIME ZONE so both paths agree.
+
+type afterHoursPolicy struct {
+	Timezone      string
+	BusinessStart int // inclusive local hour, default 6
+	BusinessEnd   int // exclusive local hour, default 22
+	WeekendAllDay bool
+}
+
+func loadAfterHoursPolicy() afterHoursPolicy {
+	p := afterHoursPolicy{
+		Timezone:      strings.TrimSpace(os.Getenv("AFTER_HOURS_TIMEZONE")),
+		BusinessStart: 6,
+		BusinessEnd:   22,
+		WeekendAllDay: true,
+	}
+	if p.Timezone == "" {
+		p.Timezone = "Africa/Lagos"
+	}
+	if _, err := time.LoadLocation(p.Timezone); err != nil {
+		log.Printf("invalid AFTER_HOURS_TIMEZONE %q (%v), using Africa/Lagos", p.Timezone, err)
+		p.Timezone = "Africa/Lagos"
+	}
+	if raw := strings.TrimSpace(os.Getenv("AFTER_HOURS_BUSINESS_START")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 && n <= 23 {
+			p.BusinessStart = n
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("AFTER_HOURS_BUSINESS_END")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 1 && n <= 24 {
+			p.BusinessEnd = n
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("AFTER_HOURS_WEEKEND_ALL_DAY")); raw != "" {
+		p.WeekendAllDay = !strings.EqualFold(raw, "false")
+	}
+	return p
+}
+
+// isAfterHours reports whether ts falls outside the configured business
+// window in the configured timezone (or on a weekend when WeekendAllDay).
+func (p afterHoursPolicy) isAfterHours(ts time.Time) bool {
+	loc, err := time.LoadLocation(p.Timezone)
+	if err != nil {
+		loc = time.UTC // LoadLocation was validated at load time; belt-and-braces
+	}
+	local := ts.In(loc)
+	if p.WeekendAllDay {
+		if wd := local.Weekday(); wd == time.Saturday || wd == time.Sunday {
+			return true
+		}
+	}
+	h := local.Hour()
+	return h < p.BusinessStart || h >= p.BusinessEnd
+}
+
 func (a *app) accessHistory(ctx context.Context, tenantID, employeeID string, hours int) (history, error) {
 	interval := fmt.Sprintf("%d hours", hours)
 	var value history
-	err := a.db.QueryRow(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE EXTRACT(HOUR FROM created_at) < 6 OR EXTRACT(HOUR FROM created_at) > 22), COUNT(*) FILTER (WHERE resource IN ('customer_database','financial_records','ledger','kyc_documents')) FROM privileged_access_logs WHERE tenant_id=$1 AND employee_id=$2 AND created_at >= NOW() - $3::interval`, tenantID, employeeID, interval).Scan(&value.total, &value.afterHours, &value.privileged)
+	policy := loadAfterHoursPolicy()
+	// Weekend clause is static SQL built from the validated policy (no user
+	// input); hour bounds and timezone are bound parameters.
+	weekendClause := ""
+	if policy.WeekendAllDay {
+		weekendClause = " OR EXTRACT(ISODOW FROM created_at AT TIME ZONE $4) >= 6"
+	}
+	err := a.db.QueryRow(ctx, `SELECT COUNT(*), COUNT(*) FILTER (WHERE EXTRACT(HOUR FROM created_at AT TIME ZONE $4) < $5 OR EXTRACT(HOUR FROM created_at AT TIME ZONE $4) >= $6`+weekendClause+`), COUNT(*) FILTER (WHERE resource IN ('customer_database','financial_records','ledger','kyc_documents')) FROM privileged_access_logs WHERE tenant_id=$1 AND employee_id=$2 AND created_at >= NOW() - $3::interval`, tenantID, employeeID, interval, policy.Timezone, policy.BusinessStart, policy.BusinessEnd).Scan(&value.total, &value.afterHours, &value.privileged)
 	return value, err
 }
 
@@ -662,7 +737,7 @@ func riskLevel(score int) string {
 func accessRisk(event accessEvent, history history) (int, []string) {
 	score := 0
 	flags := []string{}
-	if event.Timestamp.Hour() < 6 || event.Timestamp.Hour() > 22 {
+	if loadAfterHoursPolicy().isAfterHours(event.Timestamp) {
 		score += 20
 		flags = append(flags, "after_hours_access")
 	}

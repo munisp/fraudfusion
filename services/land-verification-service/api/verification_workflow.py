@@ -333,23 +333,87 @@ class VerificationWorkflow:
     def get_history(self, verification_id: str) -> list[dict[str, Any]]:
         return self.store.history(verification_id)
 
+    # ---------------------------------------------------- site inspection ---
+    def record_inspection_report(
+        self, verification_id: str, report: dict[str, Any], actor: str = "inspector"
+    ) -> None:
+        """File a site-inspection report. Only legal from SITE_INSPECTION —
+        the previous state machine stranded verifications there forever."""
+        current = self.store.current_status(verification_id)
+        if current is None:
+            raise StateTransitionError(f"unknown verification {verification_id}")
+        self.store.record_transition(
+            verification_id, current, VerificationStatus.INSPECTION_REPORT,
+            "site inspection report filed", actor=actor,
+        )
+        self.store.save_result(
+            verification_id,
+            __import__("json").dumps({"inspection_report": report}),
+        )
+
+    def complete_inspection(
+        self,
+        verification_id: str,
+        target: VerificationStatus,
+        reason: str = "",
+        actor: str = "inspector",
+    ) -> None:
+        """Decide a verification after its inspection report. Only legal from
+        INSPECTION_REPORT and only to COMPLETED or REJECTED."""
+        if target not in (VerificationStatus.COMPLETED, VerificationStatus.REJECTED):
+            raise StateTransitionError(
+                f"inspection decision must be completed|rejected, got {target.value}"
+            )
+        current = self.store.current_status(verification_id)
+        if current is None:
+            raise StateTransitionError(f"unknown verification {verification_id}")
+        self.store.record_transition(
+            verification_id, current, target, reason or "inspection decision", actor=actor,
+        )
+
     # ------------------------------------------------------------------ steps
     def _analyze_document_sync(
         self, file_data: bytes, doc_type: DocumentType
     ) -> tuple[dict[str, Any], float]:
         """Extract structured data from the document.
 
-        Placeholder OCR: decodes embedded text when present (real deployments
-        plug in an OCR engine here). Confidence is derived from how much
-        machine-readable content the file carries.
+        Text-bearing documents are parsed for embedded field markers; binary
+        scans go through the configured OCR adapter (api/ocr.py: HTTP service
+        or local tesseract). When no OCR engine is available the extraction is
+        honestly empty with `ocr: unavailable` recorded — text is never
+        fabricated.
         """
-        text = file_data.decode("utf-8", errors="ignore")
+        from api.ocr import get_ocr_adapter
+
         extracted: dict[str, Any] = {"document_type": doc_type.value}
+        # Binary documents (image/PDF scans) must go through the OCR adapter;
+        # decoding them as text would yield garbage "content".
+        is_binary = file_data.startswith((b"\x89PNG", b"\xff\xd8\xff", b"%PDF", b"GIF8", b"RIFF"))
+        text = "" if is_binary else file_data.decode("utf-8", errors="ignore")
+        if is_binary or not text.strip():
+            adapter = get_ocr_adapter()
+            if adapter is None:
+                extracted["ocr"] = "unavailable"
+                extracted["ocr_detail"] = (
+                    "no OCR engine configured (OCR_SERVICE_URL unset, no tesseract binary)"
+                )
+                return extracted, 0.0
+            result = adapter.extract_text(file_data)
+            if result["status"] != "ok":
+                extracted["ocr"] = "unavailable"
+                extracted["ocr_detail"] = result.get("reason")
+                return extracted, 0.0
+            text = result["text"]
+            extracted["ocr_engine"] = result["engine"]
+            ocr_base = result["confidence"] if result["confidence"] is not None else 0.5
+        else:
+            ocr_base = 0.5
         for marker, key in (
             ("PLOT:", "plot_number"),
             ("PLAN:", "survey_plan_number"),
             ("LGA:", "lga"),
             ("CAC:", "cac_number"),
+            ("CERT:", "certificate_number"),
             ("ASSIGNOR:", "assignor"),
             ("ASSIGNEE:", "assignee"),
             ("BEACONS:", "beacon_coordinates"),
@@ -359,7 +423,7 @@ class VerificationWorkflow:
                     value = line[len(marker):].strip()
                     extracted[key] = value.split(",") if key == "beacon_coordinates" else value
         coverage = sum(1 for k in ("plot_number", "survey_plan_number", "lga") if k in extracted)
-        ocr_confidence = min(0.99, 0.5 + 0.15 * coverage) if text.strip() else 0.2
+        ocr_confidence = min(0.99, ocr_base + 0.15 * coverage) if text.strip() else 0.2
         return extracted, round(ocr_confidence, 3)
 
     def _detect_fraud(
@@ -388,19 +452,42 @@ class VerificationWorkflow:
     async def _registry_lookup(
         self, extracted: dict[str, Any], request: VerificationRequest
     ) -> dict[str, Any]:
-        """Query the state land registry.
+        """Query the state land registry through the configured adapter
+        (api/registry_adapters.py): the state HTTP endpoint when its URL is
+        configured (LAGOS_LANDS_URL etc.), otherwise the provenance-tracked
+        file-import table (lands_registry_records). Unavailable registries are
+        reported honestly, never silently 'registered'."""
+        from api.registry_adapters import get_lands_adapter
 
-        No registry API credentials are configured in this environment, so the
-        lookup is a deterministic stub: parcels whose plot number is present in
-        the document are treated as 'pending confirmation' (not registered).
-        """
-        await asyncio.sleep(0)
+        state = request.document_upload.state.value
+        adapter = get_lands_adapter(state)
+        result = await asyncio.to_thread(
+            adapter.owner,
+            state=state,
+            certificate_number=extracted.get("certificate_number"),
+            property_address=extracted.get("property_address"),
+        )
+        status = result.get("status")
+        if status == "unavailable":
+            return {
+                "registry": f"{state}_land_registry",
+                "queried": False,
+                "registered": False,
+                "status": "unavailable",
+                "adapter": adapter.name,
+                "note": result.get("reason", "registry unavailable"),
+            }
         return {
-            "registry": f"{request.document_upload.state.value}_land_registry",
+            "registry": f"{state}_land_registry",
             "queried": True,
-            "registered": False,
+            "registered": status == "found",
+            "status": status,
+            "adapter": adapter.name,
+            "source": result.get("source"),
+            "provenance": result.get("provenance"),
             "plot_number": extracted.get("plot_number"),
-            "note": "External registry integration pending; treated as unregistered.",
+            "owner_name": result.get("name"),
+            "note": None if status == "found" else result.get("reason"),
         }
 
     def _cac_check(self, extracted: dict[str, Any]) -> dict[str, Any]:

@@ -128,6 +128,40 @@ CREATE TABLE IF NOT EXISTS merchant_applications (
 );
 CREATE INDEX IF NOT EXISTS merchant_applications_status_idx ON merchant_applications (status);
 
+-- CBN agent-banking agents (stakeholder). BVN is captured by reference only:
+-- only a salted SHA-256 hash is persisted, never the plaintext BVN.
+-- Canonical PG schema: database/20260901_python_services_caveats.sql
+-- (agent_applications, incl. the dual-control guard trigger).
+CREATE TABLE IF NOT EXISTS agent_applications (
+    id                    TEXT PRIMARY KEY,
+    tenant_id             TEXT NOT NULL DEFAULT 'default',
+    agent_code            TEXT NOT NULL,
+    full_name             TEXT NOT NULL,
+    principal_fintech     TEXT NOT NULL,
+    principal_reference   TEXT NOT NULL,
+    bvn_hash              TEXT,
+    bvn_salt              TEXT,
+    float_account_number  TEXT,
+    float_account_bank    TEXT,
+    latitude              REAL,
+    longitude             REAL,
+    cbn_tier              TEXT NOT NULL DEFAULT 'tier_1'
+                          CHECK (cbn_tier IN ('tier_1', 'tier_2', 'tier_3')),
+    status                TEXT NOT NULL DEFAULT 'submitted'
+                          CHECK (status IN ('submitted', 'screening', 'pending_approval',
+                                            'approved', 'rejected', 'suspended')),
+    screening_status      TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (screening_status IN ('pending', 'clear', 'hit', 'unavailable')),
+    screening_result      TEXT,
+    submitted_by          TEXT NOT NULL,
+    reviewed_by           TEXT,
+    approved_by           TEXT,
+    rejection_reason      TEXT,
+    created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (tenant_id, agent_code)
+);
+
 CREATE TABLE IF NOT EXISTS regulator_access (
     id              TEXT PRIMARY KEY,
     regulator_org   TEXT NOT NULL,

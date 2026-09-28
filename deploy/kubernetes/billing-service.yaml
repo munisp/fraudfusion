@@ -1,0 +1,106 @@
+# billing-service — monetization backend (FastAPI, :8400).
+# Serves /v1/billing/*: API key lifecycle, metered usage ingestion, rating,
+# invoice generation/state machine, dunning. See docs/MONETIZATION.md.
+# Schema: database/20260901_billing_monetization.sql.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: billing-service
+  namespace: fraudfusion-services
+type: Opaque
+stringData:
+  # Override before deploying; placeholders, not working defaults.
+  keycloak-client-secret: CHANGE_ME
+  db-password: CHANGE_ME
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: billing-service
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: billing-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: billing-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: billing-service
+    spec:
+      containers:
+        - name: billing-service
+          image: ghcr.io/munisp/fraudfusion/billing-service:latest
+          env:
+            - name: PORT
+              value: "8400"
+            - name: DB_HOST
+              value: postgresql.fraudfusion-data.svc.cluster.local
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: billing-service, key: db-password}
+            - name: DATABASE_URL
+              value: postgresql://billing_service:$(DB_PASSWORD)@$(DB_HOST):5432/fraudfusion?sslmode=verify-full
+            # Cluster-wide sliding-window rate limiting. If unset the service
+            # falls back to per-replica in-memory limiting and says so loudly
+            # in /health (rate_limit_backend: memory).
+            - name: REDIS_URL
+              value: redis://redis.fraudfusion-data.svc.cluster.local:6379/0
+            - name: KEYCLOAK_URL
+              # In-cluster plaintext HTTP on 8080 matches keycloak.yaml; TLS is
+              # terminated at the ingress, not in-cluster.
+              value: http://keycloak.fraudfusion-identity.svc.cluster.local:8080
+            - name: KEYCLOAK_INSECURE_HTTP
+              value: "true"
+            - name: KEYCLOAK_REALM
+              value: fraudfusion
+            - name: KEYCLOAK_CLIENT_ID
+              value: billing-service
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: billing-service, key: keycloak-client-secret}
+            - name: BILLING_ADMIN_ROLE
+              value: billing_admin
+            - name: BILLING_INVOICE_DUE_DAYS
+              value: "14"
+            - name: BILLING_DUNNING_GRACE_DAYS
+              value: "7"
+          ports:
+            - name: http
+              containerPort: 8400
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: billing-service
+  namespace: fraudfusion-services
+  labels:
+    app.kubernetes.io/name: billing-service
+spec:
+  selector:
+    app.kubernetes.io/name: billing-service
+  ports:
+    - name: http
+      port: 8400
+      targetPort: http

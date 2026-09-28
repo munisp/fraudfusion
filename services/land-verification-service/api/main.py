@@ -17,6 +17,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from api.auth import get_current_user
+from api.extended import router as extended_router
+from api.ocr import ocr_health
+from api.registry_adapters import registry_health
 from api.verification_workflow import get_workflow
 from models.schemas import (
     DocumentType,
@@ -166,6 +169,11 @@ def create_app() -> FastAPI:
 
     workflow = get_workflow()
     report_generator = get_generator()
+    # Journey-facing endpoints (temporal-orchestrator contracts) + the
+    # site-inspection state machine completion. These are internal
+    # service-to-service routes (the Temporal worker does not send user
+    # bearer tokens) and are fully DB-backed.
+    app.include_router(extended_router)
 
     @app.get("/", response_model=dict)
     async def root():
@@ -189,7 +197,8 @@ def create_app() -> FastAPI:
             version="1.0.0",
             services={
                 "document_analysis": "operational",
-                "land_registry": "pending-integration",
+                "ocr": ocr_health(),
+                "land_registry": registry_health(),
                 "cac": "pending-integration",
                 "surveyor_general": "pending-integration",
                 "fraud_detection": "operational",
