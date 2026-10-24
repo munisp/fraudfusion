@@ -143,6 +143,99 @@ CREATE TABLE IF NOT EXISTS notification_requests (
     delivery_status TEXT NOT NULL DEFAULT 'queued' CHECK (delivery_status IN ('queued','sent','failed')),
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- ---------------------------------------------------------------------------
+-- Round 11 (land-fraud video recommendations): parcel registration with
+-- first-wins conflict detection, family/consent-party tracking, dispute
+-- cases with a 90-day SLA clock, revocation/compensation workflow, and a
+-- hash-chained evidence trail per parcel.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS parcels (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id          TEXT NOT NULL DEFAULT 'default',
+    parcel_ref         TEXT NOT NULL,
+    state              TEXT NOT NULL,
+    lga                TEXT,
+    property_address   TEXT,
+    certificate_number TEXT,
+    survey_plan_hash   TEXT,
+    registered_by      TEXT,
+    status             TEXT NOT NULL DEFAULT 'provisional'
+                       CHECK (status IN ('provisional','clear','disputed','revoked')),
+    consent_required   TEXT NOT NULL DEFAULT '[]',
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (tenant_id, parcel_ref)
+);
+
+CREATE TABLE IF NOT EXISTS parcel_conflicts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    parcel_ref   TEXT NOT NULL,
+    conflict_key TEXT NOT NULL,
+    existing_ref TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS parcel_consents (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    parcel_ref   TEXT NOT NULL,
+    party_name   TEXT NOT NULL,
+    confirmed    INTEGER NOT NULL DEFAULT 0,
+    method       TEXT,
+    confirmed_at TEXT,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (tenant_id, parcel_ref, party_name)
+);
+
+CREATE TABLE IF NOT EXISTS dispute_cases (
+    id               TEXT PRIMARY KEY,
+    tenant_id        TEXT NOT NULL DEFAULT 'default',
+    parcel_ref       TEXT NOT NULL,
+    case_number      TEXT,
+    state            TEXT,
+    description      TEXT,
+    court_location   TEXT,
+    status           TEXT NOT NULL DEFAULT 'open'
+                     CHECK (status IN ('open','resolved','withdrawn')),
+    resolution       TEXT,
+    filed_at         TEXT NOT NULL,
+    resolved_at      TEXT,
+    sla_days         INTEGER NOT NULL DEFAULT 90,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS parcel_revocations (
+    id                  TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
+    parcel_ref          TEXT NOT NULL,
+    notice_ref          TEXT,
+    reason              TEXT,
+    status              TEXT NOT NULL DEFAULT 'notice_served'
+                        CHECK (status IN ('notice_served','documents_collected','compensated')),
+    compensation_amount REAL,
+    compensation_method TEXT,
+    compensated_at      TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS parcel_evidence_chain (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    parcel_ref   TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    prev_hash    TEXT NOT NULL,
+    entry_hash   TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS parcel_evidence_chain_ref_idx
+    ON parcel_evidence_chain (tenant_id, parcel_ref, id);
 """
 
 _NAMED_PARAM = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")

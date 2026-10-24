@@ -175,6 +175,12 @@ def create_app() -> FastAPI:
     # bearer tokens) and are fully DB-backed.
     app.include_router(extended_router)
 
+    # Round 11: land due-diligence module (parcels, consents, deed
+    # conformance, dispute SLA cases, revocation/compensation, evidence
+    # packs, composite pre-purchase verdict).
+    from api.due_diligence import router as due_diligence_router
+    app.include_router(due_diligence_router)
+
     @app.get("/", response_model=dict)
     async def root():
         return {

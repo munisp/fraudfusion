@@ -102,6 +102,36 @@ activates the identical codepath. This is verified in CI by
 `tests/test_registry_conformance.py` (23 tests incl. a real uvicorn round
 trip).
 
+## 5b. Land due-diligence dry-run (3 min) — the "verify the title" story
+
+The sandbox also doubles the lands registry (Round 11):
+
+```bash
+curl -s "localhost:8091/sandbox/registry/lands/owner?state=lagos&certificate_number=CERT-4521"
+# -> {"status":"found","owner_name":"SANDBOX LANDOWNER 4521",...}
+```
+
+Then against land-verification-service:
+
+```bash
+# 1. Pre-purchase composite verdict (registry cross-check + claimants +
+#    consents + disputes + revocations)
+curl -s localhost:8002/api/v1/due-diligence -H 'Content-Type: application/json' -d '{
+  "state":"Lagos","certificate_number":"CERT-4521","claimed_owner":"SANDBOX LANDOWNER 4521"}'
+# -> {"verdict":"clear",...}   (CERT-0008 -> owner_mismatch high_risk; CERT-0009 -> registry_not_found)
+
+# 2. First-wins parcel registration — a second registration of the same
+#    certificate is the multiple-sale alarm (409 / disputed + conflict record)
+curl -s -X POST localhost:8002/api/v1/parcels -H 'Content-Type: application/json' -d '{
+  "parcel_ref":"PLT-452","state":"Lagos","certificate_number":"CERT-4521",
+  "consent_required":["Family Head","Heir One"]}'
+
+# 3. Deed template conformance + consents, then the court-grade evidence pack
+curl -s -X POST localhost:8002/api/v1/deeds/conformance -H 'Content-Type: application/json' \
+  -d '{"deed_text":"...","consent_parties":["Family Head"]}'
+curl -s localhost:8002/api/v1/parcels/PLT-452/evidence   # hash-chained, verifies offline
+```
+
 ## 6. Honesty moments (sprinkle throughout)
 
 - `GET /api/v1/registry/status` with no URLs configured → every registry
