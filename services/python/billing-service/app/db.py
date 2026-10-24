@@ -203,6 +203,16 @@ def _to_pg(query: str) -> str:
 class Database:
     def __init__(self, database_url: str = DATABASE_URL, sqlite_path: str = DEFAULT_SQLITE_PATH):
         self._is_pg = database_url.startswith("postgres")
+
+        # Postgres is the source of record. In production deployments
+        # (FRAUDFUSION_REQUIRE_POSTGRES=1) the SQLite fallback is a
+        # boot-time error, never a silent downgrade.
+        if (not self._is_pg and os.getenv("FRAUDFUSION_REQUIRE_POSTGRES", "")
+                .strip().lower() in ("1", "true", "yes")):
+            raise RuntimeError(
+                "FRAUDFUSION_REQUIRE_POSTGRES is set: the SQLite fallback is "
+                "disabled — PostgreSQL is the source of record. Set "
+                "DATABASE_URL=postgresql://... before starting this service.")
         self._lock = threading.Lock()
         if self._is_pg:
             import psycopg

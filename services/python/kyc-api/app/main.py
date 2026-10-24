@@ -555,6 +555,18 @@ def _document_checks(data: bytes, document_type: str, check_forgery: bool) -> di
         elif analysis is not None:
             forgery["reason"] = ("document bytes could not be decoded as an "
                                  "image; structural checks only")
+        # Round 14: full document intelligence engine — pixel forensics (ELA
+        # splice, copy-move, JPEG ghost), metadata forensics, ICAO checksums,
+        # fingerprint registry, composite authenticity score. Runs for both
+        # image and PDF payloads; unavailable -> omitted, never fabricated.
+        engine = docverification.run_engine(data, kind, document_type)
+        if engine is not None:
+            forgery["engine"] = engine
+            forgery["reason"] += (
+                " | document intelligence engine: authenticity_score "
+                f"{engine['authenticity_score']}/100 band={engine['band']}")
+            if engine["band"] == "forgery_suspected":
+                forgery["forgery_detected"] = True
     return {
         "document_type": document_type,
         "detected_format": kind,

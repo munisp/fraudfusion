@@ -117,6 +117,42 @@ def _load_docling_adapter():
     return None, None
 
 
+def _load_engine():
+    """Round-14 document intelligence engine (doc-verification package),
+    if importable. Shares the bootstrap path with local_cv."""
+    try:
+        import doc_intelligence  # type: ignore
+        return doc_intelligence
+    except ImportError:
+        return None
+
+
+_ENGINE_STORE = None
+
+
+def _run_doc_engine(data: bytes, doc_type: str, reference: str):
+    """Full document intelligence (pixel forensics, metadata, checksums,
+    fingerprint registry, composite authenticity score). None when the
+    engine is unavailable — callers keep the local_cv/degraded path."""
+    global _ENGINE_STORE
+    engine = _load_engine()
+    if engine is None:
+        return None
+    try:
+        import base64
+        if _ENGINE_STORE is None:
+            _ENGINE_STORE = engine.DocIntelStore()
+        payload = engine.IntelligenceInput(
+            image_base64=base64.b64encode(data).decode(),
+            doc_type=doc_type, reference=reference)
+        result = engine.run_intelligence(_ENGINE_STORE, payload)
+        return {"authenticity_score": result["authenticity_score"],
+                "band": result["band"], "verdict": result["verdict"],
+                "factors": result["factors"]}
+    except Exception:
+        return None
+
+
 def _load_local_cv():
     """doc-verification's local_cv image-forensics module, if importable."""
     _bootstrap_doc_verification_path()
@@ -370,6 +406,23 @@ def _verify_image(doc: dict, data: bytes, fmt: str, engines: list[str]) -> dict:
                 forensics = analyze(data)
                 engines.append("doc-verification:local_cv")
                 result["forensics"] = forensics
+                # Round 14: full document intelligence engine on top of
+                # local_cv — forgery_suspected band rejects outright.
+                engine_result = _run_doc_engine(data, doc["type"],
+                                                doc["reference"])
+                if engine_result is not None:
+                    engines.append("doc-verification:intelligence-engine")
+                    result["authenticity"] = engine_result
+                    if engine_result["band"] == "forgery_suspected":
+                        _check(result, "document_authenticity", False,
+                               f"authenticity_score "
+                               f"{engine_result['authenticity_score']}/100: "
+                               + ", ".join(f["code"] for f in engine_result["factors"][:3]))
+                        result["verdict"] = "rejected"
+                        result["notes"].append(
+                            "document intelligence engine flagged the scan as "
+                            "forgery-suspected")
+                        return result
                 # Undecodable or poor-quality capture -> reject; otherwise
                 # forensics inform but a human still confirms the document.
                 flagged = bool(

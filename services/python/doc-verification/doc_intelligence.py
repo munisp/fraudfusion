@@ -38,6 +38,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from datetime import datetime
@@ -136,17 +137,55 @@ CREATE TABLE IF NOT EXISTS doc_verification_chain (
 
 GENESIS = "GENESIS"
 
+_NAMED_PARAM = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+
+def _to_pg(query: str) -> str:
+    return _NAMED_PARAM.sub(r"%(\1)s", query)
+
 
 class DocIntelStore:
-    def __init__(self, sqlite_path: Optional[str] = None):
-        path = sqlite_path or os.getenv(
-            "DOC_INTEL_DB", os.path.join(os.path.dirname(__file__), "docintel.db"))
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(_SCHEMA)
-        self.conn.commit()
+    """Dual-driver store: PostgreSQL (via psycopg, canonical schema
+    database/20261028_document_intelligence.sql) when
+    DATABASE_URL=postgres(ql)://... is configured — the source of record —
+    otherwise a local SQLite file (DOC_INTEL_DB) for dev/test only. In
+    production (FRAUDFUSION_REQUIRE_POSTGRES=1) the SQLite fallback is a
+    boot-time error, never a silent downgrade."""
+
+    def __init__(self, database_url: str = DATABASE_URL,
+                 sqlite_path: Optional[str] = None):
+        self._is_pg = database_url.startswith(("postgres://", "postgresql://"))
+        if (not self._is_pg and os.getenv("FRAUDFUSION_REQUIRE_POSTGRES", "")
+                .strip().lower() in ("1", "true", "yes")):
+            raise RuntimeError(
+                "FRAUDFUSION_REQUIRE_POSTGRES is set: the SQLite fallback is "
+                "disabled — PostgreSQL is the source of record. Set "
+                "DATABASE_URL=postgresql://... before starting this service.")
+        if self._is_pg:
+            import psycopg
+            from psycopg.rows import dict_row
+            self._psycopg = psycopg
+            self._dict_row = dict_row
+            self._dsn = database_url
+            self.conn = None
+        else:
+            path = sqlite_path or os.getenv(
+                "DOC_INTEL_DB",
+                os.path.join(os.path.dirname(__file__), "docintel.db"))
+            self.conn = sqlite3.connect(path, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            self.conn.executescript(_SCHEMA)
+            self.conn.commit()
+
+    def _pg_conn(self):
+        return self._psycopg.connect(self._dsn, row_factory=self._dict_row)
 
     def query(self, sql: str, params: dict[str, Any] = {}) -> list[dict[str, Any]]:
+        if self._is_pg:
+            with self._pg_conn() as conn:
+                rows = conn.execute(_to_pg(sql), params).fetchall()
+            return [dict(r) for r in rows]
         return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
 
     def query_one(self, sql: str, params: dict[str, Any] = {}) -> Optional[dict[str, Any]]:
@@ -154,6 +193,11 @@ class DocIntelStore:
         return rows[0] if rows else None
 
     def execute(self, sql: str, params: dict[str, Any] = {}) -> None:
+        if self._is_pg:
+            with self._pg_conn() as conn:
+                conn.execute(_to_pg(sql), params)
+                conn.commit()
+            return
         self.conn.execute(sql, params)
         self.conn.commit()
 

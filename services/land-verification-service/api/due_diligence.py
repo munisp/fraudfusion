@@ -38,6 +38,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from api import evidence, events, geospatial, risk
+from api import doc_intel
 from api.data_store import LandDataStore, get_land_store
 from api.deed_conformance import check_deed_conformance
 from api.registry_adapters import get_lands_adapter
@@ -340,6 +341,11 @@ class DeedConformanceInput(BaseModel):
     witness_names: list[str] = []
     surveyor_name: Optional[str] = None
     surveyor_license: Optional[str] = None
+    # Round 14 — authenticate the deed SCAN itself (pixel/PDF forensics,
+    # fingerprint registry). Text clauses prove structure; only the engine
+    # proves the document wasn't fabricated.
+    deed_document_base64: Optional[str] = None
+    deed_document_kind: str = Field(default="image", pattern="^(image|pdf)$")
 
 
 def _attestation_check(payload: DeedConformanceInput) -> dict[str, Any]:
@@ -388,6 +394,19 @@ def deed_conformance(payload: DeedConformanceInput,
     if payload.witness_names or payload.surveyor_name or payload.surveyor_license:
         result["professional_attestation"] = _attestation_check(payload)
         if result["professional_attestation"]["unattested_witnesses"]:
+            result["conformant"] = False
+    if payload.deed_document_base64:
+        import base64 as _b64
+        try:
+            raw = _b64.b64decode(payload.deed_document_base64)
+        except Exception:
+            raise HTTPException(status_code=422,
+                                detail="deed_document_base64 is not valid base64")
+        auth = doc_intel.analyze_document(raw, payload.deed_document_kind,
+                                          "deed_of_assignment",
+                                          reference=payload.parcel_ref)
+        result["document_authenticity"] = auth
+        if auth.get("engine_performed") and auth["band"] == "forgery_suspected":
             result["conformant"] = False
     if payload.parcel_ref:
         _get_parcel(store, payload.parcel_ref)
