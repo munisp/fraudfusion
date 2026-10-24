@@ -105,6 +105,28 @@ client.close()  # or use `with FraudFusionClient(...) as client:`
 `GET /sandbox/fixtures` lists all seeded customers. Full fixture docs:
 `services/python/sandbox/README.md`.
 
+## Land due diligence (land-verification-service)
+
+Point the client at the land service deployment (e.g. `http://localhost:8002`)
+and the same client covers the Round-11 land module:
+
+```python
+# pre-purchase composite verdict (CTC-equivalent registry cross-check)
+verdict = client.land_due_diligence(
+    state="Lagos", certificate_number="CERT-4521",
+    claimed_owner="Chief Seller")
+# first-wins parcel registration (duplicate -> ConflictError + conflict record)
+parcel = client.land_register_parcel(
+    parcel_ref="PLT-452", state="Lagos", certificate_number="CERT-4521",
+    consent_required=["Family Head", "Heir One"])
+client.land_record_consent("PLT-452", party_name="Family Head", method="signature")
+deed = client.land_deed_conformance(deed_text, consent_parties=["Heir One"])
+dispute = client.land_open_dispute("PLT-452", case_number="LD/452/2026")
+client.land_resolve_dispute(dispute["dispute_id"], resolution="consent judgement")
+pack = client.land_evidence_pack("PLT-452")   # hash-chained, court-admissible
+assert pack["chain_valid"]
+```
+
 ## Webhooks
 
 ### 1. Register an endpoint

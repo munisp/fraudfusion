@@ -43,7 +43,13 @@ END $$;
 DO $$
 BEGIN
     IF to_regclass('financial_close_periods') IS NOT NULL THEN
-        EXECUTE 'ALTER TABLE financial_close_periods ADD CONSTRAINT financial_close_periods_tenant_id_unique UNIQUE (tenant_id, id)';
+        -- Guard on the constraint itself: this block is skipped on the first
+        -- fresh-DB pass (table not yet created), so the constraint can
+        -- already exist on any later application (persisted databases).
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conname = 'financial_close_periods_tenant_id_unique') THEN
+            EXECUTE 'ALTER TABLE financial_close_periods ADD CONSTRAINT financial_close_periods_tenant_id_unique UNIQUE (tenant_id, id)';
+        END IF;
         EXECUTE 'ALTER TABLE financial_close_periods ADD COLUMN IF NOT EXISTS reopened_by VARCHAR(255), ADD COLUMN IF NOT EXISTS reopen_reason VARCHAR(1024), ADD COLUMN IF NOT EXISTS reopened_at TIMESTAMPTZ';
         EXECUTE 'CREATE TABLE IF NOT EXISTS financial_close_events (id UUID PRIMARY KEY, tenant_id VARCHAR(255) NOT NULL, close_id UUID NOT NULL, event_type VARCHAR(32) NOT NULL CHECK (event_type IN (''requested'',''approved'',''reopened'')), actor_id VARCHAR(255) NOT NULL, details JSONB NOT NULL DEFAULT ''{}''::jsonb, occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), FOREIGN KEY (tenant_id, close_id) REFERENCES financial_close_periods (tenant_id, id) ON DELETE RESTRICT)';
         EXECUTE 'CREATE INDEX IF NOT EXISTS financial_close_events_audit_idx ON financial_close_events (tenant_id, close_id, occurred_at)';

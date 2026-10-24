@@ -337,3 +337,72 @@ export interface WebhookDelivery {
   attempts?: number;
   [k: string]: unknown;
 }
+
+// ---------------------------------------------------------------------------
+// Land due diligence (land-verification-service; Round 11/12)
+// ---------------------------------------------------------------------------
+
+export interface LandDueDiligenceRequest {
+  state: string;
+  certificate_number?: string;
+  property_address?: string;
+  parcel_ref?: string;
+  /** Seller's claimed name, cross-checked against the registry owner. */
+  claimed_owner?: string;
+}
+
+export interface LandDueDiligenceResponse {
+  verdict: "clear" | "caution" | "high_risk" | "unavailable";
+  reasons?: Array<{ severity: string; code: string; detail: string }>;
+  signals?: Record<string, unknown>;
+  reason?: string;
+  title_sha256?: string;
+}
+
+export interface LandParcelView {
+  parcel_ref: string;
+  state: string;
+  status: "provisional" | "clear" | "disputed" | "revoked";
+  consent_required?: string[];
+  consent_outstanding?: string[];
+  consent_complete?: boolean;
+  conflicts?: Array<{ conflict_key: string; existing_ref: string; reason: string }>;
+  [k: string]: unknown;
+}
+
+export interface LandDeedConformanceResponse {
+  conformant: boolean;
+  score: number;
+  present: string[];
+  missing: Array<{ clause: string; description: string }>;
+  consent_parties_missing: string[];
+  template?: string;
+}
+
+export interface LandDisputeView {
+  dispute_id: string;
+  parcel_ref: string;
+  status: "open" | "resolved" | "withdrawn";
+  sla_days: number;
+  sla_deadline?: string;
+  sla_breached: boolean;
+  days_open?: number | null;
+  [k: string]: unknown;
+}
+
+export interface LandRevocationView {
+  revocation_id: string;
+  parcel_ref: string;
+  status: "notice_served" | "documents_collected" | "compensated";
+  /** True ONLY when compensation has been paid (Land Use Act guardrail). */
+  acquisition_lawful: boolean;
+  [k: string]: unknown;
+}
+
+export interface LandEvidencePack {
+  parcel_ref: string;
+  entries: Array<Record<string, unknown>>;
+  entry_count: number;
+  chain_valid: boolean;
+  format?: string;
+}

@@ -107,6 +107,27 @@ const legit = await client.intelLegitimacyAssess({
 Full fixture docs: `services/python/sandbox/README.md`
 (`GET /sandbox/fixtures` lists all seeded customers).
 
+## Land due diligence (land-verification-service)
+
+Point the client at the land service deployment (e.g. `http://localhost:8002`)
+and the same client covers the Round-11 land module:
+
+```ts
+const verdict = await client.landDueDiligence({
+  state: "Lagos", certificate_number: "CERT-4521", claimed_owner: "Chief Seller",
+});
+const parcel = await client.landRegisterParcel({
+  parcel_ref: "PLT-452", state: "Lagos", certificate_number: "CERT-4521",
+  consent_required: ["Family Head", "Heir One"],
+});
+await client.landRecordConsent("PLT-452", { party_name: "Family Head", method: "signature" });
+const deed = await client.landDeedConformance(deedText, { consent_parties: ["Heir One"] });
+const dispute = await client.landOpenDispute("PLT-452", { case_number: "LD/452/2026" });
+await client.landResolveDispute(dispute.dispute_id, "consent judgement");
+const pack = await client.landEvidencePack("PLT-452");  // hash-chained
+assert.equal(pack.chain_valid, true);
+```
+
 ## Webhooks
 
 ### 1. Register an endpoint

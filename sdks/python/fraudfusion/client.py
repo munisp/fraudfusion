@@ -518,3 +518,169 @@ class FraudFusionClient:
         """GET /v1/webhooks/{endpoint_id}/deliveries — delivery history with
         attempt history / dead-letter status for the tenant."""
         return self._request("GET", f"/v1/webhooks/{endpoint_id}/deliveries")
+
+    # ------------------------------------------------------------------
+    # Land due diligence (land-verification-service; point base_url at that
+    # deployment, e.g. http://localhost:8002). Round 11/12.
+    # ------------------------------------------------------------------
+
+    def land_due_diligence(
+        self,
+        *,
+        state: str,
+        certificate_number: Optional[str] = None,
+        property_address: Optional[str] = None,
+        parcel_ref: Optional[str] = None,
+        claimed_owner: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """POST /api/v1/due-diligence — composite pre-purchase verdict
+        (``clear|caution|high_risk|unavailable``) with reason codes and
+        per-signal detail. ``claimed_owner`` is the seller's claimed name,
+        cross-checked against the registry owner (CTC equivalent)."""
+        payload = self._drop_none({
+            "state": state,
+            "certificate_number": certificate_number,
+            "property_address": property_address,
+            "parcel_ref": parcel_ref,
+            "claimed_owner": claimed_owner,
+        })
+        return self._request("POST", "/api/v1/due-diligence", json_body=payload)
+
+    def land_register_parcel(
+        self,
+        *,
+        parcel_ref: str,
+        state: str,
+        lga: Optional[str] = None,
+        property_address: Optional[str] = None,
+        certificate_number: Optional[str] = None,
+        survey_plan_hash: Optional[str] = None,
+        registered_by: Optional[str] = None,
+        consent_required: Optional[list[str]] = None,
+        idempotency_key: Union[str, bool, None] = None,
+    ) -> dict[str, Any]:
+        """POST /api/v1/parcels — first-wins registration. A duplicate
+        ``parcel_ref`` raises :class:`ConflictError` (and records a
+        multiple-sale conflict server-side); the same certificate number or
+        survey-plan hash under a different ref registers as ``disputed``."""
+        payload = self._drop_none({
+            "parcel_ref": parcel_ref,
+            "state": state,
+            "lga": lga,
+            "property_address": property_address,
+            "certificate_number": certificate_number,
+            "survey_plan_hash": survey_plan_hash,
+            "registered_by": registered_by,
+            "consent_required": consent_required or [],
+        })
+        return self._request("POST", "/api/v1/parcels", json_body=payload,
+                             idempotency_key=idempotency_key)
+
+    def land_get_parcel(self, parcel_ref: str) -> dict[str, Any]:
+        """GET /api/v1/parcels/{parcel_ref} — status, consents, conflicts."""
+        return self._request("GET", f"/api/v1/parcels/{parcel_ref}")
+
+    def land_record_consent(
+        self,
+        parcel_ref: str,
+        *,
+        party_name: str,
+        confirmed: bool = True,
+        method: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """POST /api/v1/parcels/{ref}/consents — record one consenting
+        party's confirmation (signature/thumbprint/video-attestation). The
+        parcel clears only when EVERY required party has confirmed."""
+        payload = self._drop_none({
+            "party_name": party_name, "confirmed": confirmed, "method": method})
+        return self._request("POST", f"/api/v1/parcels/{parcel_ref}/consents",
+                             json_body=payload)
+
+    def land_deed_conformance(
+        self,
+        deed_text: str,
+        *,
+        consent_parties: Optional[list[str]] = None,
+        parcel_ref: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """POST /api/v1/deeds/conformance — standard deed-of-assignment
+        clause check (9 clauses incl. Governor's consent s.22); every
+        consent party must have a signature block, not just a name mention."""
+        payload = self._drop_none({
+            "deed_text": deed_text,
+            "consent_parties": consent_parties or [],
+            "parcel_ref": parcel_ref,
+        })
+        return self._request("POST", "/api/v1/deeds/conformance", json_body=payload)
+
+    def land_open_dispute(
+        self,
+        parcel_ref: str,
+        *,
+        case_number: Optional[str] = None,
+        description: Optional[str] = None,
+        court_location: Optional[str] = None,
+        filed_at: Optional[str] = None,
+        sla_days: Optional[int] = None,
+    ) -> dict[str, Any]:
+        """POST /api/v1/parcels/{ref}/disputes — open a dispute case; the SLA
+        clock (default 90 days) starts at ``filed_at`` (default: now)."""
+        payload = self._drop_none({
+            "case_number": case_number, "description": description,
+            "court_location": court_location, "filed_at": filed_at,
+            "sla_days": sla_days,
+        })
+        return self._request("POST", f"/api/v1/parcels/{parcel_ref}/disputes",
+                             json_body=payload)
+
+    def land_resolve_dispute(
+        self,
+        dispute_id: str,
+        *,
+        resolution: str,
+        status: str = "resolved",
+    ) -> dict[str, Any]:
+        """POST /api/v1/disputes/{id}/resolve — status ``resolved|withdrawn``."""
+        return self._request("POST", f"/api/v1/disputes/{dispute_id}/resolve",
+                             json_body={"resolution": resolution, "status": status})
+
+    def land_list_disputes(self, parcel_ref: str) -> dict[str, Any]:
+        """GET /api/v1/parcels/{ref}/disputes — all cases with SLA flags."""
+        return self._request("GET", f"/api/v1/parcels/{parcel_ref}/disputes")
+
+    def land_open_revocation(
+        self,
+        parcel_ref: str,
+        *,
+        notice_ref: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """POST /api/v1/parcels/{ref}/revocations — record a government
+        revocation notice. ``acquisition_lawful`` stays false until
+        compensation completes (Land Use Act 1978 guardrail)."""
+        payload = self._drop_none({"notice_ref": notice_ref, "reason": reason})
+        return self._request("POST", f"/api/v1/parcels/{parcel_ref}/revocations",
+                             json_body=payload)
+
+    def land_revocation_documents(self, revocation_id: str) -> dict[str, Any]:
+        """POST /api/v1/revocations/{id}/documents — claimant documents
+        collected (required before compensation)."""
+        return self._request("POST", f"/api/v1/revocations/{revocation_id}/documents")
+
+    def land_compensate_revocation(
+        self,
+        revocation_id: str,
+        *,
+        amount: float,
+        method: str,
+    ) -> dict[str, Any]:
+        """POST /api/v1/revocations/{id}/compensate — pay compensation; only
+        then is the acquisition lawful."""
+        return self._request("POST", f"/api/v1/revocations/{revocation_id}/compensate",
+                             json_body={"amount": amount, "method": method})
+
+    def land_evidence_pack(self, parcel_ref: str) -> dict[str, Any]:
+        """GET /api/v1/parcels/{ref}/evidence — the tamper-evident
+        hash-chained evidence pack (payloads hash-only). Verify
+        ``chain_valid`` before presenting it."""
+        return self._request("GET", f"/api/v1/parcels/{parcel_ref}/evidence")

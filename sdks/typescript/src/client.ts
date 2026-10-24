@@ -15,6 +15,13 @@
 import { errorForStatus, FraudFusionError } from "./errors.js";
 import type {
   AjoAssessRequest,
+  LandDeedConformanceResponse,
+  LandDisputeView,
+  LandDueDiligenceRequest,
+  LandDueDiligenceResponse,
+  LandEvidencePack,
+  LandParcelView,
+  LandRevocationView,
   AjoAssessResponse,
   BiometricVerifyResponse,
   CulturalCalendarResponse,
@@ -449,5 +456,134 @@ export class FraudFusionClient {
   ): Promise<{ deliveries: WebhookDelivery[] } | WebhookDelivery[]> {
     return this.request("GET",
       `/v1/webhooks/${encodeURIComponent(endpointId)}/deliveries`);
+  }
+
+  // ---------------------------------------------------------------
+  // Land due diligence (land-verification-service; point baseUrl at
+  // that deployment, e.g. http://localhost:8002). Round 11/12.
+  // ---------------------------------------------------------------
+
+  /** POST /api/v1/due-diligence — composite pre-purchase verdict. */
+  landDueDiligence(input: LandDueDiligenceRequest): Promise<LandDueDiligenceResponse> {
+    return this.request("POST", "/api/v1/due-diligence", { json: { ...input } });
+  }
+
+  /** POST /api/v1/parcels — first-wins registration. A duplicate parcel_ref
+   *  throws ConflictError (and records a multiple-sale conflict
+   *  server-side); a shared certificate/survey-hash registers as disputed. */
+  landRegisterParcel(
+    input: {
+      parcel_ref: string;
+      state: string;
+      lga?: string;
+      property_address?: string;
+      certificate_number?: string;
+      survey_plan_hash?: string;
+      registered_by?: string;
+      consent_required?: string[];
+    },
+    options: RequestOptions = {},
+  ): Promise<LandParcelView> {
+    return this.request("POST", "/api/v1/parcels", {
+      json: { ...input, consent_required: input.consent_required ?? [] },
+      idempotencyKey: options.idempotencyKey,
+    });
+  }
+
+  /** GET /api/v1/parcels/{parcelRef}. */
+  landGetParcel(parcelRef: string): Promise<LandParcelView> {
+    return this.request("GET", `/api/v1/parcels/${encodeURIComponent(parcelRef)}`);
+  }
+
+  /** POST /api/v1/parcels/{ref}/consents — the parcel clears only when
+   *  EVERY required party has confirmed. */
+  landRecordConsent(
+    parcelRef: string,
+    input: { party_name: string; confirmed?: boolean; method?: string },
+  ): Promise<LandParcelView> {
+    return this.request("POST",
+      `/api/v1/parcels/${encodeURIComponent(parcelRef)}/consents`,
+      { json: { confirmed: true, ...input } });
+  }
+
+  /** POST /api/v1/deeds/conformance — standard 9-clause deed check. */
+  landDeedConformance(
+    deedText: string,
+    options: { consent_parties?: string[]; parcel_ref?: string } = {},
+  ): Promise<LandDeedConformanceResponse> {
+    return this.request("POST", "/api/v1/deeds/conformance", {
+      json: {
+        deed_text: deedText,
+        consent_parties: options.consent_parties ?? [],
+        parcel_ref: options.parcel_ref,
+      },
+    });
+  }
+
+  /** POST /api/v1/parcels/{ref}/disputes — SLA clock starts at filed_at. */
+  landOpenDispute(
+    parcelRef: string,
+    input: {
+      case_number?: string;
+      description?: string;
+      court_location?: string;
+      filed_at?: string;
+      sla_days?: number;
+    } = {},
+  ): Promise<LandDisputeView> {
+    return this.request("POST",
+      `/api/v1/parcels/${encodeURIComponent(parcelRef)}/disputes`,
+      { json: { ...input } });
+  }
+
+  /** POST /api/v1/disputes/{id}/resolve. */
+  landResolveDispute(
+    disputeId: string,
+    resolution: string,
+    status: "resolved" | "withdrawn" = "resolved",
+  ): Promise<LandDisputeView> {
+    return this.request("POST",
+      `/api/v1/disputes/${encodeURIComponent(disputeId)}/resolve`,
+      { json: { resolution, status } });
+  }
+
+  /** GET /api/v1/parcels/{ref}/disputes. */
+  landListDisputes(
+    parcelRef: string,
+  ): Promise<{ disputes: LandDisputeView[]; open: number; sla_breached: number }> {
+    return this.request("GET",
+      `/api/v1/parcels/${encodeURIComponent(parcelRef)}/disputes`);
+  }
+
+  /** POST /api/v1/parcels/{ref}/revocations. */
+  landOpenRevocation(
+    parcelRef: string,
+    input: { notice_ref?: string; reason?: string } = {},
+  ): Promise<LandRevocationView> {
+    return this.request("POST",
+      `/api/v1/parcels/${encodeURIComponent(parcelRef)}/revocations`,
+      { json: { ...input } });
+  }
+
+  /** POST /api/v1/revocations/{id}/documents. */
+  landRevocationDocuments(revocationId: string): Promise<LandRevocationView> {
+    return this.request("POST",
+      `/api/v1/revocations/${encodeURIComponent(revocationId)}/documents`);
+  }
+
+  /** POST /api/v1/revocations/{id}/compensate. */
+  landCompensateRevocation(
+    revocationId: string,
+    input: { amount: number; method: string },
+  ): Promise<LandRevocationView> {
+    return this.request("POST",
+      `/api/v1/revocations/${encodeURIComponent(revocationId)}/compensate`,
+      { json: { ...input } });
+  }
+
+  /** GET /api/v1/parcels/{ref}/evidence — hash-chained evidence pack. */
+  landEvidencePack(parcelRef: string): Promise<LandEvidencePack> {
+    return this.request("GET",
+      `/api/v1/parcels/${encodeURIComponent(parcelRef)}/evidence`);
   }
 }

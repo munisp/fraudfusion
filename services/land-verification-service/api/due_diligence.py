@@ -37,7 +37,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from api import evidence
+from api import evidence, events
 from api.data_store import LandDataStore, get_land_store
 from api.deed_conformance import check_deed_conformance
 from api.registry_adapters import get_lands_adapter
@@ -145,6 +145,9 @@ def register_parcel(payload: ParcelRegisterInput,
         )
         evidence.append_event(store, ref, "conflict_detected",
                               {"conflict_key": f"parcel_ref:{ref}", "reason": "duplicate_ref"})
+        events.emit_event("parcel.conflict.detected", "default",
+                          {"parcel_ref": ref, "conflict_key": f"parcel_ref:{ref}",
+                           "existing_registered_at": existing["created_at"]})
         raise HTTPException(
             status_code=409,
             detail={"error": "parcel_conflict", "conflict_key": f"parcel_ref:{ref}",
@@ -188,8 +191,13 @@ def register_parcel(payload: ParcelRegisterInput,
     evidence.append_event(store, ref, "parcel_registered",
                           {"state": state, "certificate_number": payload.certificate_number,
                            "conflicts": conflicts})
+    events.emit_event("parcel.registered", "default",
+                      {"parcel_ref": ref, "state": state, "status": status})
     for c in conflicts:
         evidence.append_event(store, ref, "conflict_detected", c)
+        events.emit_event("parcel.conflict.detected", "default",
+                          {"parcel_ref": ref, "conflict_key": c["conflict_key"],
+                           "existing_ref": c["existing_ref"]})
     row = _get_parcel(store, ref)
     view = _parcel_view(store, row)
     view["conflicts"] = conflicts
@@ -232,6 +240,7 @@ def record_consent(parcel_ref: str, payload: ConsentInput,
                 " WHERE tenant_id = 'default' AND parcel_ref = :p",
                 {"t": now, "p": parcel_ref})
             evidence.append_event(store, parcel_ref, "parcel_cleared", {})
+            events.emit_event("parcel.cleared", "default", {"parcel_ref": parcel_ref})
             view["status"] = "clear"
     return view
 
@@ -321,6 +330,9 @@ def open_dispute(parcel_ref: str, payload: DisputeOpenInput,
     evidence.append_event(store, parcel_ref, "dispute_opened",
                           {"dispute_id": dispute_id, "case_number": payload.case_number,
                            "sla_days": sla})
+    events.emit_event("dispute.opened", "default",
+                      {"parcel_ref": parcel_ref, "dispute_id": dispute_id,
+                       "sla_days": sla})
     row = store.query_one("SELECT * FROM dispute_cases WHERE id = :i", {"i": dispute_id})
     return _dispute_view(row)
 
@@ -344,6 +356,9 @@ def resolve_dispute(dispute_id: str, payload: DisputeResolveInput,
     evidence.append_event(store, parcel_ref, "dispute_resolved",
                           {"dispute_id": dispute_id, "resolution": payload.resolution,
                            "status": payload.status})
+    events.emit_event("dispute.resolved", "default",
+                      {"parcel_ref": parcel_ref, "dispute_id": dispute_id,
+                       "status": payload.status})
     remaining = store.query(
         "SELECT id FROM dispute_cases WHERE tenant_id = 'default' AND parcel_ref = :p AND status = 'open'",
         {"p": parcel_ref})
@@ -368,6 +383,35 @@ def list_disputes(parcel_ref: str, store: LandDataStore = Depends(get_land_store
     return {"parcel_ref": parcel_ref, "disputes": views,
             "open": sum(1 for v in views if v["status"] == "open"),
             "sla_breached": sum(1 for v in views if v["sla_breached"])}
+
+
+@router.post("/internal/disputes/sweep")
+def sweep_sla_breaches(store: LandDataStore = Depends(get_land_store)) -> dict[str, Any]:
+    """SLA-breach sweeper (internal/cron): every open dispute past its SLA
+    deadline that has NOT yet been notified is marked and emits exactly one
+    `dispute.sla.breached` webhook. Time — not a request — is what breaches an
+    SLA, so this must be swept periodically (e.g. hourly cron).
+    breach_notified persists the exactly-once guarantee across restarts."""
+    rows = store.query(
+        "SELECT * FROM dispute_cases WHERE tenant_id = 'default' AND status = 'open'"
+        " AND breach_notified = :f", {"f": False})
+    breached = []
+    for row in rows:
+        view = _dispute_view(row)
+        if not view["sla_breached"]:
+            continue
+        store.execute(
+            "UPDATE dispute_cases SET breach_notified = :b, updated_at = :t"
+            " WHERE tenant_id = 'default' AND id = :i",
+            {"b": True, "t": _now(), "i": row["id"]})
+        evidence.append_event(store, row["parcel_ref"], "dispute_sla_breached",
+                              {"dispute_id": row["id"], "days_open": view["days_open"]})
+        events.emit_event("dispute.sla.breached", "default",
+                          {"parcel_ref": row["parcel_ref"], "dispute_id": row["id"],
+                           "sla_days": view["sla_days"], "days_open": view["days_open"]})
+        breached.append({"dispute_id": row["id"], "parcel_ref": row["parcel_ref"],
+                         "days_open": view["days_open"]})
+    return {"swept": len(breached), "breached": breached}
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +465,8 @@ def open_revocation(parcel_ref: str, payload: RevocationOpenInput,
         {"t": _now(), "p": parcel_ref})
     evidence.append_event(store, parcel_ref, "revocation_notice",
                           {"revocation_id": rid, "notice_ref": payload.notice_ref})
+    events.emit_event("revocation.opened", "default",
+                      {"parcel_ref": parcel_ref, "revocation_id": rid})
     row = store.query_one("SELECT * FROM parcel_revocations WHERE id = :i", {"i": rid})
     return _revocation_view(row)
 
@@ -469,6 +515,8 @@ def revocation_compensate(revocation_id: str, payload: CompensationInput,
     )
     evidence.append_event(store, row["parcel_ref"], "revocation_compensated",
                           {"revocation_id": revocation_id, "amount": payload.amount})
+    events.emit_event("revocation.compensated", "default",
+                      {"parcel_ref": row["parcel_ref"], "revocation_id": revocation_id})
     updated = store.query_one("SELECT * FROM parcel_revocations WHERE id = :i", {"i": revocation_id})
     return _revocation_view(updated)
 

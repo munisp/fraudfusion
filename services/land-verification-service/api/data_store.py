@@ -205,6 +205,7 @@ CREATE TABLE IF NOT EXISTS dispute_cases (
     filed_at         TEXT NOT NULL,
     resolved_at      TEXT,
     sla_days         INTEGER NOT NULL DEFAULT 90,
+    breach_notified  INTEGER NOT NULL DEFAULT 0,
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
@@ -270,6 +271,11 @@ class LandDataStore:
             self._conn.row_factory = sqlite3.Row
             with self._lock, self._conn:
                 self._conn.executescript(SQLITE_SCHEMA)
+                # Column-level migrations for pre-Round-12 SQLite dev files
+                # (CREATE TABLE IF NOT EXISTS never alters existing tables).
+                self._ensure_column("dispute_cases", "breach_notified",
+                                    "ALTER TABLE dispute_cases ADD COLUMN breach_notified"
+                                    " INTEGER NOT NULL DEFAULT 0")
                 if seed:
                     self._seed_synthetic()
 
@@ -337,6 +343,14 @@ class LandDataStore:
 
     def _pg_conn(self):
         return self._psycopg.connect(self._dsn, row_factory=self._dict_row)
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        """SQLite-only additive migration: add `column` to `table` when an
+        older dev database file lacks it (PostgreSQL is migrated canonically
+        via database/*.sql instead)."""
+        cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            self._conn.execute(ddl)
 
     def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         params = params or {}
