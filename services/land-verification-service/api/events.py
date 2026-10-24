@@ -16,6 +16,8 @@ Land event types:
                              want to wake up for
   parcel.cleared           — all consents confirmed, no conflicts
   dispute.opened           — dispute case opened, SLA clock started
+  parcel.objection.raised  — public objection filed against a parcel (F5)
+  parcel.evidence.anchored — evidence-chain Merkle root anchored (F9)
   dispute.sla.breached     — open dispute past its SLA (emitted by the
                              sweeper, exactly once per dispute)
   dispute.resolved         — dispute resolved/withdrawn

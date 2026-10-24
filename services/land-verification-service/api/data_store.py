@@ -160,6 +160,8 @@ CREATE TABLE IF NOT EXISTS parcels (
     property_address   TEXT,
     certificate_number TEXT,
     survey_plan_hash   TEXT,
+    beacons            TEXT,
+    notice_expires_at  TEXT,
     registered_by      TEXT,
     status             TEXT NOT NULL DEFAULT 'provisional'
                        CHECK (status IN ('provisional','clear','disputed','revoked')),
@@ -186,6 +188,8 @@ CREATE TABLE IF NOT EXISTS parcel_consents (
     party_name   TEXT NOT NULL,
     confirmed    INTEGER NOT NULL DEFAULT 0,
     method       TEXT,
+    identity_hash TEXT,
+    liveness_challenge_id TEXT,
     confirmed_at TEXT,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (tenant_id, parcel_ref, party_name)
@@ -224,6 +228,22 @@ CREATE TABLE IF NOT EXISTS parcel_revocations (
     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS parcel_objections (
+    id               TEXT PRIMARY KEY,
+    tenant_id        TEXT NOT NULL DEFAULT 'default',
+    parcel_ref       TEXT NOT NULL,
+    objector_name    TEXT NOT NULL,
+    objector_id_hash TEXT,
+    grounds          TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'open'
+                     CHECK (status IN ('open','resolved','dismissed')),
+    resolution       TEXT,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    resolved_at      TEXT
+);
+CREATE INDEX IF NOT EXISTS parcel_objections_ref_idx
+    ON parcel_objections (tenant_id, parcel_ref, status);
 
 CREATE TABLE IF NOT EXISTS parcel_evidence_chain (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -276,6 +296,14 @@ class LandDataStore:
                 self._ensure_column("dispute_cases", "breach_notified",
                                     "ALTER TABLE dispute_cases ADD COLUMN breach_notified"
                                     " INTEGER NOT NULL DEFAULT 0")
+                self._ensure_column("parcels", "beacons",
+                                    "ALTER TABLE parcels ADD COLUMN beacons TEXT")
+                self._ensure_column("parcels", "notice_expires_at",
+                                    "ALTER TABLE parcels ADD COLUMN notice_expires_at TEXT")
+                self._ensure_column("parcel_consents", "identity_hash",
+                                    "ALTER TABLE parcel_consents ADD COLUMN identity_hash TEXT")
+                self._ensure_column("parcel_consents", "liveness_challenge_id",
+                                    "ALTER TABLE parcel_consents ADD COLUMN liveness_challenge_id TEXT")
                 if seed:
                     self._seed_synthetic()
 

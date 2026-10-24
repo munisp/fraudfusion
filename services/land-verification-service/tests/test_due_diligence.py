@@ -78,7 +78,8 @@ def client(store):
 def _register(client, ref="PLT-001", **overrides):
     payload = {"parcel_ref": ref, "state": "Lagos", "lga": "Eti-Osa",
                "property_address": "Plot 452, Badore", "certificate_number": "CERT-452",
-               "consent_required": ["Emeka Okafor", "Ngozi Family Head"]}
+               "consent_required": ["Emeka Okafor", "Ngozi Family Head"],
+               "notice_period_days": 0}  # R13: opt out of the notice window
     payload.update(overrides)
     return client.post("/api/v1/parcels", json=payload)
 
