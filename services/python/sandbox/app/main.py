@@ -58,6 +58,11 @@ def create_app() -> FastAPI:
     app.state.rate_limiter = SlidingWindowRateLimiter()
     app.state.kyb_verdicts = {}  # application_id -> verdict envelope
 
+    # Registry doubles (Round 10): synthetic NIBSS/NIMC/CAC mirrors that
+    # kyc-api's live registry adapters can be pointed at for dry runs.
+    from app import registries
+    app.include_router(registries.router, prefix="/sandbox/registry")
+
     @app.get("/health")
     def health() -> dict:
         return {"status": "healthy", "service": SERVICE_NAME,
@@ -106,6 +111,78 @@ def create_app() -> FastAPI:
                                 detail="upload exceeds 10MB limit")
         return kyc.document_checks(data, document_type, check_forgery,
                                    filename=document.filename or "")
+
+    # ----------------- Biometric liveness (kyc-api shapes) -----------------
+    # Synthetic doubles of the Round-10 challenge-response endpoints. The
+    # challenge is signed with the documented demo secret so SDK verifiers
+    # work unchanged; verify-frames verdicts are filename-driven magic:
+    # any frame filename containing "spoof" -> "spoof", containing "live"
+    # -> "live", otherwise honest "inconclusive" (the sandbox does not run
+    # the real cv2 liveness engine — disclosed in every response).
+    import hashlib as _hashlib
+    import hmac as _hmac
+    import secrets as _secrets
+    import time as _time
+    import uuid as _uuid
+
+    _LIVENESS_KEY = _hashlib.sha256(
+        fixtures.WEBHOOK_DEMO_SECRET.encode()).hexdigest().encode()
+
+    @app.post("/api/v1/biometric/liveness/challenge")
+    def liveness_challenge(_key: str = Depends(require_sandbox_key)) -> dict:
+        phases = [_secrets.choice(("still", "move")) for _ in range(3)]
+        challenge_id = _uuid.uuid4().hex
+        expires_at = int(_time.time()) + 120
+        msg = f"{challenge_id}|{','.join(phases)}|{expires_at}".encode()
+        return {
+            "challenge_id": challenge_id,
+            "phases": phases,
+            "expires_at": expires_at,
+            "ttl_seconds": 120,
+            "signature": _hmac.new(_LIVENESS_KEY, msg,
+                                   _hashlib.sha256).hexdigest(),
+            "environment": "sandbox",
+            "synthetic": True,
+            "timestamp": kyc._now(),
+        }
+
+    @app.post("/api/v1/biometric/liveness/verify-frames")
+    async def liveness_verify_frames(
+        challenge_id: str = Form(...),
+        phases: str = Form(...),
+        expires_at: int = Form(...),
+        signature: str = Form(...),
+        frames: list[UploadFile] = File(...),
+        _key: str = Depends(require_sandbox_key),
+    ) -> dict:
+        phase_list = [p.strip() for p in phases.split(",") if p.strip()]
+        msg = f"{challenge_id}|{','.join(phase_list)}|{int(expires_at)}".encode()
+        expected = _hmac.new(_LIVENESS_KEY, msg, _hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(expected, signature):
+            raise HTTPException(status_code=401,
+                                detail="challenge signature invalid")
+        if int(_time.time()) > int(expires_at):
+            raise HTTPException(status_code=410, detail="challenge expired")
+        names = " ".join((f.filename or "").lower() for f in frames)
+        if "spoof" in names:
+            verdict = "spoof"
+        elif "live" in names:
+            verdict = "live"
+        else:
+            verdict = "inconclusive"
+        return {
+            "verification_id": _uuid.uuid4().hex,
+            "performed": True,
+            "verdict": verdict,
+            "reasons": ["sandbox synthetic verdict — the real cv2 liveness "
+                        "engine runs in kyc-api; filename magic: "
+                        "spoof/live in a frame filename"],
+            "frames_received": len(frames),
+            "challenge_checked": True,
+            "environment": "sandbox",
+            "synthetic": True,
+            "timestamp": kyc._now(),
+        }
 
     # --------------------- KYB (onboarding-service shapes) -----------------
 

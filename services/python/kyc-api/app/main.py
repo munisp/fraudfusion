@@ -607,6 +607,16 @@ def _persist_document_verdict(db: Database, result: dict, data: bytes,
 def create_app() -> FastAPI:
     app = FastAPI(title="FraudFusion KYC API", version="1.0.0")
 
+    # Challenge-response liveness router (Round 10) — self-contained; the
+    # engine degrades honestly when doc-verification is not importable.
+    from app.liveness import create_liveness_router
+    app.include_router(create_liveness_router())
+
+    # Live-registry verification router (Round 10) — fail-closed adapters
+    # (NIBSS BVN / NIMC NIN / CAC); honest unavailable when unconfigured.
+    from app.registry_router import create_registry_router
+    app.include_router(create_registry_router())
+
     @app.get("/health")
     def health() -> dict:
         return {"status": "healthy", "service": "kyc-api", "timestamp": _now()}

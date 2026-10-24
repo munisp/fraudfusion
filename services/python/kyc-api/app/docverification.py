@@ -25,16 +25,18 @@ try:
     if _path and os.path.isdir(_path) and _path not in sys.path:
         sys.path.append(_path)
     import adapters as _adapters  # noqa: E402
+    import liveness as _liveness  # noqa: E402
     import local_cv as _local_cv  # noqa: E402
     import pipeline as _pipeline  # noqa: E402
 
     local_cv = _local_cv
     pipeline = _pipeline
     adapters = _adapters
+    liveness = _liveness
     DOCVERIFICATION_AVAILABLE = True
     DOCVERIFICATION_UNAVAILABLE_REASON = None
 except ImportError as exc:  # pragma: no cover - exercised where cv2 missing
-    local_cv = pipeline = adapters = None
+    local_cv = pipeline = adapters = liveness = None
     DOCVERIFICATION_AVAILABLE = False
     DOCVERIFICATION_UNAVAILABLE_REASON = (
         f"doc-verification package not importable ({exc}); expected at {_path} "

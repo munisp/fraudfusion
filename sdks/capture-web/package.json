@@ -1,0 +1,18 @@
+{
+  "name": "@fraudfusion/capture-web",
+  "version": "0.1.0",
+  "description": "Browser capture widget for FraudFusion KYC: document capture with real-time quality feedback and challenge-response liveness capture. Zero dependencies.",
+  "main": "capture-core.js",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "files": [
+    "capture-core.js",
+    "capture-widget.js",
+    "capture-core.d.ts",
+    "capture-widget.d.ts",
+    "README.md"
+  ],
+  "license": "UNLICENSED",
+  "private": true
+}
