@@ -84,6 +84,10 @@ class PaddleOCRAdapter(BackendAdapter):
             self.available = False
             self.unavailable_reason = "disabled by PADDLEOCR_ENABLED"
             return
+        # PaddleOCR 3.x paddlex backends crash inside oneDNN PIR instructions on
+        # some CPU builds (ConvertPirAttribute2RuntimeAttribute NotImplemented);
+        # the new-executor flag must be set before paddle loads.
+        os.environ.setdefault("FLAGS_enable_pir_api", "0")
         try:
             from paddleocr import PaddleOCR  # noqa: PLC0415 (lazy optional)
         except ImportError:
@@ -94,8 +98,14 @@ class PaddleOCRAdapter(BackendAdapter):
             )
             return
         try:
-            self._engine = PaddleOCR(use_angle_cls=True, lang=language,
-                                     show_log=False)
+            try:  # PaddleOCR 3.x — enable_mkldnn=False avoids the oneDNN crash
+                self._engine = PaddleOCR(use_textline_orientation=True,
+                                         lang=language, enable_mkldnn=False)
+                self._api = 3
+            except (ValueError, TypeError):  # legacy 2.x signature
+                self._engine = PaddleOCR(use_angle_cls=True, lang=language,
+                                         show_log=False)
+                self._api = 2
             self.available = True
         except Exception as exc:  # model download failures etc.
             self.available = False
@@ -116,6 +126,26 @@ class PaddleOCRAdapter(BackendAdapter):
             return {"status": "unavailable",
                     "reason": "image bytes could not be decoded", **base}
         try:
+            if getattr(self, "_api", 2) == 3:
+                # PaddleOCR 3.x: .predict() -> list[OCRResult]; each result's
+                # .json["res"] carries rec_texts / rec_scores / rec_polys.
+                raw3 = self._engine.predict(img)
+                lines = []
+                for result in raw3 or []:
+                    payload = getattr(result, "json", None)
+                    res = (payload.get("res", payload) if isinstance(payload, dict)
+                           else {})
+                    texts = res.get("rec_texts") or []
+                    scores = res.get("rec_scores") or [0.0] * len(texts)
+                    polys = res.get("rec_polys") or [None] * len(texts)
+                    for text, conf, box in zip(texts, scores, polys):
+                        lines.append({
+                            "text": str(text),
+                            "confidence": round(float(conf), 4),
+                            "box": ([[float(x), float(y)] for x, y in box]
+                                    if box is not None else []),
+                        })
+                return {"status": "ok", "lines": lines, **base}
             raw = self._engine.ocr(img, cls=True)
         except Exception as exc:
             logger.error("paddleocr inference failed: %s", exc)
@@ -139,7 +169,9 @@ class VLMAdapter(BackendAdapter):
     """Structured field extraction via an ollama vision model.
 
     Env (kg-qa conventions): OLLAMA_URL (unset -> unavailable),
-    OLLAMA_VISION_MODEL (default llama3.2-vision), OLLAMA_TIMEOUT_S.
+    OLLAMA_VISION_MODEL (default qwen2.5vl:7b — materially stronger dense
+    document OCR + structured JSON than llama3.2-vision for Nigerian
+    identity/land documents), OLLAMA_TIMEOUT_S.
     Fail-closed: connection error / non-200 / invalid JSON -> unavailable
     with reason, never invented fields.
     """
@@ -152,7 +184,7 @@ class VLMAdapter(BackendAdapter):
                  transport: httpx.BaseTransport | None = None):
         self.base_url = (base_url if base_url is not None
                          else _env("OLLAMA_URL")).rstrip("/")
-        self.model = model or _env("OLLAMA_VISION_MODEL", "llama3.2-vision")
+        self.model = model or _env("OLLAMA_VISION_MODEL", "qwen2.5vl:7b")
         self.timeout = timeout
         self._transport = transport
         if not self.base_url:
@@ -223,6 +255,68 @@ class VLMAdapter(BackendAdapter):
         clean = {k: str(v).strip() for k, v in fields.items()
                  if v is not None and str(v).strip()}
         return {"status": "ok", "fields": clean, "model": self.model, **base}
+
+    def _build_inspect_prompt(self, doc_type: str) -> str:
+        try:
+            import nigerian_registry
+            spec = nigerian_registry.get_spec(doc_type)
+        except ImportError:
+            spec = None
+        if spec:
+            context = (f"Document type: {spec['display']}. Lawful issuer: "
+                       f"{spec['issuing_authority']}. Expected security "
+                       f"features: {', '.join(spec['security_features'])}. "
+                       f"Text markers a genuine specimen carries: "
+                       f"{', '.join(spec['markers'])}.")
+        else:
+            context = f"Document type: {doc_type} (no registry spec)."
+        return (
+            "You are a forensic document examiner for Nigerian government "
+            f"documents. {context}\n"
+            "Visually inspect this scan for TEMPLATE anomalies only: wrong "
+            "font family or typography for the issuing body, layout that "
+            "does not match the claimed document type, missing expected "
+            "security features visible in the scan (hologram area, guilloche "
+            "patterns, seals, signature panels), inconsistent print "
+            "technologies between regions, era-inappropriate design for the "
+            "claimed issue date.\n"
+            "Report ONLY what is visually evident — never invent anomalies; "
+            "an empty list means the template looks consistent.\n"
+            'Respond with a single JSON object, no prose: '
+            '{"anomalies": ["..."], "template_match": true}'
+        )
+
+    def inspect(self, image_bytes: bytes, doc_type: str) -> dict[str, Any]:
+        """Template-anomaly assessment (advisory factor). Fail-closed."""
+        base = {"adapter": self.name, "source": self.base_url or None}
+        if not self.available:
+            return {"status": "unavailable", "reason": self.unavailable_reason,
+                    **base}
+        payload = {"model": self.model,
+                   "prompt": self._build_inspect_prompt(doc_type),
+                   "images": [base64.b64encode(image_bytes).decode()],
+                   "stream": False, "format": "json"}
+        try:
+            with self._client() as client:
+                resp = client.post(f"{self.base_url}/api/generate", json=payload)
+        except httpx.HTTPError as exc:
+            logger.error("ollama vision unreachable: %s", exc)
+            return {"status": "unavailable",
+                    "reason": f"ollama endpoint unreachable "
+                              f"({exc.__class__.__name__})", **base}
+        if resp.status_code != 200:
+            return {"status": "unavailable",
+                    "reason": f"ollama returned HTTP {resp.status_code}", **base}
+        try:
+            body = json.loads(resp.json().get("response", ""))
+        except (ValueError, AttributeError):
+            return {"status": "unavailable",
+                    "reason": "ollama returned non-JSON inspection", **base}
+        anomalies = [str(a).strip() for a in body.get("anomalies", [])
+                     if str(a).strip()]
+        return {"status": "ok", "anomalies": anomalies,
+                "template_match": bool(body.get("template_match", not anomalies)),
+                "model": self.model, **base}
 
 
 # ---------------------------------------------------------------------------

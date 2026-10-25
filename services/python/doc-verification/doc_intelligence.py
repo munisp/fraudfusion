@@ -53,6 +53,7 @@ import forensics
 import metadata_forensics
 import nigerian_docs
 import nigerian_registry
+import ocr_forensics
 import pipeline
 from checksums import date_logic_issues, validate_passport_mrz
 
@@ -88,6 +89,8 @@ WEIGHTS: dict[str, int] = {
     "spec_missing_required": 15,
     "spec_field_invalid": 20,
     "spec_marker_missing": 10,
+    "ocr_confidence_outlier": 10,
+    "vlm_template_anomaly": 12,
 }
 
 BANDS = ((50, "forgery_suspected"), (20, "manual_review"), (0, "clean"))
@@ -329,8 +332,10 @@ def _registry_check(store: DocIntelStore, doc_hash: str,
     return factors, matches
 
 
-def run_intelligence(store: DocIntelStore, payload: IntelligenceInput) -> dict[str, Any]:
+def run_intelligence(store: DocIntelStore, payload: IntelligenceInput,
+                     backends: Optional[pipeline.Backends] = None) -> dict[str, Any]:
     raw, kind = _payload_bytes(payload)
+    backends = backends or pipeline.Backends()
     doc_hash = hashlib.sha256(raw).hexdigest()
     doc_type = (payload.doc_type or "unknown").strip()
     canonical = (nigerian_registry.canonical_doc_type(doc_type, payload.state)
@@ -342,7 +347,7 @@ def run_intelligence(store: DocIntelStore, payload: IntelligenceInput) -> dict[s
     base: dict[str, Any] = {}
     if kind == "image":
         # Layer 1 — existing pipeline (quality, replay, OCR/VLM extraction)
-        base = pipeline.verify_document(raw, doc_type)
+        base = pipeline.verify_document(raw, doc_type, backends)
         provenance.append({"layer": "pipeline", "status": "ran",
                            "detail": f"verdict={base['status']}"})
         replay = base["authenticity"].get("screen_replay_integrity")
@@ -369,6 +374,36 @@ def run_intelligence(store: DocIntelStore, payload: IntelligenceInput) -> dict[s
         provenance.append({"layer": "metadata", "status": "ran",
                            "detail": f"{len(meta['signals'])} signal(s)"})
         factors.extend(meta["signals"])
+        # Layer 3b — OCR-confidence forensics: a patched name/date reads at
+        # a confidence that breaks from the document's baseline (Round 16).
+        ocr_result = ocr_forensics.confidence_inconsistency(
+            base.get("ocr_lines") or [])
+        if ocr_result.get("suspected"):
+            factors.append({"code": "ocr_confidence_outlier",
+                            "detail": ocr_result["detail"] + " — lines: "
+                                     + "; ".join(f"'{o['text']}'"
+                                                 for o in ocr_result["outliers"][:3])})
+        provenance.append({"layer": "ocr_forensics",
+                           "status": "ran" if ocr_result.get("lines_scored") else "skipped",
+                           "detail": ocr_result.get("detail", "")})
+        # Layer 3c — VLM template inspection (advisory): the model REPORTS
+        # anomalies, the deterministic weights DECIDE (Round 16).
+        if backends.vlm.availability()["available"]:
+            inspection = backends.vlm.inspect(raw, doc_type)
+            if inspection.get("status") == "ok":
+                anomalies = inspection.get("anomalies") or []
+                if anomalies:
+                    factors.append({"code": "vlm_template_anomaly",
+                                    "detail": "; ".join(anomalies[:3])})
+                provenance.append({"layer": "vlm_inspect", "status": "ran",
+                                   "detail": f"{len(anomalies)} anomaly(ies), "
+                                             f"model={inspection.get('model')}"})
+            else:
+                provenance.append({"layer": "vlm_inspect", "status": "unavailable",
+                                   "detail": inspection.get("reason")})
+        else:
+            provenance.append({"layer": "vlm_inspect", "status": "unavailable",
+                               "detail": backends.vlm.unavailable_reason})
         merged_fields = {**(base.get("extracted_fields") or {}), **payload.fields}
     else:
         # PDF path — byte forensics + optional docling parse

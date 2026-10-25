@@ -1,4 +1,5 @@
-# Core local_cv layer — always required, no ML deps.
+# Core forensics layers — always required (pixel forensics, fingerprints,
+# local_cv): OpenCV + numpy, no ML deps.
 opencv-python-headless>=4.8
 numpy>=1.26
 # HTTP adapters (ollama VLM, OpenKYC-compatible IDV).
@@ -8,7 +9,9 @@ httpx==0.28.1
 # OPTIONAL heavy backends — lazy-loaded at runtime; the service and its tests
 # work WITHOUT these installed. Install only in deployments that need them:
 #
-#   paddleocr + paddlepaddle   local OCR (PaddleOCRAdapter). Large install;
+#   paddleocr + paddlepaddle   local OCR (PaddleOCRAdapter) — Round 16
+#                              recommended backend #1; activates marker
+#                              detection + OCR-confidence forensics.
 #                              follow https://github.com/PaddlePaddle/PaddleOCR
 #                              for the paddlepaddle wheel matching your CPU/GPU.
 #                              Kill-switch env: PADDLEOCR_ENABLED=false.
@@ -21,3 +24,8 @@ httpx==0.28.1
 # pip install paddleocr paddlepaddle
 # pip install docling
 # ---------------------------------------------------------------------------
+
+# Round 16 VLM default: OLLAMA_VISION_MODEL=qwen2.5vl:7b (ollama sidecar,
+# see deploy/docker-compose.doc-intel.yml). The ollama server itself is NOT
+# a pip dependency — run it as the compose sidecar or set OLLAMA_URL to any
+# reachable instance.

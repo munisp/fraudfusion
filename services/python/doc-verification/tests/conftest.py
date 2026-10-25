@@ -11,6 +11,7 @@ All images are generated at test time with cv2/numpy — no binary fixtures.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +20,12 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# The heavy paddlex models (>1GB RAM) must not load during the default test
+# battery — engine tests exercise OCR via injected stubs or the honestly-
+# unavailable path. The real backend is covered by the opt-in live probe
+# (PADDLEOCR_LIVE_TEST=1).
+os.environ.setdefault("PADDLEOCR_ENABLED", "false")
 
 
 def _base_card() -> np.ndarray:
