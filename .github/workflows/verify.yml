@@ -24,11 +24,16 @@ jobs:
           python-version: '3.12'
           cache: pip
       - name: Install pgserver
-        run: pip install pgserver
+        run: pip install pgserver psycopg[binary]
       - name: Run embedded-PG migration harness (double-apply + verification + stress)
         env:
           XDG_RUNTIME_DIR: /tmp/xdg
         run: python3 database/tests/run_migrations_embedded_pg.py
+      - name: Verify GeoNames gazetteer loader (double-load idempotency)
+        env:
+          XDG_RUNTIME_DIR: /tmp/xdg
+          PG_TEST_DATA: /tmp/fraudfusion-geotest
+        run: python3 database/tests/test_gazetteer_loader.py
 
   python-tests:
     runs-on: ubuntu-latest

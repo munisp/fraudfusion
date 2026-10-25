@@ -83,3 +83,16 @@ class TestSedonaHonesty:
 
     def test_km_to_degree_conversion_constant(self):
         assert sedona_jobs.KM_TO_DEG_AT_EQUATOR == pytest.approx(1 / 111.32)
+
+    def test_cli_reports_honest_unavailability(self):
+        """The __main__ runner exits 2 with a clear message when the Sedona
+        runtime is missing — it never pretends a job ran."""
+        try:
+            import pyspark  # noqa: F401
+            pytest.skip("pyspark installed in this environment")
+        except ImportError:
+            pass
+        from intelligence.geo_analytics import __main__ as cli
+        rc = cli.main(["mule-clusters", "--events", "/tmp/none.parquet",
+                       "--out", "/tmp/out"])
+        assert rc == 2

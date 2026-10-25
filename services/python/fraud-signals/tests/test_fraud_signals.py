@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import detectors  # noqa: E402
+import geo_enrich  # noqa: E402
 from main import app  # noqa: E402
 from store import now_iso  # noqa: E402
 
@@ -90,6 +91,95 @@ class TestAgent:
         _, verdict, _ = detectors.agent(
             {"baseline_tx_per_day": 10, "distance_from_registered_km": 1}, history)
         assert verdict == "clear"
+
+
+class TestAgentGeoEnrich:
+    """Service-side computation of distance_from_registered_km (R26)."""
+
+    def test_embedded_enrichment_fires_off_location(self, fresh_store):
+        client = TestClient(app)
+        r = client.post("/api/v1/signals/agent", json={
+            "subject_id": "agent-1",
+            "payload": {"baseline_tx_per_day": 10,
+                        "registered_location": "lagos",
+                        "operating_location": "abuja"},
+        })
+        assert r.status_code == 200
+        body = r.json()
+        codes = {f["code"] for f in body["factors"]}
+        assert "off_location" in codes  # lagos-abuja ~536km > 5km
+        assert "geo_enrichment" in codes
+        detail = next(f["detail"] for f in body["factors"] if f["code"] == "off_location")
+        assert "km from registered location" in detail
+
+    def test_caller_supplied_distance_wins(self, fresh_store):
+        payload = {"distance_from_registered_km": 1.0,
+                   "registered_location": "lagos", "operating_location": "abuja"}
+        enriched, note = geo_enrich.enrich_agent_distance(payload, fresh_store)
+        assert enriched["distance_from_registered_km"] == 1.0  # not overwritten
+        assert note is None
+
+    def test_unknown_place_honest_skip(self, fresh_store):
+        client = TestClient(app)
+        r = client.post("/api/v1/signals/agent", json={
+            "subject_id": "agent-2",
+            "payload": {"baseline_tx_per_day": 10,
+                        "registered_location": "lagos",
+                        "operating_location": "atlantis"},
+        })
+        assert r.status_code == 200
+        body = r.json()
+        codes = {f["code"] for f in body["factors"]}
+        assert "off_location" not in codes  # honest skip, never a silent 0
+        note = next(f["detail"] for f in body["factors"] if f["code"] == "geo_enrichment")
+        assert "geo_unresolved" in note
+
+    def test_hyphenated_name_normalised(self, fresh_store):
+        enriched, _ = geo_enrich.enrich_agent_distance(
+            {"registered_location": "lagos", "operating_location": "Ado-Ekiti"},
+            fresh_store)
+        assert enriched["distance_from_registered_km"] > 5  # ~240km
+
+    def test_no_locations_no_enrichment(self, fresh_store):
+        payload = {"baseline_tx_per_day": 5}
+        enriched, note = geo_enrich.enrich_agent_distance(payload, fresh_store)
+        assert enriched is payload and note is None
+
+    def test_postgres_path_uses_db_function(self):
+        class FakePg:
+            _is_pg = True
+
+            def query(self, sql, params):
+                assert "geo_distance_km" in sql
+                return [{"d": 321.5}]
+
+        enriched, note = geo_enrich.enrich_agent_distance(
+            {"registered_location": "lagos", "operating_location": "kano"}, FakePg())
+        assert enriched["distance_from_registered_km"] == 321.5
+        assert note is None  # DB is authoritative; no fallback note
+
+    def test_postgres_failure_falls_back_embedded(self):
+        class BrokenPg:
+            _is_pg = True
+
+            def query(self, sql, params):
+                raise RuntimeError("function geo_distance_km does not exist")
+
+        enriched, note = geo_enrich.enrich_agent_distance(
+            {"registered_location": "lagos", "operating_location": "abuja"}, BrokenPg())
+        assert enriched["distance_from_registered_km"] > 5  # embedded haversine
+        assert "embedded gazetteer fallback" in note
+
+    def test_embedded_gazetteer_matches_migration_seed(self):
+        import re
+        seed_sql = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "..", "..", "..", "database", "20261026_postgis_geo.sql"),
+            encoding="utf-8").read()
+        seed = {n.lower(): (float(lat), float(lon)) for n, lat, lon in re.findall(
+            r"\('([^']+)',\s*([\d.-]+),\s*([\d.-]+),\s*'[^']+',\s*'[A-Z]{2}'\)", seed_sql)}
+        assert len(seed) == 72
+        assert geo_enrich.GAZETTEER == seed
 
 
 class TestLoanStacking:

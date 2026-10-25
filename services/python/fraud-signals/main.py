@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detectors import DETECTORS  # noqa: E402
+from geo_enrich import enrich_agent_distance  # noqa: E402
 from store import get_store, now_iso  # noqa: E402
 
 log = logging.getLogger("fraud-signals")
@@ -96,9 +97,14 @@ def health() -> Dict[str, Any]:
         store_ok = True
     except Exception:
         store_ok = False
+    try:
+        geo_mode = "postgres" if getattr(get_store(), "_is_pg", False) else "embedded"
+    except Exception:
+        geo_mode = "embedded"
     return {
         "status": "ok" if store_ok else "degraded",
         "store": "ok" if store_ok else "unavailable",
+        "geo": geo_mode,
         "detectors": sorted(DETECTORS.keys()),
         "mesh": INTEGRATION_AVAILABLE,
         "metering": metering_stats() if METERING_AVAILABLE else "unavailable",
@@ -169,10 +175,21 @@ def _evaluate(name: str, body: SignalRequest, mode: str) -> Dict[str, Any]:
     if name == "mule":
         events = _enrich_counterparty_risk(store, events)
 
-    score, verdict, factors = detector(body.payload, events)
+    # Service-side geo enrichment: never trust a caller to measure its own
+    # agents. The scored payload copy may gain distance_from_registered_km;
+    # the audited event keeps the caller's original payload.
+    score_payload = body.payload
+    geo_note = None
+    if name == "agent":
+        score_payload, geo_note = enrich_agent_distance(body.payload, store)
+
+    score, verdict, factors = detector(score_payload, events)
     if history_note:
         factors = factors + [{"code": "history_unavailable",
                               "detail": history_note, "weight": 0.0}]
+    if geo_note:
+        factors = factors + [{"code": "geo_enrichment",
+                              "detail": geo_note, "weight": 0.0}]
 
     audit_hash = None
     try:

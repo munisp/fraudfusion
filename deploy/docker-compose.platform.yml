@@ -169,6 +169,29 @@ services:
       - postgres
     restart: unless-stopped
 
+  # --- optional Sedona geo-analytics batch runner (profile: geo-analytics) --
+  # Platform-scale mule-ring clustering and agent off-location rollups
+  # (intelligence/geo_analytics). Batch, not long-running — run one job:
+  #   docker compose -f deploy/docker-compose.platform.yml --profile geo-analytics \
+  #     run --rm geo-analytics mule-clusters \
+  #       --events /data/events.parquet --out /data/out/mule_clusters
+  # Drop input extracts (parquet/json) into deploy/geo-analytics-data/ first.
+  # Honest note: pulls the official apache/sedona image; without registry
+  # access run the same CLI in any pyspark+apache-sedona environment
+  # (python -m geo_analytics --help). Small extracts need no Spark at all —
+  # intelligence/geo_analytics/reference.py covers them in pure Python.
+  geo-analytics:
+    build:
+      context: ..
+      dockerfile: deploy/geo-analytics.Dockerfile
+    container_name: fraudfusion-geo-analytics
+    profiles: ["geo-analytics"]
+    volumes:
+      - geo-analytics-data:/data
+    # keep container alive for `run`-style usage; jobs themselves exit
+    command: ["--help"]
+
 volumes:
   pgdata:
   ollama-models:
+  geo-analytics-data:
