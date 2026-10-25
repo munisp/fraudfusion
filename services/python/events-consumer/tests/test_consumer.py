@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from embedded_pg import clone_migrated
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from consumer import (  # noqa: E402
@@ -24,7 +26,7 @@ from consumer import (  # noqa: E402
 
 @pytest.fixture()
 def sink(tmp_path):
-    return ArchiveSink(database_url="", sqlite_path=str(tmp_path / "events.db"))
+    return ArchiveSink(database_url=clone_migrated("events"))
 
 
 def write_jsonl(path: Path, events: list[dict]) -> None:
@@ -88,14 +90,17 @@ class TestArchiveAndAggregates:
         archived = sink.query("SELECT * FROM events_archive ORDER BY id")
         assert len(archived) == 3
         assert all(r["source"] == "filetail" for r in archived)
-        assert json.loads(archived[0]["payload"])["amount"] == 100
+        payload0 = archived[0]["payload"]
+        # JSONB arrives decoded (dict) via psycopg; TEXT as str
+        payload0 = payload0 if isinstance(payload0, dict) else json.loads(payload0)
+        assert payload0["amount"] == 100
 
         # 2026-08-31 is the Monday of its week; 2026-09-05 belongs to the
         # week starting 2026-08-31 too... both scored events are same week.
         aggs = sink.query(
             "SELECT week_start, event_type, event_count FROM events_aggregates_weekly"
             " ORDER BY event_type")
-        by_type = {(a["week_start"], a["event_type"]): a["event_count"] for a in aggs}
+        by_type = {(str(a["week_start"]), a["event_type"]): a["event_count"] for a in aggs}
         assert by_type[("2026-08-31", "transaction.scored")] == 2
         assert by_type[("2026-08-31", "alert.raised")] == 1
 

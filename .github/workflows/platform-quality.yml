@@ -21,10 +21,13 @@ jobs:
         run: |
           set -euo pipefail
           python -m compileall -q ml mlops intelligence services/python services/land-verification-service
-      - name: onboarding-service unit tests (SQLite backend)
+      - name: onboarding-service unit tests (embedded PostgreSQL)
         working-directory: services/python/onboarding-service
+        env:
+          XDG_RUNTIME_DIR: /tmp/xdg
         run: |
           pip install -r requirements-dev.txt
+          pip install pgserver psycopg[binary]
           python -m pytest tests/ -q
       - name: Python detectors install + compile
         run: |

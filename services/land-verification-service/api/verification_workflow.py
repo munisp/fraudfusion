@@ -5,22 +5,18 @@ Pipeline (state machine):
     RECEIVED -> DOCUMENT_ANALYSIS -> REGISTRY_LOOKUP
              -> SITE_INSPECTION | FRAUD_REVIEW -> COMPLETED | REJECTED
 
-State transitions are persisted to SQLite (default) or PostgreSQL when
-DATABASE_URL points at a postgres instance (requires psycopg).
+State transitions are persisted to PostgreSQL (DATABASE_URL required).
+Tests use embedded pgserver via services/python/integration/embedded_pg.py.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-import threading
 from contextlib import contextmanager
 import hashlib
-import os
-import sqlite3
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Optional
 
 from models.schemas import (
@@ -34,10 +30,6 @@ from models.schemas import (
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DEFAULT_SQLITE_PATH = os.getenv(
-    "LAND_VERIFY_DB",
-    str(Path(__file__).resolve().parent.parent / "data" / "land_verification.db"),
-)
 
 
 class StateTransitionError(RuntimeError):
@@ -47,55 +39,50 @@ class StateTransitionError(RuntimeError):
 class VerificationStore:
     """Persistence for verification state transitions.
 
-    Uses PostgreSQL when DATABASE_URL=postgres(ql)://... is configured and the
-    psycopg driver is installed; otherwise falls back to a local SQLite file.
+    PostgreSQL only: DATABASE_URL must be a postgres(ql):// DSN.
     """
 
     def __init__(self, database_url: str = DATABASE_URL):
+        if not database_url.startswith(("postgres://", "postgresql://")):
+            raise RuntimeError(
+                "PostgreSQL is required: set DATABASE_URL=postgresql://... — "
+                "the verification workflow store has no SQLite fallback.")
         self.database_url = database_url
-        self._pg = database_url.startswith(("postgres://", "postgresql://"))
-        if self._pg:
-            try:
-                import psycopg  # noqa: F401
-            except ImportError as exc:
-                raise RuntimeError(
-                    "DATABASE_URL points at PostgreSQL but the 'psycopg' driver "
-                    "is not installed. Add psycopg[binary] to the environment."
-                ) from exc
-        else:
-            Path(DEFAULT_SQLITE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        self._pg = True
+        try:
+            import psycopg  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "DATABASE_URL points at PostgreSQL but the 'psycopg' driver "
+                "is not installed. Add psycopg[binary] to the environment."
+            ) from exc
 
         # Connection pooling: previously every state transition opened and
         # closed a brand-new connection (6+ connect/query/close cycles per
         # verification, each a TCP+TLS+auth handshake on PostgreSQL).
         self._pool = None
-        self._sqlite_conn = None
-        self._sqlite_lock = threading.Lock()
-        if self._pg:
-            try:
-                from psycopg_pool import ConnectionPool
+        try:
+            from psycopg_pool import ConnectionPool
 
-                self._pool = ConnectionPool(
-                    self.database_url,
-                    min_size=1,
-                    max_size=int(os.getenv("DB_POOL_MAX", "4")),
-                    open=False,
-                )
-                self._pool.open()
-            except ImportError:
-                pass  # fall back to per-call connections below
-        else:
-            self._sqlite_conn = sqlite3.connect(DEFAULT_SQLITE_PATH, check_same_thread=False)
+            self._pool = ConnectionPool(
+                self.database_url,
+                min_size=1,
+                max_size=int(os.getenv("DB_POOL_MAX", "4")),
+                open=False,
+            )
+            self._pool.open()
+        except ImportError:
+            pass  # fall back to per-call connections below
         self._init_schema()
 
     @contextmanager
     def _connection(self):
-        # Yield a pooled PostgreSQL connection or the shared SQLite
-        # connection (serialized on a lock; SQLite serializes anyway).
+        # Yield a pooled PostgreSQL connection, or a per-call connection when
+        # psycopg_pool is unavailable.
         if self._pool is not None:
             with self._pool.connection() as conn:
                 yield conn
-        elif self._pg:
+        else:
             import psycopg
 
             conn = psycopg.connect(self.database_url)
@@ -103,23 +90,14 @@ class VerificationStore:
                 yield conn
             finally:
                 conn.close()
-        else:
-            with self._sqlite_lock:
-                yield self._sqlite_conn
-
-    @staticmethod
-    def _placeholder(is_pg: bool) -> str:
-        return "%s" if is_pg else "?"
 
     def _init_schema(self) -> None:
-        ph = self._placeholder(self._pg)
-        id_col = "SERIAL PRIMARY KEY" if self._pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
         with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
-                f"""
+                """
                 CREATE TABLE IF NOT EXISTS verification_states (
-                    id {id_col},
+                    id SERIAL PRIMARY KEY,
                     verification_id TEXT NOT NULL,
                     from_status TEXT,
                     to_status TEXT NOT NULL,
@@ -130,7 +108,7 @@ class VerificationStore:
                 """
             )
             cur.execute(
-                f"""
+                """
                 CREATE TABLE IF NOT EXISTS verification_results (
                     verification_id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
@@ -152,12 +130,11 @@ class VerificationStore:
             raise StateTransitionError(
                 f"Illegal transition {from_status.value} -> {to_status.value}"
             )
-        ph = self._placeholder(self._pg)
         with self._connection() as conn:
             conn.cursor().execute(
-                f"INSERT INTO verification_states "
-                f"(verification_id, from_status, to_status, reason, actor, created_at) "
-                f"VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph})",
+                "INSERT INTO verification_states "
+                "(verification_id, from_status, to_status, reason, actor, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
                 (
                     verification_id,
                     from_status.value if from_status else None,
@@ -174,9 +151,6 @@ class VerificationStore:
             cur = conn.cursor()
             cur.execute(
                 "SELECT to_status FROM verification_states WHERE verification_id = %s"
-                " ORDER BY id DESC LIMIT 1"
-                if self._pg
-                else "SELECT to_status FROM verification_states WHERE verification_id = ?"
                 " ORDER BY id DESC LIMIT 1",
                 (verification_id,),
             )
@@ -188,10 +162,7 @@ class VerificationStore:
             cur = conn.cursor()
             cur.execute(
                 "SELECT from_status, to_status, reason, actor, created_at "
-                "FROM verification_states WHERE verification_id = %s ORDER BY id"
-                if self._pg
-                else "SELECT from_status, to_status, reason, actor, created_at "
-                "FROM verification_states WHERE verification_id = ? ORDER BY id",
+                "FROM verification_states WHERE verification_id = %s ORDER BY id",
                 (verification_id,),
             )
             return [
@@ -206,32 +177,22 @@ class VerificationStore:
             ]
 
     def save_result(self, verification_id: str, payload: str) -> None:
-        ph = self._placeholder(self._pg)
         with self._connection() as conn:
             cur = conn.cursor()
-            if self._pg:
-                cur.execute(
-                    "INSERT INTO verification_results (verification_id, payload, updated_at) "
-                    "VALUES (%s, %s, %s) "
-                    "ON CONFLICT (verification_id) DO UPDATE SET payload = EXCLUDED.payload, "
-                    "updated_at = EXCLUDED.updated_at",
-                    (verification_id, payload, datetime.utcnow().isoformat()),
-                )
-            else:
-                cur.execute(
-                    "INSERT OR REPLACE INTO verification_results "
-                    "(verification_id, payload, updated_at) VALUES (?, ?, ?)",
-                    (verification_id, payload, datetime.utcnow().isoformat()),
-                )
+            cur.execute(
+                "INSERT INTO verification_results (verification_id, payload, updated_at) "
+                "VALUES (%s, %s, %s) "
+                "ON CONFLICT (verification_id) DO UPDATE SET payload = EXCLUDED.payload, "
+                "updated_at = EXCLUDED.updated_at",
+                (verification_id, payload, datetime.utcnow().isoformat()),
+            )
             conn.commit()
 
     def load_result(self, verification_id: str) -> Optional[str]:
         with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT payload FROM verification_results WHERE verification_id = %s"
-                if self._pg
-                else "SELECT payload FROM verification_results WHERE verification_id = ?",
+                "SELECT payload FROM verification_results WHERE verification_id = %s",
                 (verification_id,),
             )
             row = cur.fetchone()

@@ -13,11 +13,12 @@ from fastapi.testclient import TestClient
 from api import mesh_boot
 from api.main import create_app
 from api.data_store import LandDataStore, get_land_store
+from embedded_pg import clone_migrated, fresh_database
 
 
 @pytest.fixture()
 def store(tmp_path):
-    s = LandDataStore(database_url="", sqlite_path=str(tmp_path / "land.db"))
+    s = LandDataStore(database_url=clone_migrated("land"))
     yield s
 
 

@@ -16,7 +16,7 @@
 --
 -- Fresh-DB-safe and idempotent: to_regclass-guarded DO blocks,
 -- CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS (matching
--- 20260928_identity_exposure.sql style). The kyc-api SQLite mirror carries
+-- 20260928_identity_exposure.sql style). The kyc-api SQLite mirror (removed Round 27) carried
 -- the same table/column (services/python/kyc-api/app/db.py).
 
 DO $$

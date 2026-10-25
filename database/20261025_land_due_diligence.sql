@@ -3,7 +3,7 @@
 -- implementing the buildable recommendations from the Channels TV land-fraud
 -- interview (docs/land-fraud-video-recommendations.md).
 --
--- Fresh-DB-safe and idempotent. Mirrors the SQLite schema in
+-- Fresh-DB-safe and idempotent. (Formerly mirrored the SQLite schema — removed Round 27 — in
 -- services/land-verification-service/api/data_store.py.
 --
 -- Contents:

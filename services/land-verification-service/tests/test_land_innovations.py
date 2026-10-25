@@ -31,6 +31,7 @@ from api.geospatial import centroid_geohash, parse_beacons, polygons_overlap  # 
 from api.main import create_app  # noqa: E402
 from api.risk import score_factors  # noqa: E402
 from api.title_chain import analyze_title_chain  # noqa: E402
+from embedded_pg import clone_migrated, fresh_database
 
 SQUARE_A = "6.4500N 3.4000E, 6.4510N 3.4000E, 6.4510N 3.4010E, 6.4500N 3.4010E"
 SQUARE_B_OVERLAP = "6.4505N 3.4005E, 6.4515N 3.4005E, 6.4515N 3.4015E, 6.4505N 3.4015E"
@@ -41,7 +42,7 @@ SQUARE_D_NEAR = "6.4511N 3.4000E, 6.4512N 3.4000E, 6.4512N 3.4001E, 6.4511N 3.40
 
 @pytest.fixture()
 def store(tmp_path):
-    s = LandDataStore(sqlite_path=str(tmp_path / "land_innov.db"), seed=False)
+    s = LandDataStore(database_url=clone_migrated("land"), seed=False)
     reset_land_store_for_tests(s)
     yield s
     reset_land_store_for_tests(None)

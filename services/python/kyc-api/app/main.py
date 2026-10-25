@@ -29,7 +29,7 @@ app/webhooks.py (fire-and-forget, hash-only payload).
 
 Schema: database/20260827_pep_kyb_merchant.sql (pep_list, watchlist),
 database/20260930_kyc_idempotency.sql (kyc_idempotency_keys,
-kyc_requests.tenant_id); SQLite mirror in app/db.py for local dev/tests.
+kyc_requests.tenant_id). PostgreSQL only — no SQLite mirror.
 """
 
 from __future__ import annotations
@@ -50,6 +50,13 @@ from app import bureau, counterparty, docverification, identity, integration, ph
 from app.api_keys import is_api_key, principal_tenant, require_scope
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db
+
+
+def _json_value(v):
+    """psycopg decodes JSONB columns to Python objects; tolerate both."""
+    if isinstance(v, (dict, list)):
+        return v
+    return json.loads(v)
 from app.schemas import (
     AppealDecisionRequest,
     AppealRequest,
@@ -120,13 +127,11 @@ def _idempotent_run(db: Database, tenant: str, key: str, req_hash: str, compute)
                 status_code=409,
                 detail="Idempotency-Key was already used with a different request payload",
             )
-        return json.loads(row["response_payload"]), True
+        return _json_value(row["response_payload"]), True
     payload = compute()
     inserted = db.execute(
-        ("INSERT OR IGNORE INTO kyc_idempotency_keys (key, tenant_id, request_hash, response_payload)"
-         " VALUES (:k, :t, :h, :p)" if not db._is_pg else
-         "INSERT INTO kyc_idempotency_keys (key, tenant_id, request_hash, response_payload)"
-         " VALUES (:k, :t, :h, :p) ON CONFLICT (tenant_id, key) DO NOTHING"),
+        "INSERT INTO kyc_idempotency_keys (key, tenant_id, request_hash, response_payload)"
+         " VALUES (:k, :t, :h, :p) ON CONFLICT (tenant_id, key) DO NOTHING",
         {"k": key, "t": tenant, "h": req_hash, "p": json.dumps(payload, default=str)},
     )
     if not inserted:
@@ -138,7 +143,7 @@ def _idempotent_run(db: Database, tenant: str, key: str, req_hash: str, compute)
                     status_code=409,
                     detail="Idempotency-Key was already used with a different request payload",
                 )
-            return json.loads(row["response_payload"]), True
+            return _json_value(row["response_payload"]), True
     return payload, False
 
 IMAGE_MAGIC = {
@@ -329,10 +334,8 @@ def _schedule_periodic_review(db: Database, customer_id: str, tier: str) -> None
     due = datetime.now(timezone.utc).timestamp() + days * 86400
     due_iso = datetime.fromtimestamp(due, timezone.utc).isoformat()
     db.execute(
-        ("INSERT OR IGNORE INTO kyc_review_schedule (customer_id, review_type, tier, due_at)"
-         " VALUES (:cid, 'periodic', :tier, :due)" if not db._is_pg else
-         "INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at)"
-         " VALUES (:cid, 'periodic', :tier, :due) ON CONFLICT DO NOTHING"),
+        "INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at)"
+         " VALUES (:cid, 'periodic', :tier, :due) ON CONFLICT DO NOTHING",
         {"cid": customer_id, "tier": tier, "due": due_iso},
     )
 
@@ -347,9 +350,7 @@ def _schedule_address_review(db: Database, customer_id: str, tier: str,
     now = datetime.now(timezone.utc)
     due = (now.date() + timedelta(days=ADDRESS_REVIEW_DEADLINE_DAYS)).isoformat()
     db.execute(
-        ("INSERT OR IGNORE INTO kyc_review_schedule (customer_id, review_type, tier, due_at,"
-         " reason) VALUES (:cid, 'triggered', :tier, :due, :reason)" if not db._is_pg else
-         "INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at, reason)"
+        ("INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at, reason)"
          " VALUES (:cid, 'triggered', :tier, :due, :reason) ON CONFLICT DO NOTHING"),
         {"cid": customer_id, "tier": tier, "due": due,
          "reason": "address_reverification: " + "; ".join(reasons)},
@@ -700,7 +701,7 @@ def create_app() -> FastAPI:
             "decision": row["decision"],
             "risk_score": row["risk_score"],
             "risk_level": row["risk_level"],
-            "verification_results": json.loads(row["results_json"]),
+            "verification_results": _json_value(row["results_json"]),
             "address_verification": address_verification,
             "timestamp": str(row.get("updated_at") or ""),
         }
@@ -800,9 +801,7 @@ def create_app() -> FastAPI:
              "reason": payload.reason, "deadline": deadline, "now": now},
         )
         db.execute(
-            ("INSERT OR IGNORE INTO kyc_review_schedule (customer_id, review_type, tier, due_at,"
-             " reason) VALUES (:cid, 'rekyc', :tier, :due, :reason)" if not db._is_pg else
-             "INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at, reason)"
+            ("INSERT INTO kyc_review_schedule (customer_id, review_type, tier, due_at, reason)"
              " VALUES (:cid, 'rekyc', :tier, :due, :reason) ON CONFLICT DO NOTHING"),
             {"cid": customer_id, "tier": original["tier"], "due": deadline,
              "reason": payload.reason},

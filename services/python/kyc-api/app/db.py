@@ -1,200 +1,22 @@
-"""Storage layer for the KYC API.
+"""Storage layer for the KYC API — PostgreSQL only.
 
-PostgreSQL (via psycopg) when DATABASE_URL=postgres(ql)://... is configured;
-otherwise a local SQLite file (KYC_DB_PATH, default ./data/kyc.db) for local
-dev/tests.
+DATABASE_URL must point at PostgreSQL (psycopg). Canonical schema:
+database/20260827_pep_kyb_merchant.sql and follow-up migrations. This layer
+assumes the migrations have been applied and fails fast otherwise. Tests
+boot a real embedded PostgreSQL (pgserver) via
+services/python/integration/embedded_pg.py.
 
-The canonical PostgreSQL schema for pep_list/watchlist lives in
-database/20260827_pep_kyb_merchant.sql; SQLITE_SCHEMA below is the
-SQLite-compatible mirror plus the service-local kyc_requests table.
-
-Queries use :name bind parameters (SQLite native); for PostgreSQL they are
-rewritten to %(name)s for psycopg.
+Queries use :name bind parameters, rewritten to %(name)s for psycopg.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import sqlite3
 import threading
-from pathlib import Path
 from typing import Any
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DEFAULT_SQLITE_PATH = os.getenv(
-    "KYC_DB_PATH",
-    str(Path(__file__).resolve().parent.parent / "data" / "kyc.db"),
-)
-
-SQLITE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS kyc_requests (
-    id           TEXT PRIMARY KEY,
-    customer_id  TEXT NOT NULL,
-    level        TEXT NOT NULL CHECK (level IN ('basic', 'enhanced', 'premium')),
-    tier         TEXT NOT NULL CHECK (tier IN ('tier_1', 'tier_2', 'tier_3')),
-    status       TEXT NOT NULL DEFAULT 'received'
-                 CHECK (status IN ('received', 'screening', 'completed')),
-    decision     TEXT NOT NULL DEFAULT 'pending'
-                 CHECK (decision IN ('pending', 'approved', 'manual_review', 'rejected')),
-    risk_score   REAL NOT NULL DEFAULT 0,
-    risk_level   TEXT NOT NULL DEFAULT 'low',
-    results_json TEXT NOT NULL DEFAULT '{}',
-    actor_sub    TEXT NOT NULL DEFAULT '',
-    tenant_id    TEXT NOT NULL DEFAULT 'default',
-    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-CREATE INDEX IF NOT EXISTS kyc_requests_customer_idx ON kyc_requests (customer_id);
-
--- Local PEP list (canonical Postgres version + seed rules in
--- database/20260827_pep_kyb_merchant.sql). Screening matches against this
--- table; it is refreshed by compliance batch jobs, never by this service.
-CREATE TABLE IF NOT EXISTS pep_list (
-    id           TEXT PRIMARY KEY,
-    full_name    TEXT NOT NULL,
-    date_of_birth TEXT,
-    nationality  TEXT,
-    position     TEXT NOT NULL DEFAULT '',
-    source       TEXT NOT NULL DEFAULT 'seed',
-    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Local sanctions watchlist cache (mirrors the JSON seed in data/watchlist.json
--- when imported; the canonical store is the `watchlist` Postgres table).
-CREATE TABLE IF NOT EXISTS watchlist (
-    id           TEXT PRIMARY KEY,
-    full_name    TEXT NOT NULL,
-    date_of_birth TEXT,
-    nationality  TEXT,
-    program      TEXT NOT NULL DEFAULT '',
-    source       TEXT NOT NULL DEFAULT 'local',
-    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Re-KYC / periodic review scheduling (canonical PG: database/20260901_python_services_caveats.sql)
-CREATE TABLE IF NOT EXISTS kyc_review_schedule (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id        TEXT NOT NULL DEFAULT 'default',
-    customer_id      TEXT NOT NULL,
-    review_type      TEXT NOT NULL DEFAULT 'periodic'
-                     CHECK (review_type IN ('periodic', 'rekyc', 'triggered')),
-    tier             TEXT,
-    due_at           TEXT NOT NULL,
-    status           TEXT NOT NULL DEFAULT 'pending'
-                     CHECK (status IN ('pending', 'in_progress', 'completed', 'overdue')),
-    reason           TEXT,
-    last_reviewed_at TEXT,
-    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, customer_id, review_type, due_at)
-);
-
--- Appeals against KYC decisions; independence rule (decider != original
--- reviewer) is enforced in app/main.py and by the PG trigger
--- kyc_appeals_independence_guard in the canonical schema.
-CREATE TABLE IF NOT EXISTS kyc_appeals (
-    id                 TEXT PRIMARY KEY,
-    tenant_id          TEXT NOT NULL DEFAULT 'default',
-    customer_id        TEXT NOT NULL,
-    kyc_request_id     TEXT,
-    grounds            TEXT NOT NULL,
-    submitted_by       TEXT NOT NULL,
-    original_reviewer  TEXT,
-    assigned_reviewer  TEXT,
-    status             TEXT NOT NULL DEFAULT 'pending'
-                       CHECK (status IN ('pending', 'under_review', 'upheld', 'overturned', 'dismissed')),
-    decision_reason    TEXT,
-    decided_by         TEXT,
-    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Counterparty verification-rigor registry (canonical PG:
--- database/20260928_kyc_rigor_agents.sql). Admin-managed; lookup fails
--- closed to 'unknown' for institutions with no entry.
-CREATE TABLE IF NOT EXISTS counterparty_rigor_registry (
-    institution_code TEXT PRIMARY KEY,
-    institution_name TEXT NOT NULL,
-    rigor_level      TEXT NOT NULL
-                     CHECK (rigor_level IN ('cbn_full_biometric', 'cbn_basic',
-                                            'unverified', 'unknown')),
-    source_note      TEXT NOT NULL DEFAULT '',
-    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Document-verification audit trail (canonical PG:
--- database/20260929_doc_verification.sql). HASH-ONLY: the raw document bytes
--- are never persisted — sha256 + verdict + per-layer provenance only.
-CREATE TABLE IF NOT EXISTS document_verifications (
-    id                       TEXT PRIMARY KEY,
-    actor_sub                TEXT NOT NULL DEFAULT '',
-    document_type            TEXT NOT NULL,
-    detected_format          TEXT NOT NULL,
-    sha256                   TEXT NOT NULL,
-    size_bytes               INTEGER NOT NULL,
-    status                   TEXT NOT NULL
-                             CHECK (status IN ('verified', 'manual_review',
-                                               'rejected', 'unavailable')),
-    quality                  TEXT,
-    screen_replay_integrity  REAL,
-    printed_cutout_integrity REAL,
-    provenance_json          TEXT NOT NULL DEFAULT '[]',
-    reasons_json             TEXT NOT NULL DEFAULT '[]',
-    created_at               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-CREATE INDEX IF NOT EXISTS document_verifications_sha_idx
-    ON document_verifications (sha256);
-
--- Single-use liveness challenges (canonical PG:
--- database/20261029_liveness_challenge_single_use.sql). Issued challenges
--- are recorded at POST /biometric/liveness/challenge and atomically
--- consumed (consumed_at IS NULL -> set) at verify-frames; a replayed or
--- unknown challenge_id gets 409. consumed_at IS NULL distinguishes spent
--- from unspent.
-CREATE TABLE IF NOT EXISTS liveness_challenges (
-    challenge_id TEXT PRIMARY KEY,
-    actor_sub    TEXT NOT NULL DEFAULT '',
-    phases       TEXT NOT NULL,
-    expires_at   INTEGER NOT NULL,
-    consumed_at  TEXT,
-    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-CREATE INDEX IF NOT EXISTS liveness_challenges_exp_idx
-    ON liveness_challenges (expires_at);
-
--- Idempotency keys for mutating verify endpoints (canonical PG:
--- database/20260930_kyc_idempotency.sql). First-wins response replay:
--- (tenant_id, key) stores the request hash + full response payload; a
--- repeated key with the same payload replays, with a different payload
--- conflicts (409). Rows older than 24h are treated as expired.
-CREATE TABLE IF NOT EXISTS kyc_idempotency_keys (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    key              TEXT NOT NULL,
-    tenant_id        TEXT NOT NULL DEFAULT 'default',
-    request_hash     TEXT NOT NULL CHECK (length(request_hash) = 64),
-    response_payload TEXT NOT NULL,
-    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, key)
-);
-"""
-
-# Columns added to kyc_requests for re-KYC + backoffice override (fresh DBs
-# get them from ALTERs below; the canonical PG table has them built in).
-KYC_REQUESTS_EXTRA_COLUMNS = {
-    "rekyc_of": "TEXT",
-    "rekyc_reason": "TEXT",
-    "rekyc_deadline": "TEXT",
-    "override_by": "TEXT",
-    "override_reason": "TEXT",
-    "override_at": "TEXT",
-    # Address-verification evidence (canonical PG columns added by
-    # database/20260928_kyc_rigor_agents.sql).
-    "address_verification_method": "TEXT",
-    "address_verified_at": "TEXT",
-    # Tenant owning the request (API-key data-plane principals; canonical PG
-    # column added by database/20260930_kyc_idempotency.sql).
-    "tenant_id": "TEXT NOT NULL DEFAULT 'default'",
-}
 
 # Demo seed so local/dev screening exercises a real match path. Production
 # rows are loaded by compliance batch jobs into the Postgres tables.
@@ -212,56 +34,36 @@ def _to_pg(query: str) -> str:
 
 class Database:
     """Minimal synchronous DB helper (FastAPI runs sync endpoints in a
-    threadpool; a lock serializes SQLite access)."""
+    threadpool)."""
 
-    def __init__(self, database_url: str = DATABASE_URL, sqlite_path: str = DEFAULT_SQLITE_PATH):
-        self._lock = threading.Lock()
-        self._is_pg = database_url.startswith(("postgres://", "postgresql://"))
-
-        # Postgres is the source of record. In production deployments
-        # (FRAUDFUSION_REQUIRE_POSTGRES=1) the SQLite fallback is a
-        # boot-time error, never a silent downgrade.
-        if (not self._is_pg and os.getenv("FRAUDFUSION_REQUIRE_POSTGRES", "")
-                .strip().lower() in ("1", "true", "yes")):
+    def __init__(self, database_url: str = DATABASE_URL):
+        if not database_url.startswith(("postgres://", "postgresql://")):
             raise RuntimeError(
-                "FRAUDFUSION_REQUIRE_POSTGRES is set: the SQLite fallback is "
-                "disabled — PostgreSQL is the source of record. Set "
-                "DATABASE_URL=postgresql://... before starting this service.")
-        if self._is_pg:
-            import psycopg
-            from psycopg.rows import dict_row
+                "PostgreSQL is required: set DATABASE_URL=postgresql://... — "
+                "this service has no SQLite fallback.")
+        import psycopg
+        from psycopg.rows import dict_row
 
-            self._psycopg = psycopg
-            self._dict_row = dict_row
-            self._dsn = database_url
-            self._conn = None
-        else:
-            Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(sqlite_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA foreign_keys = ON")
-            with self._lock, self._conn:
-                self._conn.executescript(SQLITE_SCHEMA)
-                self._migrate_sqlite()
-                self._seed_pep()
-
-    def _migrate_sqlite(self) -> None:
-        """Idempotent column adds for pre-existing SQLite dev databases."""
-        existing = {row["name"] for row in
-                    self._conn.execute("PRAGMA table_info(kyc_requests)").fetchall()}
-        for col, ddl in KYC_REQUESTS_EXTRA_COLUMNS.items():
-            if col not in existing:
-                self._conn.execute(f"ALTER TABLE kyc_requests ADD COLUMN {col} {ddl}")
+        self._lock = threading.Lock()
+        self._psycopg = psycopg
+        self._dict_row = dict_row
+        self._dsn = database_url
+        self._is_pg = True
+        self._seed_pep()
 
     def _seed_pep(self) -> None:
-        count = self._conn.execute("SELECT COUNT(*) AS c FROM pep_list").fetchone()["c"]
+        """Idempotent demo PEP seed — historically only the removed SQLite branch did
+        this, leaving production pep_list empty. Seeding here keeps embedded
+        and production Postgres identical."""
+        count = self.query_one("SELECT COUNT(*) AS c FROM pep_list")["c"]
         if count:
             return
         for row in PEP_SEED:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO pep_list (id, full_name, date_of_birth, nationality, position, source)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                row,
+            self.execute(
+                "INSERT INTO pep_list (id, full_name, date_of_birth, nationality, position, source)"
+                " VALUES (:id, :name, :dob, :nat, :pos, :src) ON CONFLICT (id) DO NOTHING",
+                {"id": row[0], "name": row[1], "dob": row[2], "nat": row[3],
+                 "pos": row[4], "src": row[5]},
             )
 
     def _pg_conn(self):
@@ -269,23 +71,17 @@ class Database:
 
     def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         params = params or {}
-        if self._is_pg:
-            with self._pg_conn() as conn:
-                rows = conn.execute(_to_pg(sql), params).fetchall()
-            return [dict(r) for r in rows]
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+        with self._pg_conn() as conn:
+            rows = conn.execute(_to_pg(sql), params).fetchall()
         return [dict(r) for r in rows]
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> int:
+        """Run a write statement; returns affected row count."""
         params = params or {}
-        if self._is_pg:
-            with self._pg_conn() as conn:
-                count = conn.execute(_to_pg(sql), params).rowcount
-                conn.commit()
-            return count
-        with self._lock, self._conn:
-            return self._conn.execute(sql, params).rowcount
+        with self._pg_conn() as conn:
+            count = conn.execute(_to_pg(sql), params).rowcount
+            conn.commit()
+        return count
 
     def query_one(self, sql: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
         rows = self.query(sql, params)
@@ -305,3 +101,4 @@ def get_db() -> Database:
 def reset_db_for_tests(db: Database | None) -> None:
     global _db
     _db = db
+

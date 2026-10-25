@@ -10,6 +10,11 @@ import json
 import sys
 from pathlib import Path
 
+def _details_json(raw):
+    """details column: JSONB arrives as dict via psycopg, TEXT as str."""
+    return raw if isinstance(raw, dict) else json.loads(raw)
+
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -18,11 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import main as svc  # noqa: E402
 from cross_reference import enrollment_agent_rollup  # noqa: E402
 from identity_store import IdentityStore, reset_store_for_tests  # noqa: E402
+from embedded_pg import clone_migrated
 
 
 @pytest.fixture()
 def store(tmp_path):
-    s = IdentityStore(database_url="", sqlite_path=str(tmp_path / "id.db"))
+    s = IdentityStore(database_url=clone_migrated("identity"))
     yield s
     reset_store_for_tests(None)
 
@@ -157,11 +163,11 @@ class TestExposureImport:
             "SELECT * FROM identity_theft_alerts WHERE alert_type = 'exposure_detected'")
         assert {a["user_id"] for a in alerts} == {"cust-syn-1", "cust-syn-2"}
         assert all(a["risk_level"] == "medium" for a in alerts)  # phone sensitivity
-        details = json.loads(alerts[0]["details"])
+        details = _details_json(alerts[0]["details"])
         assert details["breach_ref"] == "EFCC-2026-0917"
         assert details["identifier_type"] == "phone"
         # hash-only evidence: no plaintext identifier persisted anywhere new
-        assert "+2348012345678" not in alerts[0]["details"]
+        assert "+2348012345678" not in json.dumps(alerts[0]["details"])
         assert details["identifier_hash"] == hashlib.sha256(b"+2348012345678").hexdigest()
 
     def test_bvn_indicator_is_high_severity_and_matched_via_registry(self, store):
@@ -175,10 +181,10 @@ class TestExposureImport:
             "SELECT * FROM identity_theft_alerts WHERE alert_type = 'exposure_detected'"
             " AND user_id = 'cust-real-1'")
         assert alert["risk_level"] == "high"  # bvn is high-sensitivity
-        details = json.loads(alert["details"])
+        details = _details_json(alert["details"])
         assert details["identifier_type"] == "bvn"
         assert details["registry_status"] == "found"
-        assert "22345678901" not in alert["details"]
+        assert "22345678901" not in json.dumps(alert["details"])
 
     def test_reimport_is_idempotent_no_duplicate_alerts(self, store):
         client = make_client(store, ADMIN_CLAIMS)

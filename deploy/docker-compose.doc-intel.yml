@@ -40,7 +40,6 @@ services:
     environment:
       # Postgres is the source of record (Round 15 posture).
       DATABASE_URL: postgresql://fraudfusion:CHANGE_ME@postgres:5432/fraudfusion
-      FRAUDFUSION_REQUIRE_POSTGRES: "1"
       # Round 16 backends:
       OLLAMA_URL: http://ollama:11434
       OLLAMA_VISION_MODEL: qwen2.5vl:7b

@@ -39,7 +39,6 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -110,33 +109,9 @@ def score_factors(factors: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Data store — SQLite dev/test; canonical PG migration for production
-# (database/20261028_document_intelligence.sql)
+# Data store — PostgreSQL only; canonical migration
+# database/20261028_document_intelligence.sql
 # ---------------------------------------------------------------------------
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS doc_registry (
-    doc_hash TEXT PRIMARY KEY,
-    tenant_id TEXT NOT NULL,
-    doc_type TEXT,
-    dhash TEXT,
-    phash TEXT,
-    status TEXT NOT NULL DEFAULT 'active',
-    revoke_reason TEXT,
-    registered_at TEXT NOT NULL,
-    revoked_at TEXT
-);
-CREATE TABLE IF NOT EXISTS doc_verification_chain (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id TEXT NOT NULL,
-    doc_hash TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    payload_hash TEXT NOT NULL,
-    prev_hash TEXT NOT NULL,
-    entry_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-"""
 
 GENESIS = "GENESIS"
 
@@ -149,60 +124,38 @@ def _to_pg(query: str) -> str:
 
 
 class DocIntelStore:
-    """Dual-driver store: PostgreSQL (via psycopg, canonical schema
-    database/20261028_document_intelligence.sql) when
-    DATABASE_URL=postgres(ql)://... is configured — the source of record —
-    otherwise a local SQLite file (DOC_INTEL_DB) for dev/test only. In
-    production (FRAUDFUSION_REQUIRE_POSTGRES=1) the SQLite fallback is a
-    boot-time error, never a silent downgrade."""
+    """PostgreSQL only (psycopg). DATABASE_URL must be set; the canonical
+    schema is database/20261028_document_intelligence.sql. Tests use
+    embedded pgserver via services/python/integration/embedded_pg.py."""
 
-    def __init__(self, database_url: str = DATABASE_URL,
-                 sqlite_path: Optional[str] = None):
-        self._is_pg = database_url.startswith(("postgres://", "postgresql://"))
-        if (not self._is_pg and os.getenv("FRAUDFUSION_REQUIRE_POSTGRES", "")
-                .strip().lower() in ("1", "true", "yes")):
+    def __init__(self, database_url: str = DATABASE_URL):
+        if not database_url.startswith(("postgres://", "postgresql://")):
             raise RuntimeError(
-                "FRAUDFUSION_REQUIRE_POSTGRES is set: the SQLite fallback is "
-                "disabled — PostgreSQL is the source of record. Set "
-                "DATABASE_URL=postgresql://... before starting this service.")
-        if self._is_pg:
-            import psycopg
-            from psycopg.rows import dict_row
-            self._psycopg = psycopg
-            self._dict_row = dict_row
-            self._dsn = database_url
-            self.conn = None
-        else:
-            path = sqlite_path or os.getenv(
-                "DOC_INTEL_DB",
-                os.path.join(os.path.dirname(__file__), "docintel.db"))
-            self.conn = sqlite3.connect(path, check_same_thread=False)
-            self.conn.row_factory = sqlite3.Row
-            self.conn.executescript(_SCHEMA)
-            self.conn.commit()
+                "PostgreSQL is required: set DATABASE_URL=postgresql://... — "
+                "document intelligence has no SQLite fallback.")
+        import psycopg
+        from psycopg.rows import dict_row
+        self._psycopg = psycopg
+        self._dict_row = dict_row
+        self._dsn = database_url
+        self._is_pg = True
 
     def _pg_conn(self):
         return self._psycopg.connect(self._dsn, row_factory=self._dict_row)
 
     def query(self, sql: str, params: dict[str, Any] = {}) -> list[dict[str, Any]]:
-        if self._is_pg:
-            with self._pg_conn() as conn:
-                rows = conn.execute(_to_pg(sql), params).fetchall()
-            return [dict(r) for r in rows]
-        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+        with self._pg_conn() as conn:
+            rows = conn.execute(_to_pg(sql), params).fetchall()
+        return [dict(r) for r in rows]
 
     def query_one(self, sql: str, params: dict[str, Any] = {}) -> Optional[dict[str, Any]]:
         rows = self.query(sql, params)
         return rows[0] if rows else None
 
     def execute(self, sql: str, params: dict[str, Any] = {}) -> None:
-        if self._is_pg:
-            with self._pg_conn() as conn:
-                conn.execute(_to_pg(sql), params)
-                conn.commit()
-            return
-        self.conn.execute(sql, params)
-        self.conn.commit()
+        with self._pg_conn() as conn:
+            conn.execute(_to_pg(sql), params)
+            conn.commit()
 
     # -- hash-chained verification log --------------------------------------
     def append_event(self, doc_hash: str, event_type: str,

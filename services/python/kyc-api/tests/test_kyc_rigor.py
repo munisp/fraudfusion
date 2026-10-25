@@ -24,6 +24,7 @@ from app.phone_tenure import (
     assess_recycled_number,
 )
 from app.tiers import address_review_required, validate_address_evidence
+from embedded_pg import clone_migrated
 
 OPERATOR = Principal(sub="kyc-ops-1", username="ops", roles={"kyc_operator"})
 ADMIN = Principal(sub="kyc-admin-1", username="adm", roles={"kyc_operator", "kyc_admin"})
@@ -40,7 +41,7 @@ def valid_bvn() -> str:
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "kyc.db"))
+    database = Database(database_url=clone_migrated("kyc"))
     yield database
     reset_db_for_tests(None)
 

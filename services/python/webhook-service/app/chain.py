@@ -11,7 +11,7 @@ Canonical entry text:
 
 Unlike backoffice_audit_ledger (BIGSERIAL id ordering), delivery ids are
 random uuids, so verification walks the prev_hash links from GENESIS
-instead of relying on physical ordering — deterministic across SQLite and
+instead of relying on physical ordering — deterministic across engines (historically SQLite and
 PostgreSQL.
 """
 
@@ -95,7 +95,7 @@ def verify_chain(db: Database, tenant_id: str = "default") -> dict[str, Any]:
     visited: set[str] = set()
 
     def _created_iso(value) -> str:
-        """Normalise driver-specific created_at (SQLite TEXT / PG timestamptz
+        """Normalise driver-specific created_at (historically SQLite TEXT / PG timestamptz
         datetime) back to the canonical 'YYYY-MM-DDTHH:MM:SS.ffffffZ'."""
         if isinstance(value, datetime):
             return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")

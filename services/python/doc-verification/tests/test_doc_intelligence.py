@@ -24,6 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "integration"))
 
 import checksums  # noqa: E402
 import cross_field  # noqa: E402
@@ -32,6 +33,7 @@ import forensics  # noqa: E402
 import metadata_forensics  # noqa: E402
 from doc_intelligence import (DocIntelStore, create_app,  # noqa: E402
                               reset_store_for_tests, score_factors)
+from embedded_pg import clone_migrated  # noqa: E402
 
 
 def _b64(img: np.ndarray, quality: int = 95) -> str:
@@ -219,7 +221,7 @@ class TestScoring:
 
 @pytest.fixture()
 def store(tmp_path):
-    s = DocIntelStore(sqlite_path=str(tmp_path / "docintel_test.db"))
+    s = DocIntelStore(database_url=clone_migrated("docintel"))
     reset_store_for_tests(s)
     yield s
     reset_store_for_tests(None)

@@ -1,4 +1,4 @@
-"""End-to-end tests for the billing service (SQLite backend, auth stubbed).
+"""End-to-end tests for the billing service (embedded PostgreSQL, auth stubbed).
 
 Control-plane auth is exercised through dependency overrides; the fail-closed
 Keycloak introspection path is shared with onboarding-service. Data-plane
@@ -18,6 +18,7 @@ from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
 from app.rating import build_invoice_draft, rate_operation, vat_kobo
+from embedded_pg import clone_migrated
 
 TENANT_USER = Principal(sub="user-1", username="ada", roles=set(), tenant_id="tenant-1")
 TENANT2_USER = Principal(sub="user-2", username="bola", roles=set(), tenant_id="tenant-2")
@@ -25,8 +26,8 @@ ADMIN = Principal(sub="staff-1", username="staff", roles={"billing_admin"})
 
 
 @pytest.fixture()
-def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "billing.db"))
+def db():
+    database = Database(database_url=clone_migrated("billing"))
     for tenant in ("tenant-1", "tenant-2"):
         database.execute(
             "INSERT INTO tenants (id, organization, contact_email, owner_sub, state) "

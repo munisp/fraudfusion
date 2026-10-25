@@ -1,135 +1,23 @@
-"""Storage layer for the identity-theft-detector.
+"""Storage layer for the identity-theft-detector — PostgreSQL only.
 
-PostgreSQL (via psycopg) when DATABASE_URL=postgres(ql)://... is configured;
-otherwise a local SQLite file (IDENTITY_DB_PATH) for local dev/tests.
-
-Canonical PostgreSQL schema: database/20260901_python_services_caveats.sql
+Canonical schema: database/20260901_python_services_caveats.sql
 (bvn_registry, nin_registry, customer_identifiers) and
 database/20260827_service_base_tables.sql (identity_theft_alerts).
-SQLITE_SCHEMA below is the SQLite-compatible mirror.
+Tests boot a real embedded PostgreSQL (pgserver) via
+services/python/integration/embedded_pg.py — no stand-in engines.
 
-Queries use :name bind parameters (SQLite native); for PostgreSQL they are
-rewritten to %(name)s for psycopg.
+Queries use :name bind parameters, rewritten to %(name)s for psycopg.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import sqlite3
 import threading
-from pathlib import Path
 from typing import Any
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DEFAULT_SQLITE_PATH = os.getenv(
-    "IDENTITY_DB_PATH",
-    str(Path(__file__).resolve().parent / "data" / "identity_theft.db"),
-)
 
-SQLITE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS bvn_registry (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id     TEXT NOT NULL DEFAULT 'default',
-    bvn           TEXT NOT NULL,
-    full_name     TEXT NOT NULL,
-    date_of_birth TEXT,
-    phone_number  TEXT,
-    email         TEXT,
-    is_synthetic  INTEGER NOT NULL DEFAULT 0,
-    provenance    TEXT NOT NULL DEFAULT 'admin-import',
-    imported_by   TEXT,
-    -- enrollment-source tracing: where/how this identifier was enrolled
-    -- (bank_branch, sim_registration_agent, nimc_fep, self_service, unknown).
-    enrollment_source   TEXT NOT NULL DEFAULT 'unknown',
-    enrollment_agent_id TEXT,
-    enrollment_channel  TEXT,
-    enrolled_at         TEXT,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, bvn)
-);
-
-CREATE TABLE IF NOT EXISTS nin_registry (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id     TEXT NOT NULL DEFAULT 'default',
-    nin           TEXT NOT NULL,
-    full_name     TEXT NOT NULL,
-    date_of_birth TEXT,
-    phone_number  TEXT,
-    email         TEXT,
-    is_synthetic  INTEGER NOT NULL DEFAULT 0,
-    provenance    TEXT NOT NULL DEFAULT 'admin-import',
-    imported_by   TEXT,
-    enrollment_source   TEXT NOT NULL DEFAULT 'unknown',
-    enrollment_agent_id TEXT,
-    enrollment_channel  TEXT,
-    enrolled_at         TEXT,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, nin)
-);
-
-CREATE TABLE IF NOT EXISTS customer_identifiers (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id   TEXT NOT NULL DEFAULT 'default',
-    customer_id TEXT NOT NULL,
-    id_type     TEXT NOT NULL CHECK (id_type IN ('phone', 'email', 'device', 'nin', 'bvn')),
-    id_value    TEXT NOT NULL,
-    enrollment_source   TEXT NOT NULL DEFAULT 'unknown',
-    enrollment_agent_id TEXT,
-    enrollment_channel  TEXT,
-    enrolled_at         TEXT,
-    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, id_type, id_value, customer_id)
-);
-
-CREATE TABLE IF NOT EXISTS identity_theft_alerts (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id  TEXT NOT NULL DEFAULT 'default',
-    alert_id   TEXT,
-    user_id    TEXT NOT NULL,
-    alert_type TEXT NOT NULL,
-    risk_level TEXT NOT NULL,
-    details    TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
--- Victim-exposure detection (lane I1): lawfully obtained breach/leak
--- indicator batches (e.g. EFCC account-supplier crackdown, telco reports).
--- NDPA posture: identifiers are stored ONLY as sha256 hashes, never plaintext.
-CREATE TABLE IF NOT EXISTS exposure_import_batches (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id     TEXT NOT NULL DEFAULT 'default',
-    batch_id      TEXT NOT NULL,
-    source_note   TEXT,
-    row_count     INTEGER NOT NULL DEFAULT 0,
-    matched_count INTEGER NOT NULL DEFAULT 0,
-    imported_by   TEXT,
-    imported_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, batch_id)
-);
-
-CREATE TABLE IF NOT EXISTS exposure_indicators (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id       TEXT NOT NULL DEFAULT 'default',
-    batch_id        TEXT NOT NULL,
-    identifier_type TEXT NOT NULL CHECK (identifier_type IN ('phone', 'email', 'device', 'nin', 'bvn')),
-    identifier_hash TEXT NOT NULL,  -- sha256 of the normalised identifier; plaintext is NEVER persisted
-    breach_ref      TEXT NOT NULL,
-    observed_at     TEXT,
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, identifier_type, identifier_hash, breach_ref)
-);
-"""
-
-# Columns added after the initial schema shipped; existing SQLite DB files get
-# them via guarded ALTERs (CREATE TABLE IF NOT EXISTS does not upgrade them).
-_ENROLLMENT_COLUMNS = (
-    ("enrollment_source", "TEXT NOT NULL DEFAULT 'unknown'"),
-    ("enrollment_agent_id", "TEXT"),
-    ("enrollment_channel", "TEXT"),
-    ("enrolled_at", "TEXT"),
-)
-_ENROLLMENT_TABLES = ("bvn_registry", "nin_registry", "customer_identifiers")
 
 _NAMED_PARAM = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")
 
@@ -139,48 +27,23 @@ def _to_pg(query: str) -> str:
 
 
 class IdentityStore:
-    """Minimal synchronous DB helper (dual SQLite/PostgreSQL driver)."""
+    """Minimal synchronous DB helper (PostgreSQL only)."""
 
-    def __init__(self, database_url: str = DATABASE_URL, sqlite_path: str = DEFAULT_SQLITE_PATH,
-                 seed: bool = True):
-        self._lock = threading.Lock()
-        self._is_pg = database_url.startswith(("postgres://", "postgresql://"))
-
-        # Postgres is the source of record. In production deployments
-        # (FRAUDFUSION_REQUIRE_POSTGRES=1) the SQLite fallback is a
-        # boot-time error, never a silent downgrade.
-        if (not self._is_pg and os.getenv("FRAUDFUSION_REQUIRE_POSTGRES", "")
-                .strip().lower() in ("1", "true", "yes")):
+    def __init__(self, database_url: str = DATABASE_URL, seed: bool = True):
+        if not database_url.startswith(("postgres://", "postgresql://")):
             raise RuntimeError(
-                "FRAUDFUSION_REQUIRE_POSTGRES is set: the SQLite fallback is "
-                "disabled — PostgreSQL is the source of record. Set "
-                "DATABASE_URL=postgresql://... before starting this service.")
-        if self._is_pg:
-            import psycopg
-            from psycopg.rows import dict_row
+                "PostgreSQL is required: set DATABASE_URL=postgresql://... — "
+                "the identity store has no SQLite fallback.")
+        import psycopg
+        from psycopg.rows import dict_row
 
-            self._psycopg = psycopg
-            self._dict_row = dict_row
-            self._dsn = database_url
-            self._conn = None
-        else:
-            Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(sqlite_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            with self._lock, self._conn:
-                self._conn.executescript(SQLITE_SCHEMA)
-                self._upgrade_sqlite_schema()
-                if seed:
-                    self._seed_synthetic()
-
-    def _upgrade_sqlite_schema(self) -> None:
-        """Backward-compatible column upgrades for pre-existing SQLite files
-        (CREATE TABLE IF NOT EXISTS never alters an existing table)."""
-        for table in _ENROLLMENT_TABLES:
-            existing = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")}
-            for col, ddl in _ENROLLMENT_COLUMNS:
-                if col not in existing:
-                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+        self._lock = threading.Lock()
+        self._psycopg = psycopg
+        self._dict_row = dict_row
+        self._dsn = database_url
+        self._is_pg = True
+        if seed:
+            self._seed_synthetic()
 
     def _seed_synthetic(self) -> None:
         """Clearly-marked SYNTHETIC rows so dev/tests exercise real match
@@ -203,22 +66,24 @@ class IdentityStore:
             ("cust-syn-3", "email", "bola.syn@example.test"),
         ]
         for bvn, name, dob, phone, email in bvn_seed:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO bvn_registry (bvn, full_name, date_of_birth, phone_number, email,"
-                " is_synthetic, provenance) VALUES (?, ?, ?, ?, ?, 1, 'seed-synthetic')",
-                (bvn, name, dob, phone, email),
+            self.execute(
+                "INSERT INTO bvn_registry (bvn, full_name, date_of_birth, phone_number, email,"
+                " is_synthetic, provenance) VALUES (:v, :n, :d, :p, :e, TRUE, 'seed-synthetic')"
+                " ON CONFLICT DO NOTHING",
+                {"v": bvn, "n": name, "d": dob, "p": phone, "e": email},
             )
         for nin, name, dob, phone, email in nin_seed:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO nin_registry (nin, full_name, date_of_birth, phone_number, email,"
-                " is_synthetic, provenance) VALUES (?, ?, ?, ?, ?, 1, 'seed-synthetic')",
-                (nin, name, dob, phone, email),
+            self.execute(
+                "INSERT INTO nin_registry (nin, full_name, date_of_birth, phone_number, email,"
+                " is_synthetic, provenance) VALUES (:v, :n, :d, :p, :e, TRUE, 'seed-synthetic')"
+                " ON CONFLICT DO NOTHING",
+                {"v": nin, "n": name, "d": dob, "p": phone, "e": email},
             )
         for cid, typ, val in ident_seed:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO customer_identifiers (customer_id, id_type, id_value)"
-                " VALUES (?, ?, ?)",
-                (cid, typ, val),
+            self.execute(
+                "INSERT INTO customer_identifiers (customer_id, id_type, id_value)"
+                " VALUES (:c, :t, :v) ON CONFLICT DO NOTHING",
+                {"c": cid, "t": typ, "v": val},
             )
 
     def _pg_conn(self):
@@ -226,23 +91,16 @@ class IdentityStore:
 
     def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         params = params or {}
-        if self._is_pg:
-            with self._pg_conn() as conn:
-                rows = conn.execute(_to_pg(sql), params).fetchall()
-            return [dict(r) for r in rows]
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+        with self._pg_conn() as conn:
+            rows = conn.execute(_to_pg(sql), params).fetchall()
         return [dict(r) for r in rows]
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> int:
         params = params or {}
-        if self._is_pg:
-            with self._pg_conn() as conn:
-                count = conn.execute(_to_pg(sql), params).rowcount
-                conn.commit()
-            return count
-        with self._lock, self._conn:
-            return self._conn.execute(sql, params).rowcount
+        with self._pg_conn() as conn:
+            count = conn.execute(_to_pg(sql), params).rowcount
+            conn.commit()
+        return count
 
     def query_one(self, sql: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
         rows = self.query(sql, params)
@@ -252,16 +110,9 @@ class IdentityStore:
 
     def alert_matches_identifier(self, tenant_id: str, field: str, value: str) -> list[dict[str, Any]]:
         """Find identity_theft_alerts whose details JSON carries this identifier."""
-        if self._is_pg:
-            return self.query(
-                "SELECT id, alert_id, user_id, alert_type, risk_level, created_at"
-                " FROM identity_theft_alerts WHERE tenant_id = :t AND details ->> :f = :v",
-                {"t": tenant_id, "f": field, "v": value},
-            )
         return self.query(
             "SELECT id, alert_id, user_id, alert_type, risk_level, created_at"
-            " FROM identity_theft_alerts WHERE tenant_id = :t"
-            " AND json_extract(details, '$.' || :f) = :v",
+            " FROM identity_theft_alerts WHERE tenant_id = :t AND details ->> :f = :v",
             {"t": tenant_id, "f": field, "v": value},
         )
 
@@ -269,21 +120,12 @@ class IdentityStore:
                               identifier_hash: str, breach_ref: str) -> bool:
         """Dedupe key for exposure alerts: customer + identifier + breach_ref
         (the identifier itself is only ever compared as a sha256 hash)."""
-        if self._is_pg:
-            row = self.query_one(
-                "SELECT id FROM identity_theft_alerts WHERE tenant_id = :t"
-                " AND user_id = :u AND alert_type = 'exposure_detected'"
-                " AND details ->> 'identifier_hash' = :h AND details ->> 'breach_ref' = :b LIMIT 1",
-                {"t": tenant_id, "u": user_id, "h": identifier_hash, "b": breach_ref},
-            )
-        else:
-            row = self.query_one(
-                "SELECT id FROM identity_theft_alerts WHERE tenant_id = :t"
-                " AND user_id = :u AND alert_type = 'exposure_detected'"
-                " AND json_extract(details, '$.identifier_hash') = :h"
-                " AND json_extract(details, '$.breach_ref') = :b LIMIT 1",
-                {"t": tenant_id, "u": user_id, "h": identifier_hash, "b": breach_ref},
-            )
+        row = self.query_one(
+            "SELECT id FROM identity_theft_alerts WHERE tenant_id = :t"
+            " AND user_id = :u AND alert_type = 'exposure_detected'"
+            " AND details ->> 'identifier_hash' = :h AND details ->> 'breach_ref' = :b LIMIT 1",
+            {"t": tenant_id, "u": user_id, "h": identifier_hash, "b": breach_ref},
+        )
         return row is not None
 
     def enrollments_for_identifier(self, tenant_id: str, id_type: str,

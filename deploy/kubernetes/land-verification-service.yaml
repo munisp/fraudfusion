@@ -1,6 +1,6 @@
 # land-verification-service — landlord/property document verification
 # (FastAPI, port 8002). Requires Keycloak bearer auth; persists to Postgres
-# when DATABASE_URL is set, otherwise a local SQLite file (emptyDir here).
+# via DATABASE_URL — Postgres-only, no SQLite fallback.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

@@ -44,8 +44,10 @@ jobs:
           python-version: '3.12'
           cache: pip
       - name: Install pytest
-        run: pip install pytest
+        run: pip install pytest pgserver psycopg[binary]
       - name: pytest over services/python/*/tests
+        env:
+          XDG_RUNTIME_DIR: /tmp/xdg  # embedded PostgreSQL (pgserver) runtime dir
         run: |
           set -euo pipefail
           for d in services/python/*/; do
@@ -55,6 +57,15 @@ jobs:
             echo "== pytest $d"
             (cd "$d" && python -m pytest tests/ -q)
           done
+      - name: land-verification-service tests (embedded PostgreSQL)
+        env:
+          XDG_RUNTIME_DIR: /tmp/xdg
+        run: |
+          set -euo pipefail
+          pip install -r services/land-verification-service/requirements.txt
+          [ -f services/land-verification-service/requirements-dev.txt ] && \
+            pip install -r services/land-verification-service/requirements-dev.txt || true
+          cd services/land-verification-service && python -m pytest tests/ -q
       - name: ml tests
         run: |
           set -euo pipefail

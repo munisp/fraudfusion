@@ -26,11 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from api import events  # noqa: E402
 from api.data_store import LandDataStore, reset_land_store_for_tests  # noqa: E402
 from api.main import create_app  # noqa: E402
+from embedded_pg import clone_migrated, fresh_database
 
 
 @pytest.fixture()
 def store(tmp_path):
-    s = LandDataStore(sqlite_path=str(tmp_path / "land_wh.db"), seed=False)
+    s = LandDataStore(database_url=clone_migrated("land"), seed=False)
     reset_land_store_for_tests(s)
     yield s
     reset_land_store_for_tests(None)

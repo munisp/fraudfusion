@@ -38,6 +38,7 @@ from api.data_store import LandDataStore, reset_land_store_for_tests  # noqa: E4
 from api.deed_conformance import check_deed_conformance  # noqa: E402
 from api.evidence import verify_chain  # noqa: E402
 from api.main import create_app  # noqa: E402
+from embedded_pg import clone_migrated, fresh_database
 
 GOOD_DEED = """
 DEED OF ASSIGNMENT made this 10th day of March, 2026.
@@ -64,7 +65,7 @@ In the presence of: Barrister T. Adeyemi (witness)
 
 @pytest.fixture()
 def store(tmp_path):
-    s = LandDataStore(sqlite_path=str(tmp_path / "land_test.db"), seed=False)
+    s = LandDataStore(database_url=clone_migrated("land"), seed=False)
     reset_land_store_for_tests(s)
     yield s
     reset_land_store_for_tests(None)

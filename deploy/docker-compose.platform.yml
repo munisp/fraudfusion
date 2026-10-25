@@ -6,7 +6,7 @@
 # for service-to-service internal endpoints; KYC_API_KEY for scope-gated
 # kyc-api calls from peers (issue a service key via onboarding-service).
 #
-# Postgres is the source of record (FRAUDFUSION_REQUIRE_POSTGRES=1).
+# Postgres is the only database — services fail fast without DATABASE_URL.
 # Optional AI sidecars (ollama + doc-intel) live in docker-compose.doc-intel.yml.
 
 services:
@@ -45,7 +45,6 @@ services:
     build: ../services/python/intel-service
     environment: &common
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/fraudfusion
-      FRAUDFUSION_REQUIRE_POSTGRES: "1"
       KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080}
       # Local-dev only: the compose Keycloak is plain HTTP. Never set in prod.
       KEYCLOAK_INSECURE_HTTP: ${KEYCLOAK_INSECURE_HTTP:-true}

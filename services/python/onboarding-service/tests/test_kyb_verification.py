@@ -20,6 +20,7 @@ from app import kyb_verification
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 TENANT = Principal(sub="user-tenant-1", username="ada", roles=set())
 TENANT2 = Principal(sub="user-tenant-2", username="bola", roles=set())
@@ -32,7 +33,7 @@ CAC = "RC1234567"
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "onboarding.db"))
+    database = Database(database_url=clone_migrated("onboarding"))
     yield database
     reset_db_for_tests(None)
 
@@ -168,7 +169,8 @@ class TestContentIntake:
         assert resp.status_code == 201, resp.text
         row = db.query_one("SELECT documents FROM kyb_applications")
         import json as _json
-        stored = _json.loads(row["documents"])
+        stored = row["documents"]
+        stored = stored if isinstance(stored, list) else _json.loads(stored)
         assert stored[0]["content_sha256"]
         assert "content" not in stored[0]
 

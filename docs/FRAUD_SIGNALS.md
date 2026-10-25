@@ -73,8 +73,9 @@ moves the caller's own score or verdict.
 
 `deploy/docker-compose.platform.yml` includes `fraud-signals` on :8900 with
 `FRAUD_SIGNALS_URL` in the shared env anchor. Postgres is the source of
-record (`FRAUDFUSION_REQUIRE_POSTGRES=1`); SQLite only for dev/tests.
-Schema: `database/20261030_fraud_signals.sql` (also self-applied at boot).
+record — the platform has no SQLite fallback (tests boot a real embedded
+PostgreSQL via pgserver). Schema: `database/20261030_fraud_signals.sql`
+(also self-applied at boot).
 
 ## Shadow mode & backtesting (accuracy measurement)
 

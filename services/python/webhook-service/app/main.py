@@ -19,7 +19,7 @@ Tenant scoping: staff callers operate on one tenant at a time, selected by
 the X-Tenant-Id header (default "default") — same convention as the
 tenant_id="default" handling in identity-theft-detector.
 
-Schema: database/20260930_webhooks.sql (PostgreSQL; SQLite mirror in
+Schema: database/20260930_webhooks.sql (PostgreSQL only — no SQLite mirror;
 app/db.py for local dev/tests).
 """
 
@@ -304,20 +304,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=413, detail="event payload too large")
 
         received_at = chain.utc_now_iso()
-        if db._is_pg:
-            inserted = db.execute(
-                "INSERT INTO webhook_events (id, type, tenant_id, payload, received_at)"
-                " VALUES (:id, :ty, :t, :p, :r) ON CONFLICT (id) DO NOTHING",
-                {"id": event_id, "ty": event_type, "t": tenant_id, "p": payload,
-                 "r": received_at},
-            )
-        else:
-            inserted = db.execute(
-                "INSERT OR IGNORE INTO webhook_events (id, type, tenant_id, payload,"
-                " received_at) VALUES (:id, :ty, :t, :p, :r)",
-                {"id": event_id, "ty": event_type, "t": tenant_id, "p": payload,
-                 "r": received_at},
-            )
+        inserted = db.execute(
+            "INSERT INTO webhook_events (id, type, tenant_id, payload, received_at)"
+            " VALUES (:id, :ty, :t, :p, :r) ON CONFLICT (id) DO NOTHING",
+            {"id": event_id, "ty": event_type, "t": tenant_id, "p": payload,
+             "r": received_at},
+        )
         if not inserted:
             logger.info("duplicate event id=%s; no fan-out", event_id)
             return {"status": "duplicate", "event_id": event_id, "deliveries": 0}

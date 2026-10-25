@@ -13,8 +13,8 @@
 -- artifact across customers) plus metadata. Extracted PII fields are
 -- returned to the caller but not persisted here.
 --
--- The SQLite mirror for local dev/tests lives in
--- services/python/kyc-api/app/db.py (SQLITE_SCHEMA).
+-- The former SQLite mirror in kyc-api/app/db.py was removed in Round 27
+-- (Postgres-only platform).
 --
 -- Fresh-DB-safe and idempotent: to_regclass-guarded DO block, matching
 -- 20260902_cultural_intelligence.sql / 20260928_kyc_rigor_agents.sql style.

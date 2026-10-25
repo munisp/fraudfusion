@@ -172,13 +172,13 @@ class UsageBuffer:
             # the event is recorded for audit with amount_kobo=0 but is NOT
             # folded into the billable usage_rollups.
             if inserted and event.get("environment") != "test":
-                # Same upsert works on Postgres and SQLite: unqualified
-                # `units` on the RHS refers to the existing row's value.
+                # Postgres upsert: EXCLUDED is the incoming row, the qualified
+                # table name is the existing row.
                 self._db.execute(
                     "INSERT INTO usage_rollups (tenant_id, period, operation, units, updated_at) "
                     "VALUES (:tenant_id, :period, :operation, :units, :now) "
                     "ON CONFLICT (tenant_id, period, operation) DO UPDATE SET "
-                    "units = units + :units, updated_at = :now",
+                    "units = usage_rollups.units + EXCLUDED.units, updated_at = :now",
                     {
                         "tenant_id": event["tenant_id"],
                         "period": event["occurred_at"][:7],

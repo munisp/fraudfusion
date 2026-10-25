@@ -46,6 +46,11 @@ from api.title_chain import analyze_title_chain
 
 router = APIRouter()
 
+
+def _iso(value: Any) -> Any:
+    """JSON-safe timestamp: Postgres returns datetime, strings pass through."""
+    return value.isoformat() if isinstance(value, datetime) else value
+
 DISPUTE_SLA_DAYS = int(os.getenv("LAND_DISPUTE_SLA_DAYS", "90"))
 NOTICE_PERIOD_DAYS = int(os.getenv("LAND_NOTICE_PERIOD_DAYS", "21"))
 VELOCITY_DAYS = int(os.getenv("LAND_SELLER_VELOCITY_DAYS", "30"))
@@ -180,12 +185,12 @@ def register_parcel(payload: ParcelRegisterInput,
                               {"conflict_key": f"parcel_ref:{ref}", "reason": "duplicate_ref"})
         events.emit_event("parcel.conflict.detected", "default",
                           {"parcel_ref": ref, "conflict_key": f"parcel_ref:{ref}",
-                           "existing_registered_at": existing["created_at"]})
+                           "existing_registered_at": _iso(existing["created_at"])})
         raise HTTPException(
             status_code=409,
             detail={"error": "parcel_conflict", "conflict_key": f"parcel_ref:{ref}",
                     "existing_ref": existing["parcel_ref"],
-                    "registered_at": existing["created_at"]},
+                    "registered_at": _iso(existing["created_at"])},
         )
 
     # Same certificate number or survey-plan hash under a different ref is
@@ -315,8 +320,10 @@ def record_consent(parcel_ref: str, payload: ConsentInput,
             and not view["notice_active"] and not view["open_objections"]):
         conflicts = store.query(
             "SELECT id FROM parcel_conflicts WHERE tenant_id = 'default' AND parcel_ref = :p"
-            " AND (conflict_key LIKE 'parcel_ref:%' OR conflict_key LIKE 'certificate_number:%'"
-            " OR conflict_key LIKE 'survey_plan_hash:%' OR conflict_key LIKE 'geospatial_overlap:%')",
+            " AND (starts_with(conflict_key, 'parcel_ref:')"
+            " OR starts_with(conflict_key, 'certificate_number:')"
+            " OR starts_with(conflict_key, 'survey_plan_hash:')"
+            " OR starts_with(conflict_key, 'geospatial_overlap:'))",
             {"p": parcel_ref})
         if not conflicts:
             store.execute(
@@ -1017,8 +1024,8 @@ def resolve_objection(objection_id: str, payload: ObjectionResolveInput,
             " AND parcel_ref = :p AND status = 'open'", {"p": parcel_ref})
         conflicts = store.query(
             "SELECT id FROM parcel_conflicts WHERE tenant_id = 'default'"
-            " AND parcel_ref = :p AND (conflict_key LIKE 'certificate_number:%'"
-            " OR conflict_key LIKE 'geospatial_overlap:%')", {"p": parcel_ref})
+            " AND parcel_ref = :p AND (starts_with(conflict_key, 'certificate_number:')"
+            " OR starts_with(conflict_key, 'geospatial_overlap:'))", {"p": parcel_ref})
         if not blocks and not objections and not conflicts:
             view = _parcel_view(store, parcel)
             new_status = ("clear" if view["consent_complete"] and not view["notice_active"]

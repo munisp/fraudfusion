@@ -27,6 +27,7 @@ from app import docverification
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 CALLER = Principal(sub="kyc-ops-1", username="ops", roles={"kyc_operator"})
 
@@ -63,7 +64,7 @@ MOIRE_PNG = make_png("moire")
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "kyc.db"))
+    database = Database(database_url=clone_migrated("kyc"))
     yield database
     reset_db_for_tests(None)
 
@@ -148,7 +149,8 @@ class TestDocumentVerifyPipeline:
         assert row is not None
         assert row["sha256"] == hashlib.sha256(CLEAN_PNG).hexdigest()
         assert row["status"] == "manual_review"
-        provenance = json.loads(row["provenance_json"])
+        provenance = row["provenance_json"]
+        provenance = provenance if isinstance(provenance, list) else json.loads(provenance)
         assert {p["layer"] for p in provenance} == {"local_cv", "ocr", "vlm"}
 
 

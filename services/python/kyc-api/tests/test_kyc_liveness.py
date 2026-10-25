@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 CALLER = Principal(sub="kyc-ops-1", username="ops", roles={"kyc_operator"})
 SECRET = "test-liveness-secret"
@@ -39,7 +40,7 @@ def _frame(seed: int, shift: int = 0, moire: bool = False) -> bytes:
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "kyc.db"))
+    database = Database(database_url=clone_migrated("kyc"))
     yield database
     reset_db_for_tests(None)
 
@@ -149,7 +150,8 @@ class TestVerifyFrames:
         assert row is not None
         assert row["document_type"] == "liveness_frames"
         assert len(row["sha256"]) == 64
-        provenance = json.loads(row["provenance_json"])
+        provenance = row["provenance_json"]
+        provenance = provenance if isinstance(provenance, list) else json.loads(provenance)
         assert any(s["signal"] == "challenge_response" for s in provenance)
 
     def test_moire_frames_rejected_status_in_audit(self, client, db):

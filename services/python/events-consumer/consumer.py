@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sqlite3
 import threading
 import time
 import uuid
@@ -44,7 +43,6 @@ TOPIC = os.getenv("KAFKA_TOPIC", "fraudfusion-events")
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").strip()
 EVENTS_FILE_DIR = os.getenv("EVENTS_FILE_DIR", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-SQLITE_PATH = os.getenv("EVENTS_DB", str(Path(__file__).resolve().parent / "data" / "events.db"))
 EVENTS_SOURCE = os.getenv("EVENTS_SOURCE", "auto").strip().lower()
 BATCH_SIZE = int(os.getenv("EVENTS_BATCH_SIZE", "200"))
 
@@ -195,62 +193,21 @@ def select_source() -> KafkaSource | FileTailSource:
 # Sink
 # ---------------------------------------------------------------------------
 
-SQLITE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS events_archive (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id    TEXT NOT NULL DEFAULT 'default',
-    topic        TEXT NOT NULL DEFAULT 'fraudfusion-events',
-    partition    INTEGER,
-    kafka_offset INTEGER,
-    event_key    TEXT,
-    event_type   TEXT,
-    payload      TEXT NOT NULL,
-    source       TEXT NOT NULL CHECK (source IN ('kafka', 'filetail')),
-    event_ts     TEXT,
-    archived_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE TABLE IF NOT EXISTS events_aggregates_weekly (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id   TEXT NOT NULL DEFAULT 'default',
-    week_start  TEXT NOT NULL,
-    event_type  TEXT NOT NULL,
-    event_count INTEGER NOT NULL DEFAULT 0,
-    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE (tenant_id, week_start, event_type)
-);
-"""
-
-
 class ArchiveSink:
-    """Writes events_archive + events_aggregates_weekly. Dual driver:
-    psycopg/Postgres when DATABASE_URL is postgres, else a SQLite mirror."""
+    """Writes events_archive + events_aggregates_weekly. PostgreSQL only —
+    DATABASE_URL must be set; tests use embedded pgserver."""
 
-    def __init__(self, database_url: str = DATABASE_URL, sqlite_path: str = SQLITE_PATH):
-        self._lock = threading.Lock()
-        self._is_pg = database_url.startswith(("postgres://", "postgresql://"))
-
-        # Postgres is the source of record. In production deployments
-        # (FRAUDFUSION_REQUIRE_POSTGRES=1) the SQLite fallback is a
-        # boot-time error, never a silent downgrade.
-        if (not self._is_pg and os.getenv("FRAUDFUSION_REQUIRE_POSTGRES", "")
-                .strip().lower() in ("1", "true", "yes")):
+    def __init__(self, database_url: str = DATABASE_URL):
+        if not database_url.startswith(("postgres://", "postgresql://")):
             raise RuntimeError(
-                "FRAUDFUSION_REQUIRE_POSTGRES is set: the SQLite fallback is "
-                "disabled — PostgreSQL is the source of record. Set "
-                "DATABASE_URL=postgresql://... before starting this service.")
-        if self._is_pg:
-            import psycopg
+                "PostgreSQL is required: set DATABASE_URL=postgresql://... — "
+                "the events consumer has no SQLite fallback.")
+        import psycopg
 
-            self._psycopg = psycopg
-            self._dsn = database_url
-            self._conn = None
-        else:
-            Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(sqlite_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            with self._lock, self._conn:
-                self._conn.executescript(SQLITE_SCHEMA)
+        self._lock = threading.Lock()
+        self._psycopg = psycopg
+        self._dsn = database_url
+        self._is_pg = True
 
     @staticmethod
     def week_start(ts: Optional[str]) -> str:
@@ -266,62 +223,36 @@ class ArchiveSink:
             return 0
         counts: dict[str, int] = {}
         with self._lock:
-            if self._is_pg:
-                with self._psycopg.connect(self._dsn) as conn:
-                    for ev in events:
-                        conn.execute(
-                            "INSERT INTO events_archive (topic, partition, kafka_offset,"
-                            " event_key, event_type, payload, source, event_ts)"
-                            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
-                            " ON CONFLICT (topic, partition, kafka_offset) DO NOTHING",
-                            (TOPIC, ev.partition, ev.offset, ev.key, ev.event_type,
-                             json.dumps(ev.payload), source_name, ev.event_ts),
-                        )
-                        week = self.week_start(ev.event_ts)
-                        counts[week + "|" + ev.event_type] = counts.get(week + "|" + ev.event_type, 0) + 1
-                    for combo, n in counts.items():
-                        week, event_type = combo.split("|", 1)
-                        conn.execute(
-                            "INSERT INTO events_aggregates_weekly (week_start, event_type,"
-                            " event_count) VALUES (%s, %s, %s)"
-                            " ON CONFLICT (tenant_id, week_start, event_type) DO UPDATE SET"
-                            " event_count = events_aggregates_weekly.event_count + %s,"
-                            " updated_at = now()",
-                            (week, event_type, n, n),
-                        )
-                    conn.commit()
-            else:
-                with self._conn:
-                    for ev in events:
-                        self._conn.execute(
-                            "INSERT INTO events_archive (topic, partition, kafka_offset,"
-                            " event_key, event_type, payload, source, event_ts)"
-                            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                            (TOPIC, ev.partition, ev.offset, ev.key, ev.event_type,
-                             json.dumps(ev.payload), source_name, ev.event_ts),
-                        )
-                        week = self.week_start(ev.event_ts)
-                        counts[week + "|" + ev.event_type] = counts.get(week + "|" + ev.event_type, 0) + 1
-                    for combo, n in counts.items():
-                        week, event_type = combo.split("|", 1)
-                        self._conn.execute(
-                            "INSERT INTO events_aggregates_weekly (week_start, event_type,"
-                            " event_count) VALUES (?, ?, ?)"
-                            " ON CONFLICT (tenant_id, week_start, event_type) DO UPDATE SET"
-                            " event_count = event_count + ?,"
-                            " updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-                            (week, event_type, n, n),
-                        )
+            with self._psycopg.connect(self._dsn) as conn:
+                for ev in events:
+                    conn.execute(
+                        "INSERT INTO events_archive (topic, partition, kafka_offset,"
+                        " event_key, event_type, payload, source, event_ts)"
+                        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+                        " ON CONFLICT (topic, partition, kafka_offset) DO NOTHING",
+                        (TOPIC, ev.partition, ev.offset, ev.key, ev.event_type,
+                         json.dumps(ev.payload), source_name, ev.event_ts),
+                    )
+                    week = self.week_start(ev.event_ts)
+                    counts[week + "|" + ev.event_type] = counts.get(week + "|" + ev.event_type, 0) + 1
+                for combo, n in counts.items():
+                    week, event_type = combo.split("|", 1)
+                    conn.execute(
+                        "INSERT INTO events_aggregates_weekly (week_start, event_type,"
+                        " event_count) VALUES (%s, %s, %s)"
+                        " ON CONFLICT (tenant_id, week_start, event_type) DO UPDATE SET"
+                        " event_count = events_aggregates_weekly.event_count + %s,"
+                        " updated_at = now()",
+                        (week, event_type, n, n),
+                    )
+                conn.commit()
         return len(events)
 
     def query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
-        if self._is_pg:
-            from psycopg.rows import dict_row
+        from psycopg.rows import dict_row
 
-            with self._psycopg.connect(self._dsn, row_factory=dict_row) as conn:
-                return [dict(r) for r in conn.execute(sql, params).fetchall()]
-        with self._lock:
-            return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+        with self._psycopg.connect(self._dsn, row_factory=dict_row) as conn:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@
 --      verified_at. kyc-api Postgres tables DO exist in earlier migrations
 --      (kyc_requests in 20260901_python_services_caveats.sql), so the columns
 --      go on that table (guarded ALTERs) rather than a standalone table; the
---      SQLite mirror gains the same columns via KYC_REQUESTS_EXTRA_COLUMNS.
+--      SQLite mirror was removed in Round 27 (Postgres-only platform).
 --
 -- Fresh-DB-safe and idempotent: to_regclass / information_schema-guarded DO
 -- blocks and CREATE TABLE IF NOT EXISTS, matching

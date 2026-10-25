@@ -301,11 +301,8 @@ def create_app() -> FastAPI:
         checked by get_principal)."""
         if principal.jti:
             db.execute(
-                ("INSERT OR IGNORE INTO backoffice_session_revocations"
-                 " (tenant_id, jti, sub, revoked_by, reason) VALUES (:t, :j, :s, :by, :r)"
-                 if not db._is_pg else
-                 "INSERT INTO backoffice_session_revocations (tenant_id, jti, sub, revoked_by,"
-                 " reason) VALUES (:t, :j, :s, :by, :r) ON CONFLICT DO NOTHING"),
+                "INSERT INTO backoffice_session_revocations (tenant_id, jti, sub, revoked_by,"
+                " reason) VALUES (:t, :j, :s, :by, :r) ON CONFLICT DO NOTHING",
                 {"t": principal.tenant_id, "j": principal.jti, "s": principal.sub,
                  "by": principal.sub, "r": "logout"},
             )
@@ -352,34 +349,18 @@ def create_app() -> FastAPI:
         journeys_active = db.query_one(
             "SELECT COUNT(*) c FROM journey_executions WHERE tenant_id = :t"
             " AND status = 'running'", {"t": t})["c"]
-        if db._is_pg:
-            journeys_failed = db.query_one(
-                "SELECT COUNT(*) c FROM journey_executions WHERE tenant_id = :t"
-                " AND status = 'failed' AND updated_at >= now() - INTERVAL '1 day'",
-                {"t": t})["c"]
-            avg = db.query_one(
-                "SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (updated_at - created_at))), 0) a"
-                " FROM kyc_requests WHERE tenant_id = :t AND status = 'completed'",
-                {"t": t})["a"]
-            trend = db.query(
-                "SELECT to_char(detected_at, 'YYYY-MM-DD') d, COUNT(*) c FROM fraud_alerts"
-                " WHERE tenant_id = :t AND detected_at >= now() - INTERVAL '7 days'"
-                " GROUP BY 1 ORDER BY 1", {"t": t})
-        else:
-            journeys_failed = db.query_one(
-                "SELECT COUNT(*) c FROM journey_executions WHERE tenant_id = :t"
-                " AND status = 'failed'"
-                " AND updated_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')",
-                {"t": t})["c"]
-            avg = db.query_one(
-                "SELECT COALESCE(AVG((julianday(updated_at) - julianday(created_at)) * 86400.0), 0) a"
-                " FROM kyc_requests WHERE tenant_id = :t AND status = 'completed'",
-                {"t": t})["a"]
-            trend = db.query(
-                "SELECT substr(detected_at, 1, 10) d, COUNT(*) c FROM fraud_alerts"
-                " WHERE tenant_id = :t"
-                " AND detected_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')"
-                " GROUP BY 1 ORDER BY 1", {"t": t})
+        journeys_failed = db.query_one(
+            "SELECT COUNT(*) c FROM journey_executions WHERE tenant_id = :t"
+            " AND status = 'failed' AND updated_at >= now() - INTERVAL '1 day'",
+            {"t": t})["c"]
+        avg = db.query_one(
+            "SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (updated_at - created_at))), 0) a"
+            " FROM kyc_requests WHERE tenant_id = :t AND status = 'completed'",
+            {"t": t})["a"]
+        trend = db.query(
+            "SELECT to_char(detected_at, 'YYYY-MM-DD') d, COUNT(*) c FROM fraud_alerts"
+            " WHERE tenant_id = :t AND detected_at >= now() - INTERVAL '7 days'"
+            " GROUP BY 1 ORDER BY 1", {"t": t})
         kyc_by_status = db.query(
             "SELECT decision s, COUNT(*) c FROM kyc_requests WHERE tenant_id = :t GROUP BY 1",
             {"t": t})
@@ -879,13 +860,10 @@ def create_app() -> FastAPI:
         rejects tokens issued before revoked_at)."""
         require_ops(principal)
         db.execute(
-            ("INSERT OR IGNORE INTO backoffice_session_revocations"
-             " (tenant_id, jti, sub, revoked_by, reason) VALUES (:t, '*', :s, :by, :r)"
-             if not db._is_pg else
-             "INSERT INTO backoffice_session_revocations (tenant_id, jti, sub, revoked_by,"
-             " reason) VALUES (:t, '*', :s, :by, :r)"
-             " ON CONFLICT (tenant_id, jti) DO UPDATE SET revoked_at = now(),"
-             " revoked_by = EXCLUDED.revoked_by, reason = EXCLUDED.reason"),
+            "INSERT INTO backoffice_session_revocations (tenant_id, jti, sub, revoked_by,"
+            " reason) VALUES (:t, '*', :s, :by, :r)"
+            " ON CONFLICT (tenant_id, jti) DO UPDATE SET revoked_at = now(),"
+            " revoked_by = EXCLUDED.revoked_by, reason = EXCLUDED.reason",
             {"t": principal.tenant_id, "s": sub, "by": principal.sub,
              "r": payload.reason or "admin revocation"},
         )

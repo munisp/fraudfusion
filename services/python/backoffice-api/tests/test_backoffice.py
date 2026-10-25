@@ -14,6 +14,7 @@ from app.auth import Principal, get_principal
 from app.audit import append_event, verify_chain
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 OPS = Principal(sub="ops-1", email="ops@ff.io", name="Ops One",
                 roles={"backoffice_ops"}, tenant_id="default", jti="jti-ops", iat=100)
@@ -23,7 +24,7 @@ ADMIN = Principal(sub="admin-1", email="admin@ff.io", name="Admin One",
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "bo.db"))
+    database = Database(database_url=clone_migrated("backoffice"))
     yield database
     reset_db_for_tests(None)
 
@@ -219,7 +220,7 @@ class TestDocumentReviews:
         assert client.get("/api/v1/backoffice/documents/doc-1/image").status_code == 404
         db.execute(
             "INSERT INTO document_store (document_id, content_type, content)"
-            " VALUES ('doc-1', 'image/png', X'89504E47')")
+            " VALUES ('doc-1', 'image/png', decode('89504E47', 'hex'))")
         resp = client.get("/api/v1/backoffice/documents/doc-1/image")
         assert resp.status_code == 200
         assert resp.content == b"\x89PNG"
@@ -263,8 +264,15 @@ class TestAuditLedger:
                          resource_type="doc", resource_id=f"d-{i}", action="create")
         assert verify_chain(db)["intact"] is True
         assert verify_chain(db)["entries"] == 3
-        # tamper: rewrite a stored action directly (bypassing the app)
-        db.execute("UPDATE backoffice_audit_ledger SET action = 'tampered' WHERE id = 2")
+        # tamper: rewrite a stored action directly (bypassing the app).
+        # The regulated-tables trigger blocks plain UPDATE — as it should —
+        # so simulate the DBA-level attacker the hash chain exists to catch:
+        # one connection, triggers suspended for the tampering statement only.
+        with db._pg_conn() as conn:
+            conn.execute("SET session_replication_role = replica")
+            conn.execute("UPDATE backoffice_audit_ledger SET action = 'tampered' WHERE id = 2")
+            conn.execute("SET session_replication_role = DEFAULT")
+            conn.commit()
         result = verify_chain(db)
         assert result["intact"] is False
         assert result["first_broken_id"] == 2

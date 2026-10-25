@@ -19,6 +19,7 @@ from app.agents import compute_integrity
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 SUBMITTER = Principal(sub="ops-1", username="o1", roles=set())
 
@@ -38,7 +39,7 @@ AGENT = {
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "onb.db"))
+    database = Database(database_url=clone_migrated("onboarding"))
     yield database
     reset_db_for_tests(None)
 

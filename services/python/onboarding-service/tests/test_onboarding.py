@@ -1,4 +1,4 @@
-"""End-to-end tests for the onboarding service (SQLite backend, auth stubbed).
+"""End-to-end tests for the onboarding service (embedded PostgreSQL, auth stubbed).
 
 Auth is exercised through dependency overrides; the fail-closed Keycloak
 introspection path is tested separately in test_auth_fail_closed.
@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 TENANT = Principal(sub="user-tenant-1", username="ada", roles=set())
 TENANT2 = Principal(sub="user-tenant-2", username="bola", roles=set())
@@ -21,7 +22,7 @@ ADMIN_B = Principal(sub="staff-b", username="staffb", roles={"admin"})
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "onboarding.db"))
+    database = Database(database_url=clone_migrated("onboarding"))
     yield database
     reset_db_for_tests(None)
 

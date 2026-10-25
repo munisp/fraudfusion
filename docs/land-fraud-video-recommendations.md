@@ -57,7 +57,7 @@ attended; a PwC estimate of $900B+ locked in Nigerian real estate.
   due-diligence flow before any state lands-bureau contract exists; adapter
   conformance verified against a real uvicorn round trip.
 - **Canonical PG migration** `database/20261025_land_due_diligence.sql`
-  mirroring the SQLite schema (dual-driver store pattern).
+  (the former SQLite mirror was removed in Round 27 — Postgres-only).
 - `.env.example`: `LAND_DISPUTE_SLA_DAYS`, per-state `*_LANDS_URL`.
 
 ### Known follow-ups (not in this round)

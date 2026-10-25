@@ -17,11 +17,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import main as svc  # noqa: E402
 from identity_store import IdentityStore, reset_store_for_tests  # noqa: E402
 from registry import HTTPRegistryAdapter, LocalRegistryAdapter  # noqa: E402
+from embedded_pg import clone_migrated
 
 
 @pytest.fixture()
 def store(tmp_path):
-    s = IdentityStore(database_url="", sqlite_path=str(tmp_path / "id.db"))
+    s = IdentityStore(database_url=clone_migrated("identity"))
     yield s
     reset_store_for_tests(None)
 

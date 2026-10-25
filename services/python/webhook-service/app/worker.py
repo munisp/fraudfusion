@@ -177,9 +177,6 @@ async def process_due_deliveries(db: Database, client: httpx.AsyncClient,
     now = time.time() if now is None else now
     rows = db.query(
         "SELECT * FROM webhook_deliveries WHERE status = 'pending'"
-        " AND next_attempt_at <= :now ORDER BY next_attempt_at, rowid"
-        " LIMIT :n" if not db._is_pg else
-        "SELECT * FROM webhook_deliveries WHERE status = 'pending'"
         " AND next_attempt_at <= :now ORDER BY next_attempt_at, ctid"
         " LIMIT :n",
         {"now": now, "n": limit},

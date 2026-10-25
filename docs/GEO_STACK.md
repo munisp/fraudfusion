@@ -90,8 +90,8 @@ The `agent` detector used to trust caller-reported
 `distance_from_registered_km`. Now, when the payload carries
 `registered_location` + `operating_location` instead, the service measures
 the distance itself: `geo_distance_km()` on Postgres (full GeoNames
-gazetteer), or the embedded 72-place gazetteer + Python haversine on the
-SQLite dev store / un-migrated databases. A caller-supplied distance always
+gazetteer), or the embedded 72-place gazetteer + Python haversine when the
+geo functions are unreachable (e.g. un-migrated database). A caller-supplied distance always
 wins (never overwritten); unknown places produce a zero-weight
 `geo_enrichment: geo_unresolved` factor — an honest skip, never a silent 0.
 The audited event keeps the caller's original payload.

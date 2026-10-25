@@ -13,7 +13,7 @@
 --
 -- Fresh-DB-safe and idempotent: to_regclass-guarded DO blocks,
 -- ADD COLUMN IF NOT EXISTS (matching 20260928_identity_exposure.sql style).
--- The billing-service SQLite mirror carries the same columns
+-- The billing-service SQLite mirror (removed in Round 27) carried the same columns
 -- (services/python/billing-service/app/db.py).
 
 DO $$

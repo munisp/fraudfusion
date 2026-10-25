@@ -18,8 +18,8 @@
 -- CREATE INDEX IF NOT EXISTS (matching 20260928_identity_exposure.sql /
 -- 20260820_*_persistence_hardening.sql style).
 --
--- The webhook-service ALSO mirrors this schema in SQLite
--- (services/python/webhook-service/app/db.py SQLITE_SCHEMA); the SQLite
+-- The webhook-service formerly mirrored this schema in SQLite
+-- (removed in Round 27 — Postgres-only); the SQLite
 -- mirror carries the same columns so dual-driver code paths stay identical.
 -- JSON payloads are stored as TEXT in both drivers (no jsonb cast needed).
 

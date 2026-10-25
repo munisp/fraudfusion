@@ -22,12 +22,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "integration"))
 
 import adapters  # noqa: E402
 import ocr_forensics  # noqa: E402
 import pipeline  # noqa: E402
 from doc_intelligence import (DocIntelStore, IntelligenceInput, create_app,  # noqa: E402
                               reset_store_for_tests, run_intelligence)
+from embedded_pg import clone_migrated  # noqa: E402
 
 
 def _img(seed: int = 5) -> bytes:
@@ -152,7 +154,7 @@ class _NoDocling:
 
 @pytest.fixture()
 def store(tmp_path):
-    s = DocIntelStore(database_url="", sqlite_path=str(tmp_path / "di.db"))
+    s = DocIntelStore(database_url=clone_migrated("docintel"))
     reset_store_for_tests(s)
     yield s
     reset_store_for_tests(None)

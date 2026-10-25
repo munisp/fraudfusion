@@ -146,23 +146,14 @@ def import_exposure_batch(
         id_hash = hash_identifier(id_type, raw_value)
 
         # Persist the indicator — hash only, never the plaintext value.
-        if store._is_pg:
-            store.execute(
-                "INSERT INTO exposure_indicators (tenant_id, batch_id, identifier_type,"
-                " identifier_hash, breach_ref, observed_at)"
-                " VALUES (:t, :b, :ty, :h, :br, :o)"
-                " ON CONFLICT (tenant_id, identifier_type, identifier_hash, breach_ref) DO NOTHING",
-                {"t": tenant_id, "b": batch_id, "ty": id_type, "h": id_hash,
-                 "br": breach_ref, "o": observed_at},
-            )
-        else:
-            store.execute(
-                "INSERT OR IGNORE INTO exposure_indicators (tenant_id, batch_id, identifier_type,"
-                " identifier_hash, breach_ref, observed_at)"
-                " VALUES (:t, :b, :ty, :h, :br, :o)",
-                {"t": tenant_id, "b": batch_id, "ty": id_type, "h": id_hash,
-                 "br": breach_ref, "o": observed_at},
-            )
+        store.execute(
+            "INSERT INTO exposure_indicators (tenant_id, batch_id, identifier_type,"
+            " identifier_hash, breach_ref, observed_at)"
+            " VALUES (:t, :b, :ty, :h, :br, :o)"
+            " ON CONFLICT (tenant_id, identifier_type, identifier_hash, breach_ref) DO NOTHING",
+            {"t": tenant_id, "b": batch_id, "ty": id_type, "h": id_hash,
+             "br": breach_ref, "o": observed_at},
+        )
 
         # --- matching ---------------------------------------------------
         # 1) identity graph: customers holding this exact identifier.
@@ -295,7 +286,9 @@ def exposures_for_customer(
     out: list[dict[str, Any]] = []
     for row in rows:
         try:
-            details = json.loads(row["details"] or "{}")
+            raw = row["details"]
+            # psycopg decodes JSONB to dict already; TEXT columns arrive as str
+            details = raw if isinstance(raw, dict) else json.loads(raw or "{}")
         except (TypeError, ValueError):
             details = {}
         out.append({

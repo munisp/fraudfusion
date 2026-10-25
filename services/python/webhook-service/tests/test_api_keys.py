@@ -20,6 +20,7 @@ from app import api_keys
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 STAFF = Principal(sub="staff-1", username="ada", roles={"admin"})
 
@@ -35,7 +36,7 @@ ACTIVE_T2 = {"active": True, "tenant_id": "tenant-2",
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "webhooks.db"))
+    database = Database(database_url=clone_migrated("webhooks"))
     yield database
     reset_db_for_tests(None)
 

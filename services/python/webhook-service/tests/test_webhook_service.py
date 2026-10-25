@@ -23,6 +23,7 @@ from app import chain, signing, worker
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 STAFF = Principal(sub="staff-1", username="ada", roles={"admin"})
 TOKEN = "test-internal-token"
@@ -30,7 +31,7 @@ TOKEN = "test-internal-token"
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "webhooks.db"))
+    database = Database(database_url=clone_migrated("webhooks"))
     yield database
     reset_db_for_tests(None)
 
@@ -80,7 +81,7 @@ class TestEndpointCrud:
         row = db.query_one("SELECT * FROM webhook_endpoints WHERE id = :id",
                            {"id": ep["id"]})
         assert row["secret_hash"] == hashlib.sha256(ep["secret"].encode()).hexdigest()
-        assert ep["secret"].encode() not in json.dumps(row).encode()
+        assert ep["secret"].encode() not in json.dumps(row, default=str).encode()
         # Never shown again by any read path.
         for resp in (client.get("/v1/webhooks"),
                      client.get(f"/v1/webhooks/{ep['id']}")):

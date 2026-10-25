@@ -13,9 +13,8 @@
 --   * bvn_registry / nin_registry / customer_identifiers
 --       (20260901_python_services_caveats.sql)
 --   * identity_theft_alerts (20260827_service_base_tables.sql)
--- The identity-theft-detector service ALSO mirrors this schema in SQLite
--- (services/python/identity-theft-detector/identity_store.py SQLITE_SCHEMA);
--- the SQLite mirror carries the same columns/tables so dual-driver code paths
+-- The identity-theft-detector service formerly mirrored this schema in SQLite;
+-- the mirror was removed in Round 27 (Postgres-only). This file remains
 -- stay identical.
 --
 -- NDPA posture: exposure_indicators stores sha256 identifier hashes ONLY —

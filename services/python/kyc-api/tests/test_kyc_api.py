@@ -1,4 +1,4 @@
-"""Tests for the KYC API (SQLite backend, auth stubbed via overrides).
+"""Tests for the KYC API (embedded PostgreSQL, auth stubbed via overrides).
 
 The fail-closed Keycloak path is tested separately in TestAuthFailClosed.
 
@@ -17,6 +17,7 @@ from app.db import Database, get_db, reset_db_for_tests
 from app.identity import luhn_checksum_ok
 from app.main import create_app
 from app.tiers import assign_tier, check_transaction, TierAssignmentError
+from embedded_pg import clone_migrated
 
 CALLER = Principal(sub="kyc-ops-1", username="ops", roles={"kyc_operator"})
 
@@ -41,7 +42,7 @@ BVN = valid_bvn()
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "kyc.db"))
+    database = Database(database_url=clone_migrated("kyc"))
     yield database
     reset_db_for_tests(None)
 

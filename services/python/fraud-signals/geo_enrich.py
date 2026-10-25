@@ -10,8 +10,8 @@ distance itself:
      function (full GeoNames gazetteer, PostGIS ST_Distance when the
      extension is present, SQL haversine otherwise).
   2. **embedded mode** — the 72-place seed gazetteer bundled below with a
-     pure-Python haversine, for the SQLite dev/test store or a database
-     whose geo migrations have not been applied.
+     pure-Python haversine, used when the database is unreachable or its
+     geo migrations have not been applied.
 
 Honesty rules:
   * an explicit caller-supplied ``distance_from_registered_km`` always wins

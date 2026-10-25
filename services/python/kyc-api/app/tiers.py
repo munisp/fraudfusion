@@ -82,9 +82,14 @@ ADDRESS_EVIDENCE_MAX_AGE_DAYS = 90
 ADDRESS_RIGOR_TIERS = ("tier_2", "tier_3")
 
 
-def parse_verified_at(value: str) -> datetime:
-    """Parse an ISO-8601 date/datetime into an aware UTC datetime."""
-    text = value.strip()
+def parse_verified_at(value) -> datetime:
+    """Parse an ISO-8601 date/datetime into an aware UTC datetime.
+
+    Tolerates datetime instances: TIMESTAMPTZ columns come back from
+    psycopg already parsed (the canonical schema is timestamptz)."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value).strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:

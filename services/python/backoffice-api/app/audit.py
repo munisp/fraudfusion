@@ -101,9 +101,15 @@ def verify_chain(db: Database, tenant_id: str = "default") -> dict[str, Any]:
     first_broken = None
     for row in rows:
         details = Database.as_dict(row["details"])
-        created_at = str(row["created_at"]).replace(" ", "T")
-        if not created_at.endswith("Z"):
-            created_at += "Z"
+        created = row["created_at"]
+        if isinstance(created, datetime):
+            # Canonical schema is timestamptz: normalise to the chain's
+            # canonical UTC text form before re-hashing.
+            created_at = created.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        else:
+            created_at = str(created).replace(" ", "T")
+            if not created_at.endswith("Z"):
+                created_at += "Z"
         canonical = _canonical(
             details, created_at,
             prev_hash=row["prev_hash"], event_type=row["event_type"],

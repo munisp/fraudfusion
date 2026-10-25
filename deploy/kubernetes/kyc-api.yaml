@@ -1,8 +1,8 @@
 # kyc-api — CBN-tiered KYC verification service (services/python/kyc-api,
 # FastAPI, port 8086). Auth is fail-closed Keycloak token introspection
 # (KEYCLOAK_URL + realm + client credentials); persistence uses Postgres via
-# DATABASE_URL (role `kyc_api`, see database/20260901_db_roles.sql) and falls
-# back to a local SQLite file only when DATABASE_URL is unset.
+# DATABASE_URL (role `kyc_api`, see database/20260901_db_roles.sql) —
+# Postgres-only; there is no SQLite fallback.
 # Build: docker build -f services/python/kyc-api/Dockerfile -t ghcr.io/munisp/fraudfusion/kyc-api:latest .
 apiVersion: apps/v1
 kind: Deployment
@@ -62,9 +62,8 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
       volumes:
-        # Watchlist (WATCHLIST_PATH default data/watchlist.json) and the
-        # SQLite fallback live here; emptyDir is fine because Postgres is the
-        # production store.
+        # Watchlist (WATCHLIST_PATH default data/watchlist.json) lives here;
+        # emptyDir is fine because Postgres is the only store.
         - name: data
           emptyDir: {}
 ---

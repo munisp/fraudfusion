@@ -43,7 +43,7 @@ go-mobile-mock).
 | Site inspection | Physical inspection gate for unregistered parcels | workflow `SITE_INSPECTION` state (state machine in `api/verification_workflow.py`) | [implemented] as state; inspector app missing |
 | Fraud scoring | Rules-based fraud probability | `_detect_fraud` in workflow | [implemented] (rules-v1) |
 | Verification report | PDF report | `GET /api/v1/report/{id}` + `reports/generator.py` (reportlab, minimal-PDF fallback) | [implemented] |
-| Status tracking | Persisted state machine (SQLite/Postgres) | `GET /api/v1/status/{id}` | [implemented] |
+| Status tracking | Persisted state machine (Postgres) | `GET /api/v1/status/{id}` | [implemented] |
 
 ## 4. Professional (surveyor / agent)
 

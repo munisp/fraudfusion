@@ -3,7 +3,7 @@
 --   * parcels.beacons / notice_expires_at  (geospatial overlap + notice period)
 --   * parcel_consents.identity_hash / liveness_challenge_id (identity-bound consent)
 --   * parcel_objections                    (public-notice objection workflow)
--- Idempotent; mirrors the SQLite schema/column-migrations in
+-- Idempotent; formerly mirrored the SQLite schema/column-migrations in
 -- services/land-verification-service/api/data_store.py.
 
 BEGIN;

@@ -12,7 +12,7 @@ approval workflow (/api/v1/onboarding/admin/*).
   approval time; only its SHA-256 hash + a non-secret prefix are persisted.
 - Auth is fail-closed Keycloak token introspection (see app/auth.py).
 
-Schema: database/20260826_tenants_onboarding.sql (PostgreSQL; SQLite mirror
+Schema: database/20260826_tenants_onboarding.sql (PostgreSQL only — no SQLite mirror;
 in app/db.py for local dev/tests).
 """
 
@@ -98,7 +98,7 @@ def _decode_cursor(cursor: str) -> tuple[str, str]:
 def _keyset_where(cursor: str | None, alias: str = "", descending: bool = True) -> tuple[str, dict]:
     """Return (sql_fragment, params) filtering rows strictly past the cursor.
 
-    Pairs with ORDER BY created_at {DESC|ASC}, id {DESC|ASC}. Both SQLite
+    Pairs with ORDER BY created_at {DESC|ASC}, id {DESC|ASC}. (Pre-Postgres-only, both SQLite
     (tests) and Postgres (psycopg sends the ISO string as an untyped literal,
     coerced to timestamptz) accept the comparison.
     """
@@ -137,8 +137,6 @@ def _new_api_key() -> tuple[str, str, str]:
 
 def _tenant_to_status(db: Database, tenant: dict) -> OnboardingStatus:
     items = db.query(
-        "SELECT item_id AS id, label, done, required FROM onboarding_checklist_items"
-        " WHERE tenant_id = :tid ORDER BY rowid" if not db._is_pg else
         "SELECT item_id AS id, label, done, required FROM onboarding_checklist_items"
         " WHERE tenant_id = :tid ORDER BY item_id",
         {"tid": tenant["id"]},
@@ -186,8 +184,6 @@ def _get_owned_tenant(db: Database, principal: Principal, tenant_id: str | None 
 def _seed_checklist(db: Database, tenant_id: str) -> None:
     for item_id, label, required in DEFAULT_CHECKLIST:
         db.execute(
-            "INSERT OR IGNORE INTO onboarding_checklist_items (tenant_id, item_id, label, required)"
-            " VALUES (:tid, :iid, :label, :req)" if not db._is_pg else
             "INSERT INTO onboarding_checklist_items (tenant_id, item_id, label, required)"
             " VALUES (:tid, :iid, :label, :req) ON CONFLICT DO NOTHING",
             {"tid": tenant_id, "iid": item_id, "label": label, "req": required},
@@ -196,8 +192,6 @@ def _seed_checklist(db: Database, tenant_id: str) -> None:
 
 def _mark_checklist_done(db: Database, tenant_id: str, item_id: str) -> None:
     db.execute(
-        "UPDATE onboarding_checklist_items SET done = 1, updated_at = :now"
-        " WHERE tenant_id = :tid AND item_id = :iid" if not db._is_pg else
         "UPDATE onboarding_checklist_items SET done = TRUE, updated_at = :now"
         " WHERE tenant_id = :tid AND item_id = :iid",
         {"tid": tenant_id, "iid": item_id, "now": _now()},
@@ -335,7 +329,7 @@ def create_app() -> FastAPI:
         db.execute(
             "UPDATE onboarding_checklist_items SET done = :done, updated_at = :now"
             " WHERE tenant_id = :tid AND item_id = :iid",
-            {"done": payload.done if db._is_pg else int(payload.done),
+            {"done": payload.done,
              "now": _now(), "tid": tenant["id"], "iid": item_id},
         )
         return ChecklistItem(id=item_id, label=row["label"], done=payload.done, required=bool(row["required"]))
@@ -463,7 +457,7 @@ def create_app() -> FastAPI:
     # --------------------- KYB submissions (dual control) -----------------
 
     def _parse_verdict(raw) -> dict | None:
-        """verification_json is TEXT on SQLite (str) and JSONB on Postgres
+        """verification_json is JSONB on Postgres (historically TEXT on SQLite:
         (psycopg hands back a dict) — accept both."""
         if not raw:
             return None
@@ -548,11 +542,8 @@ def create_app() -> FastAPI:
                                   "reason": res.get("reason")}
         verdict["loan_stacking_signals"] = stacking_block
         db.execute(
-            # SQLite stores the verdict as plain TEXT; Postgres needs the
-            # explicit cast because psycopg binds str as text and text->jsonb
-            # has no implicit assignment cast.
-            ("UPDATE kyb_applications SET verification_json = :v,"
-             " verified_at = :t, updated_at = :t WHERE id = :id") if not db._is_pg else
+            # psycopg binds str as text and text->jsonb has no implicit
+            # assignment cast — cast explicitly.
             ("UPDATE kyb_applications SET verification_json = CAST(:v AS JSONB),"
              " verified_at = :t, updated_at = :t WHERE id = :id"),
             {"v": json.dumps(verdict), "t": verdict["verified_at"], "id": app_id},

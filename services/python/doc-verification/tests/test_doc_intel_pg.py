@@ -3,8 +3,8 @@ intelligence store. Runs the real engine against an embedded PostgreSQL
 (pgserver) with the canonical migration applied — skipped cleanly when
 pgserver/psycopg are unavailable.
 
-Also pins the production guard: FRAUDFUSION_REQUIRE_POSTGRES=1 makes the
-SQLite fallback a boot-time error.
+Also pins the production posture: the platform is Postgres-only —
+a non-Postgres DATABASE_URL is a boot-time error.
 
 Run: python3 -m pytest tests/test_doc_intel_pg.py -q
 """
@@ -83,13 +83,8 @@ class TestPostgresSourceOfRecord:
         assert third["authenticity_score"] == 100
         assert third["verdict"] == "rejected"
 
-    def test_require_postgres_guard(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("FRAUDFUSION_REQUIRE_POSTGRES", "1")
-        with pytest.raises(RuntimeError, match="source of record"):
-            doc_intelligence.DocIntelStore(database_url="",
-                                           sqlite_path=str(tmp_path / "x.db"))
-        monkeypatch.delenv("FRAUDFUSION_REQUIRE_POSTGRES")
-        # Opt-in dev path still works when the guard is off:
-        store = doc_intelligence.DocIntelStore(database_url="",
-                                               sqlite_path=str(tmp_path / "ok.db"))
-        assert store._is_pg is False
+    def test_postgres_is_unconditional(self):
+        """Round 27: the platform is Postgres-only — there is no SQLite
+        fallback to guard against; a non-Postgres DSN fails at boot."""
+        with pytest.raises(RuntimeError, match="PostgreSQL is required"):
+            doc_intelligence.DocIntelStore(database_url="")

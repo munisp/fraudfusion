@@ -15,6 +15,7 @@ from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.identity import luhn_checksum_ok
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 SUBMITTER = Principal(sub="reviewer-1", username="r1", roles={"kyc_operator"})
 OTHER = Principal(sub="reviewer-2", username="r2", roles={"kyc_operator"})
@@ -35,7 +36,7 @@ def valid_bvn() -> str:
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "kyc.db"))
+    database = Database(database_url=clone_migrated("kyc"))
     yield database
     reset_db_for_tests(None)
 
@@ -57,7 +58,7 @@ def seed_request(db, customer_id="cust-1", decision="rejected", actor="reviewer-
         "INSERT INTO kyc_requests (id, customer_id, level, tier, status, decision,"
         " risk_score, risk_level, results_json, actor_sub, created_at, updated_at)"
         " VALUES (:id, :cid, 'basic', 'tier_1', 'completed', :dec, 0.9, 'high', '{}',"
-        " :actor, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        " :actor, now(), now())",
         {"id": rid, "cid": customer_id, "dec": decision, "actor": actor},
     )
     return rid
@@ -80,11 +81,15 @@ class TestRekyc:
         assert row["decision"] == "pending" and row["status"] == "received"
         assert row["rekyc_of"] == rid
         assert row["rekyc_reason"] == "expired CAC documents"
-        assert row["rekyc_deadline"] == body["deadline"]
+        def _instant(v):
+            from datetime import datetime as _dt
+            return v if isinstance(v, _dt) else _dt.fromisoformat(str(v).replace("Z", "+00:00"))
+
+        assert _instant(row["rekyc_deadline"]) == _instant(body["deadline"])
         # and a rekyc review is scheduled at the deadline
         sched = db.query_one(
             "SELECT * FROM kyc_review_schedule WHERE customer_id = 'cust-1' AND review_type = 'rekyc'")
-        assert sched["due_at"] == body["deadline"]
+        assert _instant(sched["due_at"]) == _instant(body["deadline"])
 
     def test_rekyc_unknown_customer_404(self, db):
         client = make_client(db)

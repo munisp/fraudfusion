@@ -20,6 +20,7 @@ from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.identity import luhn_checksum_ok
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 CALLER = Principal(sub="kyc-ops-1", username="ops", roles={"kyc_operator"})
 
@@ -53,7 +54,7 @@ def basic_payload(**overrides):
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "kyc.db"))
+    database = Database(database_url=clone_migrated("kyc"))
     yield database
     reset_db_for_tests(None)
 

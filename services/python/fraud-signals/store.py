@@ -1,8 +1,7 @@
-"""Dual-driver event store for fraud-signals-service.
+"""PostgreSQL event store for fraud-signals-service.
 
-Postgres is the source of record (FRAUDFUSION_REQUIRE_POSTGRES=1 makes the
-SQLite fallback a boot-time error); SQLite serves dev/tests. Two generic
-tables back all eight detectors:
+PostgreSQL is the only database: DATABASE_URL must point at Postgres. Two
+generic tables back all eight detectors:
 
   signal_events  — ingested facts (transactions, sessions, applications,
                    issuance records, payroll rows, claims) keyed by
@@ -10,6 +9,9 @@ tables back all eight detectors:
                    these windows.
   signal_evals   — hash-chained audit of every evaluation (verdict +
                    factors), tamper-evident like the doc-intel chain.
+
+Tests boot a real embedded PostgreSQL (pgserver) via
+services/python/integration/embedded_pg.py — no stand-in engines.
 """
 
 from __future__ import annotations
@@ -18,15 +20,11 @@ import hashlib
 import json
 import os
 import re
-import sqlite3
 import threading
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-DEFAULT_SQLITE_PATH = os.getenv(
-    "FRAUD_SIGNALS_SQLITE", str(Path(__file__).parent / "fraud_signals.db"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS signal_events (
@@ -67,34 +65,23 @@ def _to_pg(sql: str) -> str:
 
 
 class SignalStore:
-    def __init__(self, database_url: str = DATABASE_URL,
-                 sqlite_path: str = DEFAULT_SQLITE_PATH):
-        self._lock = threading.Lock()
-        self._is_pg = database_url.startswith(("postgres://", "postgresql://"))
-        if (not self._is_pg and os.getenv("FRAUDFUSION_REQUIRE_POSTGRES", "")
-                .strip().lower() in ("1", "true", "yes")):
+    def __init__(self, database_url: str = DATABASE_URL):
+        if not database_url.startswith(("postgres://", "postgresql://")):
             raise RuntimeError(
-                "FRAUDFUSION_REQUIRE_POSTGRES is set: the SQLite fallback is "
-                "disabled — PostgreSQL is the source of record.")
-        if self._is_pg:
-            import psycopg
-            from psycopg.rows import dict_row
-            self._psycopg, self._dict_row, self._dsn = psycopg, dict_row, database_url
-            self._conn = None
-            with self._pg_conn() as conn:
-                conn.execute(_to_pg(SCHEMA))
-                conn.commit()
-        else:
-            Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(sqlite_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            with self._lock, self._conn:
-                self._conn.executescript(SCHEMA)
+                "PostgreSQL is required: set DATABASE_URL=postgresql://... — "
+                "fraud-signals has no SQLite fallback.")
+        import psycopg
+        from psycopg.rows import dict_row
+        self._psycopg, self._dict_row, self._dsn = psycopg, dict_row, database_url
+        self._lock = threading.Lock()
+        self._is_pg = True
+        with self._pg_conn() as conn:
+            conn.execute(_to_pg(SCHEMA))
+            conn.commit()
         self._apply_migrations()
 
     def _apply_migrations(self) -> None:
-        """Idempotent column additions (SQLite has no IF NOT EXISTS for
-        columns, so duplicate-column errors are swallowed)."""
+        """Idempotent column additions for pre-existing deployments."""
         for sql in _MIGRATIONS:
             try:
                 self.execute(sql)
@@ -108,21 +95,15 @@ class SignalStore:
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> int:
         params = params or {}
-        if self._is_pg:
-            with self._pg_conn() as conn:
-                n = conn.execute(_to_pg(sql), params).rowcount
-                conn.commit()
-            return n
-        with self._lock, self._conn:
-            return self._conn.execute(sql, params).rowcount
+        with self._pg_conn() as conn:
+            n = conn.execute(_to_pg(sql), params).rowcount
+            conn.commit()
+        return n
 
     def query(self, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         params = params or {}
-        if self._is_pg:
-            with self._pg_conn() as conn:
-                return [dict(r) for r in conn.execute(_to_pg(sql), params).fetchall()]
-        with self._lock:
-            return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+        with self._pg_conn() as conn:
+            return [dict(r) for r in conn.execute(_to_pg(sql), params).fetchall()]
 
     # -- domain helpers -----------------------------------------------------
 

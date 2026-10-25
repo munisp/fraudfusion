@@ -38,6 +38,7 @@ from api.verification_workflow import (  # noqa: E402
     VerificationWorkflow,
 )
 from models.schemas import ALLOWED_TRANSITIONS, VerificationStatus  # noqa: E402
+from embedded_pg import clone_migrated, fresh_database
 
 DOC = b"""PLOT: PLT-9921
 PLAN: SP-2210
@@ -51,19 +52,15 @@ BEACONS: 6.45N 3.40E, 6.46N 3.41E
 
 @pytest.fixture()
 def store(tmp_path, monkeypatch):
-    monkeypatch.setenv("LAND_VERIFY_DB", str(tmp_path / "wf.db"))
-    s = LandDataStore(database_url="", sqlite_path=str(tmp_path / "land.db"))
+    s = LandDataStore(database_url=clone_migrated("land"))
     yield s
     reset_land_store_for_tests(None)
 
 
 @pytest.fixture()
 def workflow(tmp_path, monkeypatch):
-    monkeypatch.setenv("LAND_VERIFY_DB", str(tmp_path / "wf.db"))
     import api.verification_workflow as vw
-
-    monkeypatch.setattr(vw, "DEFAULT_SQLITE_PATH", str(tmp_path / "wf.db"))
-    return VerificationWorkflow(store=VerificationStore(database_url=""))
+    return VerificationWorkflow(store=VerificationStore(database_url=clone_migrated("landwf")))
 
 
 def make_client(store):
@@ -237,8 +234,6 @@ class TestLandsRegistryAdapters:
 def client(store, tmp_path, monkeypatch):
     import api.verification_workflow as vw
     from api.extended import get_land_store
-
-    monkeypatch.setattr(vw, "DEFAULT_SQLITE_PATH", str(tmp_path / "wf.db"))
     vw._workflow = None
     app = create_app()
     app.dependency_overrides[get_land_store] = lambda: store
@@ -261,11 +256,11 @@ class TestJourney34Contracts:
         store.execute(
             "INSERT INTO parcel_claimants (state, certificate_number, claimant_name,"
             " claim_date, document_type, document_ref, verified) VALUES"
-            " ('Lagos', 'CERT-XYZ-1', 'Chief Seller', '2025-01-01T00:00:00', 'c_of_o', 'D1', 1)")
+            " ('Lagos', 'CERT-XYZ-1', 'Chief Seller', '2025-01-01T00:00:00', 'c_of_o', 'D1', TRUE)")
         store.execute(
             "INSERT INTO parcel_claimants (state, certificate_number, claimant_name,"
             " claim_date, document_type, document_ref, verified) VALUES"
-            " ('Lagos', 'CERT-XYZ-1', 'Mister Fraudster', '2025-06-01T00:00:00', 'deed_of_assignment', 'D2', 0)")
+            " ('Lagos', 'CERT-XYZ-1', 'Mister Fraudster', '2025-06-01T00:00:00', 'deed_of_assignment', 'D2', FALSE)")
         resp = client.post("/api/v1/detect-claimants",
                            json={"property_address": "1 SYNTHETIC Close, Ikoyi",
                                  "state": "Lagos", "certificate_number": "CERT-XYZ-1"})
@@ -286,7 +281,7 @@ class TestJourney34Contracts:
             "INSERT INTO court_disputes (case_number, state, property_address, parties,"
             " description, court_location, status, filed_date) VALUES"
             " ('LD/1234/2025', 'Lagos', '1 SYNTHETIC Close, Ikoyi',"
-            " '[\"Chief Seller\", \"Mister Fraudster\"]', 'Ownership tussle',"
+            " '{\"Chief Seller\",\"Mister Fraudster\"}', 'Ownership tussle',"
             " 'Lagos High Court', 'active', '2025-03-01T00:00:00')")
         resp = client.post("/api/v1/court-disputes",
                            json={"property_address": "1 SYNTHETIC Close, Ikoyi",

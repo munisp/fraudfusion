@@ -21,13 +21,14 @@ from app import kyb_verification
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db, reset_db_for_tests
 from app.main import create_app
+from embedded_pg import clone_migrated
 
 TENANT = Principal(sub="user-tenant-1", username="ada", roles=set())
 
 
 @pytest.fixture()
 def db(tmp_path):
-    database = Database(database_url="", sqlite_path=str(tmp_path / "onboarding.db"))
+    database = Database(database_url=clone_migrated("onboarding"))
     yield database
     reset_db_for_tests(None)
 

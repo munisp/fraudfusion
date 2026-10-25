@@ -1,6 +1,6 @@
 -- Round 14: document intelligence engine — fingerprint registry and
 -- tamper-evident verification chain (canonical PostgreSQL migration;
--- doc-verification service falls back to SQLite for dev/test).
+-- doc-verification service formerly fell back to SQLite; removed Round 27).
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS doc_registry (

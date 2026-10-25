@@ -13,8 +13,8 @@ Implements the platform's monetization stack (see docs/MONETIZATION.md):
 - Control-plane endpoints are tenant-scoped via Keycloak principals
   (fail-closed, see app/auth.py); billing_admin role is cross-tenant.
 
-Schema: database/20260901_billing_monetization.sql (PostgreSQL; SQLite
-mirror in app/db.py for local dev/tests).
+Schema: database/20260901_billing_monetization.sql (PostgreSQL only —
+the platform has no SQLite fallback).
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ def _record_usage(database, body: UsageEventIn) -> dict[str, Any]:
             "INSERT INTO usage_rollups (tenant_id, period, operation, units, updated_at) "
             "VALUES (:t, :period, :op, :units, :now) "
             "ON CONFLICT (tenant_id, period, operation) DO UPDATE SET "
-            "units = units + :units, updated_at = :now",
+            "units = usage_rollups.units + EXCLUDED.units, updated_at = :now",
             {"t": body.tenant_id, "period": occurred_at[:7], "op": body.operation,
              "units": body.units, "now": utcnow()},
         )

@@ -356,9 +356,8 @@ def court_disputes(payload: CourtDisputesInput,
             {"s": state, "a": payload.property_address},
         ))
     for party in payload.parties or []:
-        # parties stored as JSON array text (SQLite) or TEXT[] (Postgres);
-        # a case-insensitive substring match on the serialized parties keeps
-        # both dialects honest without dialect-specific SQL.
+        # parties is TEXT[] on Postgres (decoded to a list by psycopg);
+        # match case-insensitively on the serialized form.
         _add([
             r for r in store.query(
                 "SELECT * FROM court_disputes WHERE tenant_id = 'default'"
@@ -501,8 +500,6 @@ def create_booking(payload: BookingInput,
     # Mark the availability slot taken (kept for audit; availability endpoint
     # also subtracts confirmed bookings).
     store.execute(
-        "UPDATE professional_availability SET is_available = 0 WHERE professional_id = :p"
-        " AND slot_date = :d AND start_time = :t" if not store._is_pg else
         "UPDATE professional_availability SET is_available = FALSE WHERE professional_id = :p"
         " AND slot_date = :d AND start_time = :t",
         {"p": payload.professional_id, "d": payload.date, "t": payload.start_time},
