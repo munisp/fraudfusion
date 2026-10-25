@@ -46,7 +46,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Response, UploadFile, status
 
-from app import bureau, counterparty, docverification, identity, phone_tenure, screening, tiers, webhooks
+from app import bureau, counterparty, docverification, identity, integration, phone_tenure, screening, tiers, webhooks
 from app.api_keys import is_api_key, principal_tenant, require_scope
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db
@@ -1248,6 +1248,21 @@ def create_app() -> FastAPI:
         if gap["flag"]:
             score += gap["contribution"]
             factors.append(gap["factor"])
+        # Cross-service enrichment (advisory): national fraud-intelligence
+        # posterior from intel-service via the mesh. Advisory only — it
+        # informs analysts, it never moves the score itself; unavailable
+        # peers degrade to an honest status block.
+        intel_block = {"status": "unavailable",
+                       "reason": integration.INTEGRATION_UNAVAILABLE_REASON
+                       or "INTEL_SERVICE_URL not configured"}
+        if integration.INTEGRATION_AVAILABLE:
+            summary = integration.flows.intel_national_summary(
+                integration.fresh_mesh())
+            intel_block = {"status": summary["status"],
+                           **({"data": summary["data"],
+                               "latency_ms": summary["latency_ms"]}
+                              if summary["status"] == "ok"
+                              else {"reason": summary.get("reason")})}
         score = round(min(score, 1.0), 3)
         return {
             "assessment_id": uuid.uuid4().hex,
@@ -1256,6 +1271,7 @@ def create_app() -> FastAPI:
             "factors": factors,
             "counterparty_verification_gap": gap["flag"],
             "counterparty_rigor": rigor,
+            "national_intelligence": intel_block,
             "model": "rules",
             "timestamp": _now(),
         }
@@ -1297,6 +1313,21 @@ def create_app() -> FastAPI:
         if gap["flag"]:
             score += gap["contribution"]
             factors.append(gap["factor"])
+        # Cross-service enrichment (advisory): national fraud-intelligence
+        # posterior from intel-service via the mesh. Advisory only — it
+        # informs analysts, it never moves the score itself; unavailable
+        # peers degrade to an honest status block.
+        intel_block = {"status": "unavailable",
+                       "reason": integration.INTEGRATION_UNAVAILABLE_REASON
+                       or "INTEL_SERVICE_URL not configured"}
+        if integration.INTEGRATION_AVAILABLE:
+            summary = integration.flows.intel_national_summary(
+                integration.fresh_mesh())
+            intel_block = {"status": summary["status"],
+                           **({"data": summary["data"],
+                               "latency_ms": summary["latency_ms"]}
+                              if summary["status"] == "ok"
+                              else {"reason": summary.get("reason")})}
         score = round(min(score, 1.0), 3)
         return {
             "check_id": uuid.uuid4().hex,
@@ -1307,9 +1338,23 @@ def create_app() -> FastAPI:
             "factors": factors,
             "counterparty_verification_gap": gap["flag"],
             "counterparty_rigor": rigor,
+            "national_intelligence": intel_block,
             "model": "rules",
             "timestamp": _now(),
         }
+
+    @app.get("/api/v1/integrations/status")
+    def integrations_status(
+            principal: Principal = Depends(require_scope("fraud_score"))) -> dict:
+        """Service-mesh health: which peer services are configured and
+        reachable from kyc-api right now. Never raises."""
+        if not integration.INTEGRATION_AVAILABLE:
+            return {"mesh": "unavailable",
+                    "reason": integration.INTEGRATION_UNAVAILABLE_REASON,
+                    "services": {}}
+        return {"mesh": "ok",
+                "services": integration.fresh_mesh().status(),
+                "timestamp": _now()}
 
     @app.post("/api/v1/risk/behavioral-analysis")
     def behavioral_analysis(payload: BehavioralAnalysisRequest,

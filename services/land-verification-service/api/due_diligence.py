@@ -38,7 +38,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from api import evidence, events, geospatial, risk
-from api import doc_intel
+from api import doc_intel, mesh_boot
 from api.data_store import LandDataStore, get_land_store
 from api.deed_conformance import check_deed_conformance
 from api.registry_adapters import get_lands_adapter
@@ -843,6 +843,37 @@ def due_diligence(payload: DueDiligenceInput,
     signals["title_chain"] = chain
 
     scored = risk.score_factors(factors)
+    # Cross-service enrichment (advisory): screen the seller's claimed name
+    # against kyc-api PEP/sanctions lists via the service mesh. Advisory —
+    # it never moves the verdict itself; a hit lands as a scored factor
+    # only when the screening service actually reports one. Unavailable
+    # peers degrade to an honest status block.
+    screening_block: dict[str, Any] = {"status": "unavailable",
+                                       "reason": mesh_boot.INTEGRATION_UNAVAILABLE_REASON
+                                       or "KYC_API_URL not configured"}
+    if mesh_boot.INTEGRATION_AVAILABLE and payload.claimed_owner:
+        m = mesh_boot.fresh_mesh()
+        pep = mesh_boot.flows.kyc_pep_screening(payload.claimed_owner, m)
+        san = mesh_boot.flows.kyc_sanctions_screening(payload.claimed_owner, m)
+        screening_block = {"status": "unavailable",
+                           "pep": {"status": pep["status"],
+                                   **({"data": pep["data"]} if pep["status"] == "ok"
+                                      else {"reason": pep.get("reason")})},
+                           "sanctions": {"status": san["status"],
+                                         **({"data": san["data"]} if san["status"] == "ok"
+                                            else {"reason": san.get("reason")})}}
+        if pep["status"] == "ok" or san["status"] == "ok":
+            screening_block["status"] = "ok"
+        san_data = san.get("data") or {}
+        pep_data = pep.get("data") or {}
+        if san_data.get("is_sanctioned"):
+            _factor("seller_sanctions_hit",
+                    "seller name matched a sanctions list entry", "high")
+        if pep_data.get("is_pep"):
+            _factor("seller_pep_hit",
+                    "seller name matched the PEP list", "medium")
+        scored = risk.score_factors(factors)  # re-score with screening factors
+    signals["identity_screening"] = screening_block
     # Back-compat: the legacy severity verdict and the score band are both
     # reported; the headline verdict is the STRICTER of the two so existing
     # integrators never see a downgrade silently.

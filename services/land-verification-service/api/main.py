@@ -181,6 +181,17 @@ def create_app() -> FastAPI:
     from api.due_diligence import router as due_diligence_router
     app.include_router(due_diligence_router)
 
+    @app.get("/api/v1/integrations/status", response_model=dict)
+    async def integrations_status():
+        """Service-mesh health: which peer services are configured and
+        reachable from the land service right now. Never raises."""
+        from api import mesh_boot
+        if not mesh_boot.INTEGRATION_AVAILABLE:
+            return {"mesh": "unavailable",
+                    "reason": mesh_boot.INTEGRATION_UNAVAILABLE_REASON,
+                    "services": {}}
+        return {"mesh": "ok", "services": mesh_boot.fresh_mesh().status()}
+
     @app.get("/", response_model=dict)
     async def root():
         return {

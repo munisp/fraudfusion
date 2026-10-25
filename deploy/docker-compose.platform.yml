@@ -1,0 +1,96 @@
+# FraudFusion platform compose — python service mesh wiring.
+#
+# Boots the python services with the mesh registry env vars
+# (services/python/integration/mesh.py) so every service can call every
+# other service. Auth: Keycloak for user tokens; FRAUDFUSION_INTERNAL_TOKEN
+# for service-to-service internal endpoints; KYC_API_KEY for scope-gated
+# kyc-api calls from peers (issue a service key via onboarding-service).
+#
+# Postgres is the source of record (FRAUDFUSION_REQUIRE_POSTGRES=1).
+# Optional AI sidecars (ollama + doc-intel) live in docker-compose.doc-intel.yml.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: fraudfusion
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../database:/migrations:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  intel-service:
+    build: ../services/python/intel-service
+    environment: &common
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/fraudfusion
+      FRAUDFUSION_REQUIRE_POSTGRES: "1"
+      KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-fraudfusion}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-fraudfusion}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
+      FRAUDFUSION_INTERNAL_TOKEN: ${FRAUDFUSION_INTERNAL_TOKEN:?set FRAUDFUSION_INTERNAL_TOKEN}
+      # --- mesh registry: every peer address, so any service can call any other
+      KYC_API_URL: http://kyc-api:8000
+      LAND_SERVICE_URL: http://land-verification:8200
+      INTEL_SERVICE_URL: http://intel-service:8500
+      ONBOARDING_SERVICE_URL: http://onboarding-service:8300
+      BACKOFFICE_API_URL: http://backoffice-api:8400
+      BILLING_SERVICE_URL: http://billing-service:8600
+      WEBHOOK_SERVICE_URL: http://webhook-service:8700
+      WEBHOOK_INTERNAL_TOKEN: ${FRAUDFUSION_INTERNAL_TOKEN}
+      KYC_API_KEY: ${KYC_SERVICE_API_KEY:-}
+      DOC_INTEL_URL: http://doc-intelligence:8800
+      OLLAMA_URL: http://ollama:11434
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8500:8500"]
+
+  kyc-api:
+    build: ../services/python/kyc-api
+    environment: *common
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8000:8000"]
+
+  land-verification:
+    build: ../services/land-verification-service
+    environment: *common
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8200:8200"]
+
+  onboarding-service:
+    build: ../services/python/onboarding-service
+    environment: *common
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8300:8300"]
+
+  backoffice-api:
+    build: ../services/python/backoffice-api
+    environment: *common
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8400:8400"]
+
+  billing-service:
+    build: ../services/python/billing-service
+    environment: *common
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8600:8600"]
+
+  webhook-service:
+    build: ../services/python/webhook-service
+    environment: *common
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8700:8700"]
+
+volumes:
+  pgdata:
