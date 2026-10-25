@@ -27,6 +27,10 @@ pub const ISSUANCE_BENEFICIARY_BURST_MIN: f64 = 3.0;
 pub const HIGH_VALUE_SINGLE_APPROVAL_NGN: f64 = 10_000_000.0;
 pub const SIM_STEPUP_WINDOW_HOURS: f64 = 168.0;
 pub const SIM_STEPUP_AMOUNT_MIN_NGN: f64 = 100_000.0;
+pub const POST_SWAP_CUMULATIVE_MIN_NGN: f64 = 250_000.0;
+pub const BEHAVIORAL_Z_REVIEW: f64 = 3.0;
+pub const BEHAVIORAL_Z_BLOCK: f64 = 4.5;
+pub const BEHAVIORAL_MIN_BASELINE: usize = 10;
 
 pub type Payload = Map<String, Value>;
 
@@ -333,7 +337,7 @@ pub fn issuance(p: &Payload, history: &[HistoryEvent], now: DateTime<Utc>) -> De
 }
 
 /// 6. USSD / feature-phone channel fraud.
-pub fn channel(p: &Payload, _history: &[HistoryEvent], _now: DateTime<Utc>) -> DetectorResult {
+pub fn channel(p: &Payload, history: &[HistoryEvent], now: DateTime<Utc>) -> DetectorResult {
     let mut f = vec![];
     let mut score = 0.05;
     let sim_hours = num(p.get("sim_change_hours"));
@@ -352,6 +356,25 @@ pub fn channel(p: &Payload, _history: &[HistoryEvent], _now: DateTime<Utc>) -> D
             score += 0.30;
             f.push(factor("sim_age_high_value_stepup",
                           "high-value transaction within the SIM-age step-up window", 0.30));
+        }
+    }
+    if let Some(h) = sim_hours {
+        if h < SIM_STEPUP_WINDOW_HOURS {
+            let cutoff = now - Duration::minutes((h * 60.0) as i64);
+            let post_swap: f64 = history
+                .iter()
+                .filter(|e| match DateTime::parse_from_rfc3339(&e.created_at) {
+                    Ok(t) => t.with_timezone(&Utc) >= cutoff,
+                    Err(_) => true,
+                })
+                .map(|e| num(e.payload.get("amount_ngn")).unwrap_or(0.0))
+                .sum();
+            let total = post_swap + channel_amount;
+            if total >= POST_SWAP_CUMULATIVE_MIN_NGN {
+                score += 0.25;
+                f.push(factor("post_swap_cumulative_stepup",
+                              "cumulative amount moved within the SIM-age window", 0.25));
+            }
         }
     }
     if truthy(p.get("imei_is_new")) && channel_amount > 100_000.0 {
@@ -458,6 +481,59 @@ pub fn subsidy(p: &Payload, history: &[HistoryEvent], _now: DateTime<Utc>) -> De
     mkresult(score, f)
 }
 
+/// 9. Behavioral baseline anomaly (dependency-free z-scores).
+pub fn behavioral(p: &Payload, history: &[HistoryEvent], _now: DateTime<Utc>) -> DetectorResult {
+    let mut f = vec![];
+    let mut score = 0.05;
+    let mut metrics: Vec<&String> = p
+        .iter()
+        .filter(|(_, v)| v.is_number())
+        .map(|(k, _)| k)
+        .collect();
+    metrics.sort();
+    if metrics.is_empty() {
+        f.push(factor("history_unavailable",
+                      "no numeric metrics in payload — behavioral scoring skipped", 0.0));
+        return mkresult(score, f);
+    }
+    let mut fired = 0;
+    let mut any_baseline = false;
+    for metric in &metrics {
+        let values: Vec<f64> = history
+            .iter()
+            .filter_map(|e| num(e.payload.get(*metric)))
+            .collect();
+        if values.len() >= BEHAVIORAL_MIN_BASELINE {
+            any_baseline = true;
+        } else {
+            continue;
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance =
+            values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / values.len() as f64;
+        let std = variance.sqrt().max(mean * 0.01).max(1e-9);
+        let current = num(p.get(*metric)).unwrap_or(0.0);
+        let z = (current - mean).abs() / std;
+        if z >= BEHAVIORAL_Z_BLOCK {
+            score += 0.35;
+            fired += 1;
+            f.push(factor("behavioral_outlier_block",
+                          "metric far outside subject baseline", 0.35));
+        } else if z >= BEHAVIORAL_Z_REVIEW {
+            score += 0.20;
+            fired += 1;
+            f.push(factor("behavioral_outlier_review",
+                          "metric outside subject baseline", 0.20));
+        }
+    }
+    if fired == 0 && !any_baseline {
+        f.push(factor("history_unavailable",
+                      "fewer than the minimum baseline points per metric — behavioral scoring skipped",
+                      0.0));
+    }
+    mkresult(score, f)
+}
+
 /// Look up a detector by canonical name.
 pub fn detect(
     name: &str, p: &Payload, history: &[HistoryEvent], now: DateTime<Utc>,
@@ -471,6 +547,7 @@ pub fn detect(
         "channel" => channel,
         "ghost_payroll" => ghost_payroll,
         "subsidy" => subsidy,
+        "behavioral" => behavioral,
         _ => return None,
     };
     Some(f(p, history, now))

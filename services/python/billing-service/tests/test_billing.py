@@ -8,6 +8,7 @@ API-key auth is exercised for real through the /v1/billing/meter/* endpoints.
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import date, timedelta
 
 import pytest
@@ -492,3 +493,155 @@ def test_dunning_marks_past_due_then_suspends_keys_after_grace(db):
                        headers={"X-API-Key": issued_key["plaintext_key"]}).status_code == 403
     events = db.query("SELECT action FROM billing_dunning_events WHERE tenant_id = 'tenant-1'")
     assert {e["action"] for e in events} == {"past_due", "suspend_keys"}
+
+
+# ---------------------------------------------------------------------------
+# Paystack payment rail (checkout + signed webhook)
+# ---------------------------------------------------------------------------
+
+import hmac as _hmac
+
+PAYSTACK_TEST_SECRET = "sk_test_billing-suite-secret"
+
+
+def _generate_issued_invoice(client, db, period="2026-08"):
+    _seed_growth_usage(client, db, period=period)
+    invoice_id = client.post("/v1/billing/invoices/generate",
+                             params={"period": period}).json()["generated"][0]["invoice_id"]
+    resp = client.post(f"/v1/billing/invoices/{invoice_id}/issue")
+    assert resp.status_code == 200, resp.text
+    return invoice_id
+
+
+def _paystack_headers(raw: bytes, secret: str = PAYSTACK_TEST_SECRET) -> dict:
+    return {"x-paystack-signature": _hmac.new(secret.encode(), raw, hashlib.sha512).hexdigest(),
+            "content-type": "application/json"}
+
+
+def test_checkout_fails_closed_without_secret(db, monkeypatch):
+    monkeypatch.delenv("PAYSTACK_SECRET_KEY", raising=False)
+    client = make_client(db, TENANT_USER)
+    invoice_id = _generate_issued_invoice(client, db)
+    resp = client.post(f"/v1/billing/invoices/{invoice_id}/checkout",
+                       params={"email": "ada@example.com"})
+    assert resp.status_code == 503
+    assert "PAYSTACK_SECRET_KEY" in resp.json()["detail"]
+
+
+def test_checkout_rejects_non_issued_invoice(db, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", PAYSTACK_TEST_SECRET)
+    client = make_client(db, TENANT_USER)
+    _seed_growth_usage(client, db)
+    invoice_id = client.post("/v1/billing/invoices/generate",
+                             params={"period": "2026-08"}).json()["generated"][0]["invoice_id"]
+    resp = client.post(f"/v1/billing/invoices/{invoice_id}/checkout",
+                       params={"email": "ada@example.com"})
+    assert resp.status_code == 409
+
+
+def test_webhook_rejects_bad_signature(db, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", PAYSTACK_TEST_SECRET)
+    client = make_client(db, TENANT_USER)
+    raw = b'{"event": "charge.success", "data": {"reference": "inv-anything"}}'
+    resp = client.post("/webhooks/paystack", content=raw,
+                       headers={"x-paystack-signature": "deadbeef",
+                                "content-type": "application/json"})
+    assert resp.status_code == 401
+
+
+def test_webhook_rejects_when_secret_unconfigured(db, monkeypatch):
+    """Fail-closed: with no secret configured even a 'correct-looking'
+    signature cannot verify, so the webhook is rejected."""
+    monkeypatch.delenv("PAYSTACK_SECRET_KEY", raising=False)
+    client = make_client(db, TENANT_USER)
+    raw = b'{"event": "charge.success", "data": {"reference": "x"}}'
+    resp = client.post("/webhooks/paystack", content=raw, headers=_paystack_headers(raw))
+    assert resp.status_code == 401
+
+
+def test_webhook_charge_success_marks_invoice_paid_and_resumes_subscription(db, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", PAYSTACK_TEST_SECRET)
+    client = make_client(db, TENANT_USER)
+    invoice_id = _generate_issued_invoice(client, db)
+    # Simulate dunning: subscription past_due before the payment lands.
+    db.execute("UPDATE billing_subscriptions SET status = 'past_due' WHERE tenant_id = 'tenant-1'")
+
+    raw = json.dumps({"event": "charge.success", "data": {"reference": invoice_id}}).encode()
+    resp = client.post("/webhooks/paystack", content=raw, headers=_paystack_headers(raw))
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"status": "paid", "invoice_id": invoice_id}
+
+    row = db.query_one("SELECT status, paid_at FROM billing_invoices WHERE id = :id", {"id": invoice_id})
+    assert row["status"] == "paid" and row["paid_at"]
+    sub = db.query_one("SELECT status FROM billing_subscriptions WHERE tenant_id = 'tenant-1'")
+    assert sub["status"] == "active"
+
+    # Idempotent: Paystack retries the webhook; second delivery is a no-op.
+    again = client.post("/webhooks/paystack", content=raw, headers=_paystack_headers(raw))
+    assert again.status_code == 200 and again.json()["status"] == "already_paid"
+
+
+def test_webhook_unknown_reference_and_unrelated_event(db, monkeypatch):
+    monkeypatch.setenv("PAYSTACK_SECRET_KEY", PAYSTACK_TEST_SECRET)
+    client = make_client(db, TENANT_USER)
+    raw = json.dumps({"event": "charge.success", "data": {"reference": "inv-nope"}}).encode()
+    assert client.post("/webhooks/paystack", content=raw,
+                       headers=_paystack_headers(raw)).status_code == 404
+    other = json.dumps({"event": "transfer.success", "data": {"reference": "x"}}).encode()
+    resp = client.post("/webhooks/paystack", content=other, headers=_paystack_headers(other))
+    assert resp.status_code == 200 and resp.json()["status"] == "ignored"
+
+
+# ---------------------------------------------------------------------------
+# Auto-metering ingestion (service-to-service /internal/usage)
+# ---------------------------------------------------------------------------
+
+INTERNAL_TOKEN = "billing-internal-test-token"
+
+
+def _usage_body(tenant="tenant-1", operation="fraud_score", key="svc:req-1"):
+    return {"tenant_id": tenant, "service": "fraud-signals", "operation": operation,
+            "units": 1, "idempotency_key": key}
+
+
+def test_internal_usage_fail_closed_without_token(db, monkeypatch):
+    monkeypatch.setattr("app.main.BILLING_INTERNAL_TOKEN", "")
+    client = make_client(db, TENANT_USER)
+    resp = client.post("/internal/usage", json=_usage_body(),
+                       headers={"X-Internal-Token": "anything"})
+    assert resp.status_code == 503
+
+
+def test_internal_usage_rejects_wrong_token(db, monkeypatch):
+    monkeypatch.setattr("app.main.BILLING_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    client = make_client(db, TENANT_USER)
+    resp = client.post("/internal/usage", json=_usage_body(),
+                       headers={"X-Internal-Token": "wrong"})
+    assert resp.status_code == 401
+
+
+def test_internal_usage_records_and_rolls_up_idempotently(db, monkeypatch):
+    monkeypatch.setattr("app.main.BILLING_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    client = make_client(db, TENANT_USER)
+    body = _usage_body()
+    headers = {"X-Internal-Token": INTERNAL_TOKEN}
+    first = client.post("/internal/usage", json=body, headers=headers)
+    assert first.status_code == 201 and first.json()["recorded"] is True
+    # Middleware retry with the same idempotency key must not double-bill.
+    replay = client.post("/internal/usage", json=body, headers=headers)
+    assert replay.status_code == 201 and replay.json()["idempotent_replay"] is True
+    rollup = db.query_one("SELECT units FROM usage_rollups WHERE tenant_id = 'tenant-1'"
+                          " AND operation = 'fraud_score'")
+    assert rollup["units"] == 1
+
+
+def test_internal_usage_validates_operation_and_tenant(db, monkeypatch):
+    monkeypatch.setattr("app.main.BILLING_INTERNAL_TOKEN", INTERNAL_TOKEN)
+    client = make_client(db, TENANT_USER)
+    headers = {"X-Internal-Token": INTERNAL_TOKEN}
+    resp = client.post("/internal/usage", json=_usage_body(operation="not_a_thing"),
+                       headers=headers)
+    assert resp.status_code == 422
+    resp = client.post("/internal/usage", json=_usage_body(tenant="tenant-ghost"),
+                       headers=headers)
+    assert resp.status_code == 404

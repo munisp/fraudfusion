@@ -621,10 +621,11 @@
       },
       "history": [],
       "expected": {
-        "score": 0.35,
+        "score": 0.6,
         "verdict": "review",
         "factor_codes": [
-          "sim_age_high_value_stepup"
+          "sim_age_high_value_stepup",
+          "post_swap_cumulative_stepup"
         ]
       }
     },
@@ -715,6 +716,235 @@
         "factor_codes": [
           "beneficiary_issuance_burst",
           "high_value_single_approval"
+        ]
+      }
+    },
+    {
+      "detector": "channel",
+      "payload": {
+        "channel": "ussd",
+        "sim_change_hours": 30,
+        "amount_ngn": 60000,
+        "phone_tenure_days": 400
+      },
+      "history": [
+        {
+          "payload": {
+            "amount_ngn": 80000
+          },
+          "created_at": "2026-10-30T11:52:48+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 120000
+          },
+          "created_at": "2026-10-30T11:45:36+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.3,
+        "verdict": "clear",
+        "factor_codes": [
+          "post_swap_cumulative_stepup"
+        ]
+      }
+    },
+    {
+      "detector": "behavioral",
+      "payload": {
+        "amount_ngn": 900000
+      },
+      "history": [
+        {
+          "payload": {
+            "amount_ngn": 10000
+          },
+          "created_at": "2026-10-30T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10500
+          },
+          "created_at": "2026-10-30T09:36:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 11000
+          },
+          "created_at": "2026-10-30T07:12:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10000
+          },
+          "created_at": "2026-10-30T04:48:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10500
+          },
+          "created_at": "2026-10-30T02:24:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 11000
+          },
+          "created_at": "2026-10-30T00:00:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10000
+          },
+          "created_at": "2026-10-29T21:36:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10500
+          },
+          "created_at": "2026-10-29T19:12:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 11000
+          },
+          "created_at": "2026-10-29T16:48:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10000
+          },
+          "created_at": "2026-10-29T14:24:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10500
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 11000
+          },
+          "created_at": "2026-10-29T09:36:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.4,
+        "verdict": "review",
+        "factor_codes": [
+          "behavioral_outlier_block"
+        ]
+      }
+    },
+    {
+      "detector": "behavioral",
+      "payload": {
+        "amount_ngn": 10500
+      },
+      "history": [
+        {
+          "payload": {
+            "amount_ngn": 10000
+          },
+          "created_at": "2026-10-30T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10500
+          },
+          "created_at": "2026-10-30T09:36:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 11000
+          },
+          "created_at": "2026-10-30T07:12:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10000
+          },
+          "created_at": "2026-10-30T04:48:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10500
+          },
+          "created_at": "2026-10-30T02:24:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 11000
+          },
+          "created_at": "2026-10-30T00:00:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10000
+          },
+          "created_at": "2026-10-29T21:36:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10500
+          },
+          "created_at": "2026-10-29T19:12:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 11000
+          },
+          "created_at": "2026-10-29T16:48:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10000
+          },
+          "created_at": "2026-10-29T14:24:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 10500
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 11000
+          },
+          "created_at": "2026-10-29T09:36:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.05,
+        "verdict": "clear",
+        "factor_codes": []
+      }
+    },
+    {
+      "detector": "behavioral",
+      "payload": {
+        "amount_ngn": 10500
+      },
+      "history": [
+        {
+          "payload": {
+            "amount_ngn": 10000
+          },
+          "created_at": "2026-10-30T09:36:00+00:00"
+        },
+        {
+          "payload": {
+            "amount_ngn": 11000
+          },
+          "created_at": "2026-10-30T10:48:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.05,
+        "verdict": "clear",
+        "factor_codes": [
+          "history_unavailable"
         ]
       }
     }

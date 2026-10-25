@@ -4,18 +4,19 @@ Developing-market fraud detectors, exposed as a mesh service and implemented
 in **four languages** (Python reference, TypeScript SDK, Go, Rust) pinned to
 one parity contract.
 
-## The eight detectors
+## The nine detectors
 
 | Detector | Endpoint | Pattern |
 |---|---|---|
 | `app_scam` | `POST /api/v1/signals/app_scam` | Authorized-push-payment / social-engineering scams (payee novelty, amount outlier, rushed session, new device, payee mule score) |
-| `mule` | `POST /api/v1/signals/mule` | Money-mule behaviour (pass-through ratio, fan-in, dormancy burst, shared-device clusters) |
+| `mule` | `POST /api/v1/signals/mule` | Money-mule behaviour (pass-through ratio, fan-in, dormancy burst, shared-device clusters, high-risk sender fan-in) |
 | `agent` | `POST /api/v1/signals/agent` | Agent-banking / mobile-money fraud (velocity spike, structuring below ₦50k, off-location, float diversion) |
 | `loan_stacking` | `POST /api/v1/signals/loan_stacking` | Cross-lender stacking & bust-out (≥3 lenders in 14d, first-payment default, thin file, forged income docs) |
-| `issuance` | `POST /api/v1/signals/issuance` | Insider-issued *genuine* documents (officer velocity z-score, after-hours issuance, sequence gaps, registry/survey mismatch) |
-| `channel` | `POST /api/v1/signals/channel` | USSD / feature-phone fraud (SIM-swap recency, new IMEI high-value, fake-alert integrity, low phone tenure) |
+| `issuance` | `POST /api/v1/signals/issuance` | Insider-issued *genuine* documents (officer velocity z-score, after-hours issuance, sequence gaps, registry/survey mismatch, beneficiary burst, four-eyes) |
+| `channel` | `POST /api/v1/signals/channel` | USSD / feature-phone fraud (SIM-swap recency, SIM-age step-up, post-swap cumulative drain, new IMEI high-value, fake-alert integrity, low phone tenure) |
 | `ghost_payroll` | `POST /api/v1/signals/ghost_payroll` | Ghost workers (shared salary accounts, duplicate identities, salary-only accounts, deceased-registry hits) |
 | `subsidy` | `POST /api/v1/signals/subsidy` | Phantom-farmer subsidy fraud (implausible ₦/ha, farm outside LGA, duplicate claimants, no field activity) |
+| `behavioral` | `POST /api/v1/signals/behavioral` | Population-z behavioral outlier scoring (numeric payload metrics vs subject baseline; z ≥ 3 review, z ≥ 4.5 block; min 10-point baseline) |
 
 ## Contract
 
@@ -117,12 +118,35 @@ ports + parity fixture updated together):
 
 1. **SIM-swap 24h cliff** → SIM-age step-up: high-value transactions (≥ ₦100k)
    within 168h of a SIM change escalate (`sim_age_high_value_stepup`, 0.30).
-   Residual: sub-₦100k moves at 25h+ — needs cumulative-amount step-up.
+   Closed further in Round 22 (below).
 2. **Under-threshold mule fan-in** → sender-risk propagation: events may carry
    `counterparty_risk` (the sender's own score, annotated via the mesh); ≥3
-   risky senders fires `high_risk_fan_in` (0.30). Residual: unannotated
-   senders — service-side self-enrichment is the roadmap.
+   risky senders fires `high_risk_fan_in` (0.30). Closed further in Round 22.
 3. **Slow insider issuance** → beneficiary-side + four-eyes:
    `beneficiary_issuance_burst` (≥3 certs to one beneficiary in 30d, 0.25) and
    `high_value_single_approval` (≥ ₦10M with one approver, 0.20). Residual:
    clean-beneficiary low-value dual-approved issuance — needs audit sampling.
+
+### Gap closures (Round 22)
+
+The two Round-21 residuals that were closable in code were closed (again in
+all four language ports + parity fixture together):
+
+1. **Post-swap cumulative drain** — the channel detector now sums ALL
+   transactions since the SIM change (unparseable timestamps count toward
+   the drain, fail-suspicious); ≥ ₦250k cumulative fires
+   `post_swap_cumulative_stepup` (0.30). A fraudster dripping sub-₦100k
+   amounts past the 24h cliff is caught once the drip total crosses ₦250k.
+   Residual: patient drains below ₦250k total — needs per-tenant limits.
+2. **Unannotated mule senders** — the service now self-enriches: incoming
+   transfer events naming a `counterparty` without `counterparty_risk` are
+   annotated from the latest stored eval score for that counterparty
+   (`_enrich_counterparty_risk`). The detector stays pure; composition
+   happens at the service layer. Residual: senders never previously scored
+   remain unknown (cold start).
+3. **No ML scoring** → the `behavioral` detector adds population-z outlier
+   scoring: numeric payload metrics are z-scored against the subject's own
+   stored history (min 10-point baseline, std floored against degenerate
+   distributions); max z ≥ 3 → review factor (0.20), z ≥ 4.5 → block factor
+   (0.35). It is honest about its limits: below the baseline it emits
+   `history_unavailable` rather than fabricating a score.

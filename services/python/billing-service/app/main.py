@@ -30,7 +30,10 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Path, Query, status
+from fastapi import (Depends, FastAPI, Header, HTTPException, Path, Query,
+                     Request, status)
+
+from app import paystack
 
 from app.auth import Principal, get_current_principal
 from app.db import Database, get_db
@@ -106,6 +109,45 @@ def _key_view(row: dict[str, Any]) -> ApiKeyView:
         expires_at=r.get("expires_at"), last_used_at=r.get("last_used_at"),
         created_at=str(r["created_at"]),
     )
+
+
+
+def _mark_invoice_paid(database, row: dict, journal_id: str | None = None) -> None:
+    """Shared paid-transition used by the manual endpoint and the Paystack
+    webhook: mark paid, record the settlement journal link, clear dunning."""
+    database.execute(
+        "UPDATE billing_invoices SET status = 'paid', paid_at = :now, settlement_journal_id = :j, updated_at = :now WHERE id = :id",
+        {"now": utcnow(), "j": journal_id, "id": row["id"]},
+    )
+    database.execute(
+        "UPDATE billing_subscriptions SET status = 'active', updated_at = :now "
+        "WHERE tenant_id = :t AND status = 'past_due'",
+        {"now": utcnow(), "t": row["tenant_id"]},
+    )
+
+
+def _record_usage(database, body: UsageEventIn) -> dict[str, Any]:
+    """Idempotent usage-event insert + rollup bump. Shared by the
+    control-plane endpoint and the service-to-service /internal/usage."""
+    occurred_at = body.occurred_at or utcnow()
+    inserted = database.insert_idempotent(
+        "INSERT INTO usage_events (id, tenant_id, api_key_id, service, operation, units, amount_kobo, idempotency_key, occurred_at) "
+        "VALUES (:id, :t, :key, :svc, :op, :units, 0, :idem, :occ)",
+        {"id": str(uuid.uuid4()), "t": body.tenant_id, "key": body.api_key_id,
+         "svc": body.service, "op": body.operation, "units": body.units,
+         "idem": body.idempotency_key, "occ": occurred_at},
+    )
+    if inserted:
+        database.execute(
+            "INSERT INTO usage_rollups (tenant_id, period, operation, units, updated_at) "
+            "VALUES (:t, :period, :op, :units, :now) "
+            "ON CONFLICT (tenant_id, period, operation) DO UPDATE SET "
+            "units = units + :units, updated_at = :now",
+            {"t": body.tenant_id, "period": occurred_at[:7], "op": body.operation,
+             "units": body.units, "now": utcnow()},
+        )
+    return {"recorded": inserted, "idempotent_replay": not inserted,
+            "idempotency_key": body.idempotency_key}
 
 
 def create_app(db: Database | None = None, flush_threshold: int | None = None) -> FastAPI:
@@ -277,6 +319,30 @@ def create_app(db: Database | None = None, flush_threshold: int | None = None) -
             "environment": row.get("key_type") or "live",
         }
 
+    @app.post("/internal/usage", status_code=201)
+    def internal_ingest_usage(body: UsageEventIn,
+                              x_internal_token: str = Header(default="")) -> dict[str, Any]:
+        """Service-to-service usage ingestion for auto-metering middleware
+        (integration/metering.py). Guarded by X-Internal-Token
+        (BILLING_INTERNAL_TOKEN); FAIL-CLOSED 503 when unconfigured.
+        Validates the operation and tenant exist so a misconfigured peer
+        cannot write unbillable usage."""
+        if not BILLING_INTERNAL_TOKEN:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "internal token not configured (BILLING_INTERNAL_TOKEN unset); "
+                "usage endpoint is fail-closed",
+            )
+        if not hmac.compare_digest(x_internal_token, BILLING_INTERNAL_TOKEN):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid internal token")
+        if body.operation not in VALID_OPERATIONS:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                f"unknown operation '{body.operation}'")
+        if database.query_one("SELECT id FROM tenants WHERE id = :t",
+                              {"t": body.tenant_id}) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "tenant not found")
+        return _record_usage(database, body)
+
     # -- metered data-plane (API-key auth) ------------------------------------
     @app.post("/v1/billing/meter/{operation}")
     def meter(operation: str = Path(...), key: dict[str, Any] = Depends(require_api_key)):
@@ -327,25 +393,7 @@ def create_app(db: Database | None = None, flush_threshold: int | None = None) -
     @app.post("/v1/billing/usage", status_code=201)
     def ingest_usage(body: UsageEventIn, principal: Principal = Depends(get_current_principal)):
         principal.require_tenant(body.tenant_id)
-        occurred_at = body.occurred_at or utcnow()
-        inserted = database.insert_idempotent(
-            "INSERT INTO usage_events (id, tenant_id, api_key_id, service, operation, units, amount_kobo, idempotency_key, occurred_at) "
-            "VALUES (:id, :t, :key, :svc, :op, :units, 0, :idem, :occ)",
-            {"id": str(uuid.uuid4()), "t": body.tenant_id, "key": body.api_key_id,
-             "svc": body.service, "op": body.operation, "units": body.units,
-             "idem": body.idempotency_key, "occ": occurred_at},
-        )
-        if inserted:
-            database.execute(
-                "INSERT INTO usage_rollups (tenant_id, period, operation, units, updated_at) "
-                "VALUES (:t, :period, :op, :units, :now) "
-                "ON CONFLICT (tenant_id, period, operation) DO UPDATE SET "
-                "units = units + :units, updated_at = :now",
-                {"t": body.tenant_id, "period": occurred_at[:7], "op": body.operation,
-                 "units": body.units, "now": utcnow()},
-            )
-        return {"recorded": inserted, "idempotent_replay": not inserted,
-                "idempotency_key": body.idempotency_key}
+        return _record_usage(database, body)
 
     @app.get("/v1/billing/usage/current")
     def current_usage(tenant_id: str = Query(...), principal: Principal = Depends(get_current_principal)):
@@ -478,16 +526,7 @@ def create_app(db: Database | None = None, flush_threshold: int | None = None) -
         # The settlement journal (DR accounts-receivable / CR revenue) is
         # posted by the ledger-control-service; we record its UUID here as the
         # double-entry link. See docs/MONETIZATION.md.
-        database.execute(
-            "UPDATE billing_invoices SET status = 'paid', paid_at = :now, settlement_journal_id = :j, updated_at = :now WHERE id = :id",
-            {"now": utcnow(), "j": journal_id, "id": invoice_id},
-        )
-        # Paying clears dunning: resume the subscription if it was past_due.
-        database.execute(
-            "UPDATE billing_subscriptions SET status = 'active', updated_at = :now "
-            "WHERE tenant_id = :t AND status = 'past_due'",
-            {"now": utcnow(), "t": row["tenant_id"]},
-        )
+        _mark_invoice_paid(database, row, journal_id)
         return _decode_json_fields(database.query_one("SELECT * FROM billing_invoices WHERE id = :id", {"id": invoice_id}), ("line_items",))
 
     @app.post("/v1/billing/invoices/{invoice_id}/void")
@@ -501,6 +540,50 @@ def create_app(db: Database | None = None, flush_threshold: int | None = None) -
             {"now": utcnow(), "id": invoice_id},
         )
         return _decode_json_fields(database.query_one("SELECT * FROM billing_invoices WHERE id = :id", {"id": invoice_id}), ("line_items",))
+
+    # -- payment rail (Paystack) ------------------------------------------------
+    @app.post("/v1/billing/invoices/{invoice_id}/checkout", status_code=201)
+    def checkout_invoice(invoice_id: str, email: str = Query(...),
+                         principal: Principal = Depends(get_current_principal)):
+        """Initialize a Paystack hosted checkout for an issued invoice."""
+        row = _get_invoice_or_404(database, invoice_id)
+        principal.require_tenant(row["tenant_id"])
+        if row["status"] != "issued":
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                f"cannot checkout invoice in status '{row['status']}'")
+        if not paystack.available():
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                                "payment rail unavailable: PAYSTACK_SECRET_KEY not configured")
+        result = paystack.initialize_checkout(row, email)
+        if result["status"] != "ok":
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY,
+                                f"payment rail error: {result.get('reason')}")
+        return result
+
+    @app.post("/webhooks/paystack")
+    async def paystack_webhook(request: Request):
+        """Paystack charge.success -> invoice paid. Signature verified over
+        the RAW body (HMAC-SHA512); unverified webhooks are rejected."""
+        raw = await request.body()
+        signature = request.headers.get("x-paystack-signature", "")
+        if not paystack.verify_webhook_signature(raw, signature):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED,
+                                "invalid paystack webhook signature")
+        event = json.loads(raw or b"{}")
+        if event.get("event") != "charge.success":
+            return {"status": "ignored", "event": event.get("event")}
+        reference = (event.get("data") or {}).get("reference")
+        row = database.query_one(
+            "SELECT * FROM billing_invoices WHERE id = :id", {"id": reference})
+        if row is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown reference")
+        if row["status"] == "paid":
+            return {"status": "already_paid", "invoice_id": row["id"]}
+        if row["status"] != "issued":
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                f"invoice is {row['status']}, not issued")
+        _mark_invoice_paid(database, row)
+        return {"status": "paid", "invoice_id": row["id"]}
 
     # -- dunning -----------------------------------------------------------------
     @app.post("/v1/billing/dunning/run")

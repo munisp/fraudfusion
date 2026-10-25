@@ -126,6 +126,28 @@ class TestEvasionResisted:
         assert verdict in ("review", "block")
         assert "multi_lender_stack" not in {f["code"] for f in factors}
 
+    def test_low_value_drip_caught_by_cumulative_stepup(self):
+        """CLOSED (Round 22): patient SIM-swapper waits 30h then drips
+        sub-₦100k moves — each is under the single-transaction step-up, but
+        the cumulative total since the swap (₦80k + ₦120k + ₦60k = ₦260k)
+        trips the cumulative step-up."""
+        history = [ev(0.005, amount_ngn=80_000), ev(0.01, amount_ngn=120_000)]
+        score, verdict, factors = detectors.channel(
+            {"channel": "ussd", "sim_change_hours": 30,
+             "amount_ngn": 60_000, "phone_tenure_days": 400}, history)
+        assert "post_swap_cumulative_stepup" in {f["code"] for f in factors}
+
+    def test_behavioral_baseline_catches_amount_outlier(self):
+        """Round 22: the behavioral detector learns the subject's own
+        baseline — a ₦900k move against a ₦10k habit fires without any
+        fixed threshold."""
+        history = [ev(i * 0.1, amount_ngn=10_000 + (i % 3) * 500)
+                   for i in range(12)]
+        _, verdict, factors = detectors.behavioral(
+            {"amount_ngn": 900_000}, history)
+        assert verdict in ("review", "block")
+        assert "behavioral_outlier_block" in {f["code"] for f in factors}
+
     def test_business_hours_insider_still_flagged_by_velocity(self):
         """Insider issues during business hours (no after_hours signal) but
         can't hide 20 issuances against a peer mean of 5, plus the survey
@@ -145,11 +167,11 @@ class TestEvasionResisted:
 
 class TestKnownGaps:
     def test_sim_swap_25h_low_value_residual(self):
-        """RESIDUAL GAP (Round 21 narrowed this from the full 25h evasion):
-        patient SIM-swapper waits 25h and keeps amounts under ₦100k — the
-        step-up window only bites on high value.
-        Compensating control: cumulative-amount step-up (sum of post-swap
-        transactions vs window), needs issuer-side session aggregation."""
+        """RESIDUAL GAP (narrowed twice: R21 added the high-value step-up,
+        R22 the cumulative step-up): patient SIM-swapper who keeps BOTH
+        single transactions and the running total small stays clear.
+        Compensating control: hard daily caps on new-SIM sessions —
+        issuer-side policy, not a scoring signal."""
         _, verdict, factors = detectors.channel(
             {"channel": "ussd", "sim_change_hours": 25,
              "amount_ngn": 50_000, "phone_tenure_days": 400}, [])
@@ -157,11 +179,13 @@ class TestKnownGaps:
         assert not [f for f in factors if f["weight"] > 0]
 
     def test_mule_small_fan_in_unannotated_residual(self):
-        """RESIDUAL GAP (Round 21 closed the ANNOTATED variant): 4 senders,
-        80% pass-through, and no sender-risk annotation on the events —
-        propagation only works when the caller annotates via the mesh.
-        Compensating control: fraud-signals could self-enrich by querying
-        stored evals for each sender — roadmap service-side enrichment."""
+        """RESIDUAL GAP (narrowed in R21/R22): annotated senders are caught
+        by high_risk_fan_in, and the SERVICE now self-enriches sender risk
+        from its stored evals (see TestApi self-enrichment tests) — this
+        residual covers only the pure detector called with neither
+        annotations nor service enrichment.
+        Compensating control: deployed via the service, enrichment is
+        automatic; direct library callers must annotate."""
         history = [ev(1, direction="in", amount_ngn=100_000, counterparty=f"s{i}")
                    for i in range(4)]
         history += [ev(0.5, direction="out", amount_ngn=80_000, counterparty="x")]

@@ -24,6 +24,10 @@ export const ISSUANCE_BENEFICIARY_BURST_MIN = 3;
 export const HIGH_VALUE_SINGLE_APPROVAL_NGN = 10_000_000;
 export const SIM_STEPUP_WINDOW_HOURS = 168;
 export const SIM_STEPUP_AMOUNT_MIN_NGN = 100_000;
+export const POST_SWAP_CUMULATIVE_MIN_NGN = 250_000;
+export const BEHAVIORAL_Z_REVIEW = 3.0;
+export const BEHAVIORAL_Z_BLOCK = 4.5;
+export const BEHAVIORAL_MIN_BASELINE = 10;
 
 export type Payload = Record<string, unknown>;
 export interface HistoryEvent { payload: Payload; created_at: string }
@@ -238,7 +242,7 @@ export function issuance(payload: Payload, history: HistoryEvent[], now?: Date):
 }
 
 /** 6. USSD / feature-phone channel fraud. */
-export function channel(payload: Payload, _history: HistoryEvent[], _now?: Date): Result {
+export function channel(payload: Payload, history: HistoryEvent[], now?: Date): Result {
   const f: Factor[] = [];
   let score = 0.05;
   const simHours = num(payload.sim_change_hours);
@@ -250,6 +254,18 @@ export function channel(payload: Payload, _history: HistoryEvent[], _now?: Date)
   if (simHours !== null && simHours >= 24 && simHours < SIM_STEPUP_WINDOW_HOURS && chanAmount >= SIM_STEPUP_AMOUNT_MIN_NGN) {
     score += 0.30;
     f.push({ code: "sim_age_high_value_stepup", detail: `high-value transaction ${simHours}h after SIM change (step-up window ${SIM_STEPUP_WINDOW_HOURS}h)`, weight: 0.30 });
+  }
+  if (simHours !== null && simHours < SIM_STEPUP_WINDOW_HOURS) {
+    const cutoff = (now ?? new Date()).getTime() - simHours * 3_600_000;
+    const postSwap = history.reduce((a, e) => {
+      const t = Date.parse(e.created_at);
+      return a + ((Number.isNaN(t) || t >= cutoff) ? (num(e.payload.amount_ngn) ?? 0) : 0);
+    }, 0);
+    const total = postSwap + chanAmount;
+    if (total >= POST_SWAP_CUMULATIVE_MIN_NGN) {
+      score += 0.25;
+      f.push({ code: "post_swap_cumulative_stepup", detail: `N${total} moved within ${simHours}h of SIM change (cumulative step-up)`, weight: 0.25 });
+    }
   }
   if (payload.imei_is_new && chanAmount > 100_000) {
     score += 0.25;
@@ -331,7 +347,7 @@ export function subsidy(payload: Payload, history: HistoryEvent[], _now?: Date):
 
 export type DetectorName =
   | "app_scam" | "mule" | "agent" | "loan_stacking"
-  | "issuance" | "channel" | "ghost_payroll" | "subsidy";
+  | "issuance" | "channel" | "ghost_payroll" | "subsidy" | "behavioral";
 
 export const DETECTORS: Record<DetectorName, (p: Payload, h: HistoryEvent[], now?: Date) => Result> = {
   app_scam: appScam,
@@ -342,4 +358,44 @@ export const DETECTORS: Record<DetectorName, (p: Payload, h: HistoryEvent[], now
   channel,
   ghost_payroll: ghostPayroll,
   subsidy,
+  behavioral,
 };
+
+/** 9. Behavioral baseline anomaly (lightweight, dependency-free z-scores). */
+export function behavioral(payload: Payload, history: HistoryEvent[], _now?: Date): Result {
+  const f: Factor[] = [];
+  let score = 0.05;
+  const metrics = Object.keys(payload).filter((k) => {
+    const v = payload[k];
+    return typeof v === "number" && Number.isFinite(v);
+  }).sort();
+  if (metrics.length === 0) {
+    f.push({ code: "history_unavailable", detail: "no numeric metrics in payload — behavioral scoring skipped", weight: 0 });
+    return result(score, f);
+  }
+  let fired = 0;
+  for (const metric of metrics) {
+    const values = history
+      .map((e) => e.payload[metric])
+      .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+    if (values.length < BEHAVIORAL_MIN_BASELINE) continue;
+    const mean = values.reduce((a, b) => a + b, 0) / values.length;
+    const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
+    const std = Math.max(Math.sqrt(variance), mean * 0.01, 1e-9);
+    const z = Math.abs((payload[metric] as number) - mean) / std;
+    if (z >= BEHAVIORAL_Z_BLOCK) {
+      score += 0.35;
+      fired += 1;
+      f.push({ code: "behavioral_outlier_block", detail: `${metric} z=${z.toFixed(1)} vs subject baseline (mean ${mean}, n=${values.length})`, weight: 0.35 });
+    } else if (z >= BEHAVIORAL_Z_REVIEW) {
+      score += 0.20;
+      fired += 1;
+      f.push({ code: "behavioral_outlier_review", detail: `${metric} z=${z.toFixed(1)} vs subject baseline (mean ${mean}, n=${values.length})`, weight: 0.20 });
+    }
+  }
+  if (fired === 0 && !metrics.some((m) =>
+    history.filter((e) => typeof e.payload[m] === "number").length >= BEHAVIORAL_MIN_BASELINE)) {
+    f.push({ code: "history_unavailable", detail: `fewer than ${BEHAVIORAL_MIN_BASELINE} baseline points per metric — behavioral scoring skipped`, weight: 0 });
+  }
+  return result(score, f);
+}

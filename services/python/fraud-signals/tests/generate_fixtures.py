@@ -80,6 +80,16 @@ CASES = [
                   "beneficiary_certificates_30d": 4,
                   "certificate_value_ngn": 12_000_000, "approvals": 1},
      [ev(0.3, certificate="C1"), ev(0.1, certificate="C2")]),
+    # Round 22: cumulative step-up + behavioral baseline
+    ("channel", {"channel": "ussd", "sim_change_hours": 30,
+                 "amount_ngn": 60_000, "phone_tenure_days": 400},
+     [ev(0.005, amount_ngn=80_000), ev(0.01, amount_ngn=120_000)]),
+    ("behavioral", {"amount_ngn": 900_000},
+     [ev(i * 0.1, amount_ngn=10_000 + (i % 3) * 500) for i in range(12)]),
+    ("behavioral", {"amount_ngn": 10_500},
+     [ev(i * 0.1, amount_ngn=10_000 + (i % 3) * 500) for i in range(12)]),
+    ("behavioral", {"amount_ngn": 10_500},
+     [ev(0.1, amount_ngn=10_000), ev(0.05, amount_ngn=11_000)]),
 ]
 
 

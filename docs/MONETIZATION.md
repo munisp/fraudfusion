@@ -173,6 +173,40 @@ analytics without privacy controls beyond standard tenant isolation.
 
 ---
 
+## 4. Payment rail — Paystack (Round 22)
+
+Invoices can be settled online instead of only via manual ledger posting:
+
+- `POST /v1/billing/invoices/{id}/checkout?email=...` — initializes a
+  Paystack hosted checkout (amount in kobo, `reference` = invoice id,
+  NGN) and returns the `authorization_url` for the tenant to pay.
+  Issued invoices only; **fail-closed 503** when `PAYSTACK_SECRET_KEY`
+  is not configured; 502 with the rail's reason on Paystack errors.
+- `POST /webhooks/paystack` — Paystack webhook. The raw body is verified
+  with HMAC-SHA512 against `x-paystack-signature` using the secret key
+  (**401 without a valid signature — fail-closed even when no secret is
+  configured**). On `charge.success` the invoice whose id matches
+  `data.reference` transitions `issued → paid` and a `past_due`
+  subscription resumes. Retried deliveries are idempotent
+  (`already_paid`); unknown references 404; non-`charge.success` events
+  are acknowledged and ignored.
+
+## 5. Auto-metering middleware (Round 22)
+
+`services/python/integration/metering.py` closes the "usage is recorded
+manually" gap. Any FastAPI service mounts `UsageMeteringMiddleware` with a
+route map `(method, path_prefix, operation)`; every matched, successful
+request is posted to `POST {BILLING_SERVICE_URL}/internal/usage` with
+`X-Internal-Token` auth — idempotency-keyed (`<service>:<x-request-id>`)
+so retries never double-bill. Billing validates the operation and tenant
+before recording. fraud-signals is the reference mount: every successful
+detector evaluation (enforce AND shadow) meters one `fraud_score` unit.
+
+Fail-closed honesty: billing outages never break the request path — the
+loss is logged and counted in `metering_stats()` (exposed on the service's
+`/health`), as are unattributed requests (no tenant resolved → skipped,
+never guessed) and failed responses (never billed).
+
 ## Example flows (curl)
 
 ```bash

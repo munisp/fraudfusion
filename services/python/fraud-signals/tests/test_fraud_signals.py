@@ -263,4 +263,34 @@ class TestApi:
     def test_health(self, fresh_store):
         client = TestClient(app)
         body = client.get("/health").json()
-        assert body["store"] == "ok" and len(body["detectors"]) == 8
+        assert body["store"] == "ok" and len(body["detectors"]) == 9
+
+    def test_mule_self_enriches_sender_risk(self, fresh_store):
+        """Service-side enrichment: senders with stored high-score evals get
+        counterparty_risk annotated automatically — no caller annotation."""
+        client = TestClient(app)
+        # three senders each have a stored high mule score
+        for s in ("s0", "s1", "s2"):
+            client.post("/api/v1/signals/mule", json={
+                "subject_id": s, "record_event": False,
+                "payload": {"dormant_days_before": 120,
+                            "shared_device_accounts": 5},
+                "events": [{"payload": {"direction": "in", "amount_ngn": 50_000,
+                                        "counterparty": "x"},
+                            "created_at": NOW.isoformat()}]})
+        # receiver fans in from those three senders, one clean, forwards 80%
+        events = [
+            {"payload": {"direction": "in", "amount_ngn": 100_000,
+                         "counterparty": f"s{i}"},
+             "created_at": NOW.isoformat()} for i in range(3)]
+        events.append({"payload": {"direction": "in", "amount_ngn": 100_000,
+                                   "counterparty": "clean"},
+                       "created_at": NOW.isoformat()})
+        events.append({"payload": {"direction": "out", "amount_ngn": 80_000,
+                                   "counterparty": "x"},
+                       "created_at": NOW.isoformat()})
+        r = client.post("/api/v1/signals/mule", json={
+            "subject_id": "receiver-1", "payload": {}, "events": events,
+            "record_event": False})
+        codes = {f["code"] for f in r.json()["factors"]}
+        assert "high_risk_fan_in" in codes

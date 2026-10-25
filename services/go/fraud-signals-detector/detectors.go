@@ -9,6 +9,7 @@ package detectors
 import (
 	"encoding/json"
 	"math"
+	"sort"
 	"time"
 )
 
@@ -29,6 +30,10 @@ const (
 	HighValueSingleApprovalNgn  = 10_000_000.0
 	SimStepupWindowHours     = 168.0
 	SimStepupAmountMinNgn    = 100_000.0
+	PostSwapCumulativeMinNgn = 250_000.0
+	BehavioralZReview        = 3.0
+	BehavioralZBlock         = 4.5
+	BehavioralMinBaseline    = 10
 	SubsidyMaxNgnPerHectare  = 150_000.0
 )
 
@@ -320,7 +325,7 @@ func Issuance(p Payload, history []HistoryEvent, now time.Time) Result {
 }
 
 // Channel — USSD / feature-phone channel fraud.
-func Channel(p Payload, _ []HistoryEvent, _ time.Time) Result {
+func Channel(p Payload, history []HistoryEvent, now time.Time) Result {
 	f := []Factor{}
 	score := 0.05
 	simHours, hasSim := num(p["sim_change_hours"])
@@ -332,6 +337,21 @@ func Channel(p Payload, _ []HistoryEvent, _ time.Time) Result {
 	if hasSim && simHours >= 24 && simHours < SimStepupWindowHours && amt >= SimStepupAmountMinNgn {
 		score += 0.30
 		f = append(f, Factor{"sim_age_high_value_stepup", "high-value transaction within the SIM-age step-up window", 0.30})
+	}
+	if hasSim && simHours < SimStepupWindowHours {
+		cutoff := now.Add(-time.Duration(simHours * float64(time.Hour)))
+		var postSwap float64
+		for _, e := range history {
+			t, err := time.Parse(time.RFC3339, e.CreatedAt)
+			if err != nil || !t.Before(cutoff) {
+				v, _ := num(e.Payload["amount_ngn"])
+				postSwap += v
+			}
+		}
+		if total := postSwap + amt; total >= PostSwapCumulativeMinNgn {
+			score += 0.25
+			f = append(f, Factor{"post_swap_cumulative_stepup", "cumulative amount moved within the SIM-age window", 0.25})
+		}
 	}
 	if truthy(p["imei_is_new"]) && amt > 100_000 {
 		score += 0.25
@@ -422,6 +442,64 @@ func Subsidy(p Payload, history []HistoryEvent, _ time.Time) Result {
 	return mkresult(score, f)
 }
 
+// Behavioral — per-subject baseline anomaly via dependency-free z-scores.
+func Behavioral(p Payload, history []HistoryEvent, _ time.Time) Result {
+	f := []Factor{}
+	score := 0.05
+	metrics := []string{}
+	for k, v := range p {
+		if _, ok := num(v); ok {
+			metrics = append(metrics, k)
+		}
+	}
+	sort.Strings(metrics)
+	if len(metrics) == 0 {
+		f = append(f, Factor{"history_unavailable", "no numeric metrics in payload — behavioral scoring skipped", 0})
+		return mkresult(score, f)
+	}
+	fired := 0
+	anyBaseline := false
+	for _, metric := range metrics {
+		values := []float64{}
+		for _, e := range history {
+			if v, ok := num(e.Payload[metric]); ok {
+				values = append(values, v)
+			}
+		}
+		if len(values) >= BehavioralMinBaseline {
+			anyBaseline = true
+		} else {
+			continue
+		}
+		var mean float64
+		for _, v := range values {
+			mean += v
+		}
+		mean /= float64(len(values))
+		var variance float64
+		for _, v := range values {
+			variance += (v - mean) * (v - mean)
+		}
+		variance /= float64(len(values))
+		std := math.Max(math.Sqrt(variance), math.Max(mean*0.01, 1e-9))
+		current, _ := num(p[metric])
+		z := math.Abs(current-mean) / std
+		if z >= BehavioralZBlock {
+			score += 0.35
+			fired++
+			f = append(f, Factor{"behavioral_outlier_block", "metric far outside subject baseline", 0.35})
+		} else if z >= BehavioralZReview {
+			score += 0.20
+			fired++
+			f = append(f, Factor{"behavioral_outlier_review", "metric outside subject baseline", 0.20})
+		}
+	}
+	if fired == 0 && !anyBaseline {
+		f = append(f, Factor{"history_unavailable", "fewer than the minimum baseline points per metric — behavioral scoring skipped", 0})
+	}
+	return mkresult(score, f)
+}
+
 // Detectors maps the canonical detector names to their implementations.
 var Detectors = map[string]Detector{
 	"app_scam":      AppScam,
@@ -432,4 +510,5 @@ var Detectors = map[string]Detector{
 	"channel":       Channel,
 	"ghost_payroll": GhostPayroll,
 	"subsidy":       Subsidy,
+	"behavioral":    Behavioral,
 }

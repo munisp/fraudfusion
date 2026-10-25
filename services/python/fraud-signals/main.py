@@ -49,6 +49,25 @@ except Exception:  # pragma: no cover
     get_mesh = None  # type: ignore
     INTEGRATION_AVAILABLE = False
 
+# Auto-metering: every successful detector evaluation is metered to
+# billing-service as a fraud_score usage event (fail-closed — metering
+# failure never breaks the request path; see integration/metering.py).
+try:  # pragma: no cover - depends on repo layout
+    from metering import UsageMeteringMiddleware, metering_stats  # type: ignore
+
+    METERING_AVAILABLE = True
+except Exception:  # pragma: no cover
+    UsageMeteringMiddleware = None  # type: ignore
+    metering_stats = None  # type: ignore
+    METERING_AVAILABLE = False
+
+if METERING_AVAILABLE:
+    app.add_middleware(
+        UsageMeteringMiddleware,
+        routes=[("POST", "/api/v1/signals", "fraud_score")],
+        service_name="fraud-signals",
+    )
+
 
 class SignalRequest(BaseModel):
     subject_id: str = Field(..., min_length=1)
@@ -82,6 +101,7 @@ def health() -> Dict[str, Any]:
         "store": "ok" if store_ok else "unavailable",
         "detectors": sorted(DETECTORS.keys()),
         "mesh": INTEGRATION_AVAILABLE,
+        "metering": metering_stats() if METERING_AVAILABLE else "unavailable",
     }
 
 
@@ -103,6 +123,35 @@ def ingest_event(body: EventIngest) -> Dict[str, Any]:
     return {"status": "recorded", "kind": body.kind, "subject_id": body.subject_id}
 
 
+def _enrich_counterparty_risk(store, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Service-side sender-risk enrichment (Round 22): incoming transfer
+    events whose payload names a counterparty but carries no
+    counterparty_risk get annotated from the latest stored eval score for
+    that counterparty — the detector stays pure; the service composes it
+    with its own history. Never fabricates: unknown senders stay
+    unannotated."""
+    enriched = []
+    cache: Dict[str, Optional[float]] = {}
+    for e in events:
+        payload = dict(e.get("payload") or {})
+        cp = payload.get("counterparty")
+        if (payload.get("direction") == "in" and cp
+                and payload.get("counterparty_risk") is None):
+            if cp not in cache:
+                try:
+                    rows = store.query(
+                        "SELECT score FROM signal_evals WHERE subject_id = :s"
+                        " ORDER BY created_at DESC, id DESC LIMIT 1",
+                        {"s": str(cp)})
+                    cache[cp] = float(rows[0]["score"]) if rows else None
+                except Exception:  # noqa: BLE001
+                    cache[cp] = None
+            if cache[cp] is not None:
+                payload["counterparty_risk"] = cache[cp]
+        enriched.append({**e, "payload": payload})
+    return enriched
+
+
 def _evaluate(name: str, body: SignalRequest, mode: str) -> Dict[str, Any]:
     detector = DETECTORS[name]
     store = get_store()
@@ -116,6 +165,9 @@ def _evaluate(name: str, body: SignalRequest, mode: str) -> Dict[str, Any]:
         events = stored + events
     except Exception as exc:  # noqa: BLE001
         history_note = f"history unavailable: {exc}"
+
+    if name == "mule":
+        events = _enrich_counterparty_risk(store, events)
 
     score, verdict, factors = detector(body.payload, events)
     if history_note:

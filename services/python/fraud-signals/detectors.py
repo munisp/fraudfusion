@@ -43,6 +43,10 @@ HIGH_VALUE_SINGLE_APPROVAL_NGN = 10_000_000  # four-eyes threshold
 SUBSIDY_MAX_NGN_PER_HECTARE = 150_000  # plausibility ceiling
 SIM_STEPUP_WINDOW_HOURS = 168          # SIM-age step-up window (7d)
 SIM_STEPUP_AMOUNT_MIN_NGN = 100_000    # step-up applies to high value
+POST_SWAP_CUMULATIVE_MIN_NGN = 250_000 # cumulative step-up ceiling
+BEHAVIORAL_Z_REVIEW = 3.0              # behavioral z-score bands
+BEHAVIORAL_Z_BLOCK = 4.5
+BEHAVIORAL_MIN_BASELINE = 10           # history points needed
 
 
 def _verdict(score: float) -> str:
@@ -274,6 +278,20 @@ def channel(payload: dict[str, Any], history: list[dict]) -> tuple[float, str, l
         f.append({"code": "sim_age_high_value_stepup",
                   "detail": f"high-value transaction {float(sim_hours):.0f}h after SIM change (step-up window {SIM_STEPUP_WINDOW_HOURS}h)",
                   "weight": 0.30})
+    # Cumulative step-up: many sub-₦100k moves after a swap evade the
+    # single-transaction step-up — so sum everything moved since the swap.
+    # Closes the residual low-value lane of the SIM-swap gap.
+    if sim_hours is not None and float(sim_hours) < SIM_STEPUP_WINDOW_HOURS:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=float(sim_hours))
+        post_swap = sum(
+            float(e["payload"].get("amount_ngn") or 0) for e in history
+            if (_parse_ts(e.get("created_at", "")) or cutoff) >= cutoff)
+        total = post_swap + float(payload.get("amount_ngn") or 0)
+        if total >= POST_SWAP_CUMULATIVE_MIN_NGN:
+            score += 0.25
+            f.append({"code": "post_swap_cumulative_stepup",
+                      "detail": f"N{total:,.0f} moved within {float(sim_hours):.0f}h of SIM change (cumulative step-up)",
+                      "weight": 0.25})
     if payload.get("imei_is_new") and float(payload.get("amount_ngn") or 0) > 100_000:
         score += 0.25
         f.append({"code": "new_imei_high_value", "detail": "high-value transaction from an unrecognised handset", "weight": 0.25})
@@ -352,6 +370,67 @@ def subsidy(payload: dict[str, Any], history: list[dict]) -> tuple[float, str, l
     return _cap(score), _verdict(_cap(score)), f
 
 
+# ---------------------------------------------------------------------------
+# 9. Behavioral baseline anomaly (lightweight ML, no heavy deps)
+# ---------------------------------------------------------------------------
+
+def behavioral(payload: dict[str, Any], history: list[dict]) -> tuple[float, str, list[dict]]:
+    """Per-subject behavioral baseline scoring. For each numeric metric the
+    subject has history for (amount_ngn, session_seconds, ...), compute the
+    population mean/std over the history window and the z-score of the
+    current payload value. Honest by construction: with fewer than
+    BEHAVIORAL_MIN_BASELINE history points the detector says so and scores
+    nothing — it never invents a baseline.
+
+    This is deliberately dependency-free (z-scores, not a trained model): it
+    runs identically in all four language ports. It is the honest 'ML-lite'
+    layer — a trained model can later replace it behind the same
+    (payload, history) -> (score, verdict, factors) contract."""
+    f: list[dict] = []
+    score = 0.05
+    metrics = [k for k, v in payload.items()
+               if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if not metrics:
+        f.append({"code": "history_unavailable",
+                  "detail": "no numeric metrics in payload — behavioral scoring skipped",
+                  "weight": 0.0})
+        return _cap(score), _verdict(_cap(score)), f
+    fired = 0
+    for metric in sorted(metrics):
+        values = [float(e["payload"][metric]) for e in history
+                  if isinstance(e.get("payload", {}).get(metric), (int, float))
+                  and not isinstance(e["payload"].get(metric), bool)]
+        if len(values) < BEHAVIORAL_MIN_BASELINE:
+            continue
+        mean = sum(values) / len(values)
+        var = sum((v - mean) ** 2 for v in values) / len(values)
+        std = max(var ** 0.5, mean * 0.01, 1e-9)
+        z = abs(float(payload[metric]) - mean) / std
+        if z >= BEHAVIORAL_Z_BLOCK:
+            score += 0.35
+            fired += 1
+            f.append({"code": "behavioral_outlier_block",
+                      "detail": f"{metric} z={z:.1f} vs subject baseline "
+                                f"(mean {mean:,.0f}, n={len(values)})",
+                      "weight": 0.35})
+        elif z >= BEHAVIORAL_Z_REVIEW:
+            score += 0.20
+            fired += 1
+            f.append({"code": "behavioral_outlier_review",
+                      "detail": f"{metric} z={z:.1f} vs subject baseline "
+                                f"(mean {mean:,.0f}, n={len(values)})",
+                      "weight": 0.20})
+    if not fired and not any(
+            sum(1 for e in history
+                if isinstance(e.get("payload", {}).get(m), (int, float)))
+            >= BEHAVIORAL_MIN_BASELINE for m in metrics):
+        f.append({"code": "history_unavailable",
+                  "detail": f"fewer than {BEHAVIORAL_MIN_BASELINE} baseline "
+                            "points per metric — behavioral scoring skipped",
+                  "weight": 0.0})
+    return _cap(score), _verdict(_cap(score)), f
+
+
 DETECTORS = {
     "app_scam": app_scam,
     "mule": mule,
@@ -361,4 +440,5 @@ DETECTORS = {
     "channel": channel,
     "ghost_payroll": ghost_payroll,
     "subsidy": subsidy,
+    "behavioral": behavioral,
 }
