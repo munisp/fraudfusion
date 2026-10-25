@@ -46,3 +46,4 @@ services/go/ledger-command/ledger-command
 orchestrator/go/cmd/orchestrator/orchestrator
 database/cmd/migrate/migrate
 observability/release-gate-metrics/release-gate-metrics
+*.db
