@@ -103,16 +103,8 @@ def ingest_event(body: EventIngest) -> Dict[str, Any]:
     return {"status": "recorded", "kind": body.kind, "subject_id": body.subject_id}
 
 
-@app.post("/api/v1/signals/{detector_name}")
-def evaluate(detector_name: str, body: SignalRequest) -> Dict[str, Any]:
-    name = _normalize(detector_name)
-    detector = DETECTORS.get(name)
-    if detector is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"unknown detector {detector_name!r}; available: {sorted(DETECTORS)}",
-        )
-
+def _evaluate(name: str, body: SignalRequest, mode: str) -> Dict[str, Any]:
+    detector = DETECTORS[name]
     store = get_store()
     events: List[Dict[str, Any]] = list(body.events or [])
     history_note = None
@@ -132,11 +124,12 @@ def evaluate(detector_name: str, body: SignalRequest) -> Dict[str, Any]:
 
     audit_hash = None
     try:
-        if body.record_event:
+        if body.record_event and mode == "enforce":
             store.record_event(str(uuid.uuid4()), body.event_kind or name,
                                body.subject_id, body.payload, now_iso())
         audit_hash = store.append_eval(str(uuid.uuid4()), name, body.subject_id,
-                                       score, verdict, factors, now_iso())
+                                       score, verdict, factors, now_iso(),
+                                       mode=mode)
     except Exception as exc:  # noqa: BLE001
         log.warning("audit append failed: %s", exc)
 
@@ -146,9 +139,58 @@ def evaluate(detector_name: str, body: SignalRequest) -> Dict[str, Any]:
         "score": score,
         "verdict": verdict,
         "factors": factors,
+        "mode": mode,
         "audit_hash": audit_hash,
         "audit": "ok" if audit_hash else "unavailable",
     }
+
+
+@app.post("/api/v1/signals/{detector_name}")
+def evaluate(detector_name: str, body: SignalRequest) -> Dict[str, Any]:
+    name = _normalize(detector_name)
+    if name not in DETECTORS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown detector {detector_name!r}; available: {sorted(DETECTORS)}",
+        )
+    return _evaluate(name, body, mode="enforce")
+
+
+@app.post("/api/v1/signals/shadow/{detector_name}")
+def evaluate_shadow(detector_name: str, body: SignalRequest) -> Dict[str, Any]:
+    """Shadow mode: full evaluation + tamper-evident audit row, but the
+    triggering event is NOT recorded (live history stays clean) and the eval
+    is tagged mode='shadow' so score distributions can be replayed for
+    threshold tuning without touching enforcement data."""
+    name = _normalize(detector_name)
+    if name not in DETECTORS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown detector {detector_name!r}; available: {sorted(DETECTORS)}",
+        )
+    return _evaluate(name, body, mode="shadow")
+
+
+@app.get("/api/v1/signals/scores/{detector_name}")
+def score_distribution(detector_name: str, mode: str = "shadow") -> Dict[str, Any]:
+    """Score/verdict rows for threshold tuning — defaults to shadow evals so
+    tuning analysis never mixes with enforcement records."""
+    name = _normalize(detector_name)
+    if name not in DETECTORS:
+        raise HTTPException(status_code=404, detail=f"unknown detector {detector_name!r}")
+    if mode not in ("shadow", "enforce"):
+        raise HTTPException(status_code=400, detail="mode must be shadow|enforce")
+    store = get_store()
+    rows = store.query(
+        "SELECT subject_id, score, verdict, created_at FROM signal_evals"
+        " WHERE detector = :d AND mode = :m ORDER BY created_at",
+        {"d": name, "m": mode})
+    scores = [r["score"] for r in rows]
+    return {"detector": name, "mode": mode, "count": len(rows),
+            "min": min(scores) if scores else None,
+            "max": max(scores) if scores else None,
+            "mean": round(sum(scores) / len(scores), 4) if scores else None,
+            "rows": rows}
 
 
 @app.get("/api/v1/signals/chain/{detector_name}")

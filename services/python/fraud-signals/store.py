@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS signal_evals (
     score       REAL NOT NULL,
     verdict     TEXT NOT NULL,
     factors     TEXT NOT NULL DEFAULT '[]',
+    mode        TEXT NOT NULL DEFAULT 'enforce',
     prev_hash   TEXT NOT NULL,
     entry_hash  TEXT NOT NULL,
     created_at  TEXT NOT NULL
@@ -52,6 +53,11 @@ CREATE TABLE IF NOT EXISTS signal_evals (
 CREATE INDEX IF NOT EXISTS signal_evals_idx
     ON signal_evals (detector, subject_id, created_at);
 """
+
+# Existing deployments: add the shadow-mode column idempotently.
+_MIGRATIONS = (
+    "ALTER TABLE signal_evals ADD COLUMN mode TEXT NOT NULL DEFAULT 'enforce'",
+)
 
 _NAMED = re.compile(r":([a-zA-Z_][a-zA-Z0-9_]*)")
 
@@ -84,6 +90,18 @@ class SignalStore:
             self._conn.row_factory = sqlite3.Row
             with self._lock, self._conn:
                 self._conn.executescript(SCHEMA)
+        self._apply_migrations()
+
+    def _apply_migrations(self) -> None:
+        """Idempotent column additions (SQLite has no IF NOT EXISTS for
+        columns, so duplicate-column errors are swallowed)."""
+        for sql in _MIGRATIONS:
+            try:
+                self.execute(sql)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "duplicate column" not in msg and "already exists" not in msg:
+                    raise
 
     def _pg_conn(self):
         return self._psycopg.connect(self._dsn, row_factory=self._dict_row)
@@ -127,8 +145,10 @@ class SignalStore:
 
     def append_eval(self, eval_id: str, detector: str, subject_id: str,
                     score: float, verdict: str, factors: list[dict],
-                    created_at: str) -> str:
-        """Hash-chained audit append; returns the entry hash."""
+                    created_at: str, mode: str = "enforce") -> str:
+        """Hash-chained audit append; returns the entry hash. ``mode`` is
+        metadata ('enforce' | 'shadow') and deliberately NOT part of the
+        hashed body, so toggling shadow mode never breaks an existing chain."""
         last = self.query(
             "SELECT entry_hash FROM signal_evals WHERE detector = :d"
             " ORDER BY created_at DESC, id DESC LIMIT 1", {"d": detector})
@@ -142,11 +162,11 @@ class SignalStore:
             .encode()).hexdigest()
         self.execute(
             "INSERT INTO signal_evals (id, detector, subject_id, score, verdict,"
-            " factors, prev_hash, entry_hash, created_at)"
-            " VALUES (:i, :d, :s, :sc, :v, :f, :p, :e, :c)",
+            " factors, mode, prev_hash, entry_hash, created_at)"
+            " VALUES (:i, :d, :s, :sc, :v, :f, :m, :p, :e, :c)",
             {"i": eval_id, "d": detector, "s": subject_id, "sc": score,
-             "v": verdict, "f": json.dumps(factors), "p": prev, "e": entry,
-             "c": created_at})
+             "v": verdict, "f": json.dumps(factors), "m": mode, "p": prev,
+             "e": entry, "c": created_at})
         return entry
 
     def verify_chain(self, detector: str) -> dict[str, Any]:

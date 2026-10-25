@@ -74,3 +74,38 @@ moves the caller's own score or verdict.
 `FRAUD_SIGNALS_URL` in the shared env anchor. Postgres is the source of
 record (`FRAUDFUSION_REQUIRE_POSTGRES=1`); SQLite only for dev/tests.
 Schema: `database/20261030_fraud_signals.sql` (also self-applied at boot).
+
+## Shadow mode & backtesting (accuracy measurement)
+
+The detectors are heuristic — their real-world precision/recall is only
+knowable by measurement. Two tools close that loop:
+
+- **Shadow mode** — `POST /api/v1/signals/shadow/{detector}` runs the full
+  evaluation and appends a tamper-evident audit row tagged `mode='shadow'`,
+  but does NOT record the triggering event (live history stays clean).
+  Run detectors on production traffic in shadow for 4–8 weeks, then pull
+  `GET /api/v1/signals/scores/{detector}?mode=shadow` for the score
+  distribution and tune thresholds from observed data.
+  Migration: `database/20261031_fraud_signals_shadow.sql`.
+- **Backtest harness** — `backtest.py` replays labeled JSONL cases
+  (`{detector, label: fraud|legit, payload, history}`) and reports
+  precision/recall/FPR at both bands, per detector and overall, with raw
+  counts always shown. `fixtures/backtest_cases.jsonl` (32 synthetic labeled
+  cases) gives the baseline: block-band recall 87.5%, review-band recall
+  100%, 0% FPR — on synthetic data only; replace with real labeled cases.
+
+## Evasion surface (red-team register)
+
+`tests/test_redteam_evasion.py` attacks every detector with a source-reading
+adversary and asserts the outcome in two classes:
+
+- **Resisted** — evading one factor still lands in review/block because
+  others fire (e.g. sub-₦45k structuring evades the structuring factor but
+  velocity + off-location still catch it)
+- **Known gaps** — evasions that succeed today, each documented with the
+  compensating control that would close it (e.g. SIM-swap + 25h wait →
+  step-up auth scaled to SIM age; distributed ghost accounts → biometric
+  dedup; plausible ₦/ha subsidy claims → satellite NDVI cross-check)
+
+These tests are the honest evasion register: if a change closes a gap, the
+test is *moved* to the resisted class, never weakened.
