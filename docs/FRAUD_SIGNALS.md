@@ -103,9 +103,26 @@ adversary and asserts the outcome in two classes:
   others fire (e.g. sub-₦45k structuring evades the structuring factor but
   velocity + off-location still catch it)
 - **Known gaps** — evasions that succeed today, each documented with the
-  compensating control that would close it (e.g. SIM-swap + 25h wait →
-  step-up auth scaled to SIM age; distributed ghost accounts → biometric
-  dedup; plausible ₦/ha subsidy claims → satellite NDVI cross-check)
+  compensating control that would close it (e.g. distributed ghost accounts
+  → biometric dedup; plausible ₦/ha subsidy claims → satellite NDVI
+  cross-check)
 
 These tests are the honest evasion register: if a change closes a gap, the
 test is *moved* to the resisted class, never weakened.
+
+### Gap closures (Round 21)
+
+Three of the original gaps were closed in the detectors (all four language
+ports + parity fixture updated together):
+
+1. **SIM-swap 24h cliff** → SIM-age step-up: high-value transactions (≥ ₦100k)
+   within 168h of a SIM change escalate (`sim_age_high_value_stepup`, 0.30).
+   Residual: sub-₦100k moves at 25h+ — needs cumulative-amount step-up.
+2. **Under-threshold mule fan-in** → sender-risk propagation: events may carry
+   `counterparty_risk` (the sender's own score, annotated via the mesh); ≥3
+   risky senders fires `high_risk_fan_in` (0.30). Residual: unannotated
+   senders — service-side self-enrichment is the roadmap.
+3. **Slow insider issuance** → beneficiary-side + four-eyes:
+   `beneficiary_issuance_burst` (≥3 certs to one beneficiary in 30d, 0.25) and
+   `high_value_single_approval` (≥ ₦10M with one approver, 0.20). Residual:
+   clean-beneficiary low-value dual-approved issuance — needs audit sampling.

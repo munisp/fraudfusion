@@ -35,9 +35,14 @@ LOAN_STACKING_LENDERS = 3              # distinct lenders in window
 LOAN_STACKING_WINDOW_DAYS = 14
 MULE_PASS_THROUGH_MIN = 0.85           # in->out ratio within 72h
 MULE_FAN_IN_MIN = 5                    # distinct senders in window
+MULE_HIGH_RISK_FAN_IN_MIN = 3          # distinct HIGH-RISK senders in window
 GHOST_SHARED_ACCOUNT_MIN = 2           # employees paid into one account
 ISSUANCE_OFFICER_Z = 3.0               # officer velocity z-score
+ISSUANCE_BENEFICIARY_BURST_MIN = 3     # certs to one beneficiary in 30d
+HIGH_VALUE_SINGLE_APPROVAL_NGN = 10_000_000  # four-eyes threshold
 SUBSIDY_MAX_NGN_PER_HECTARE = 150_000  # plausibility ceiling
+SIM_STEPUP_WINDOW_HOURS = 168          # SIM-age step-up window (7d)
+SIM_STEPUP_AMOUNT_MIN_NGN = 100_000    # step-up applies to high value
 
 
 def _verdict(score: float) -> str:
@@ -119,6 +124,18 @@ def mule(payload: dict[str, Any], history: list[dict]) -> tuple[float, str, list
     if len(senders) >= MULE_FAN_IN_MIN:
         score += 0.25
         f.append({"code": "fan_in", "detail": f"{len(senders)} distinct senders in 7d", "weight": 0.25})
+    # Sender-risk propagation: even a SMALL fan-in is damning when the
+    # senders themselves score high (each sender's own mule/scam score is
+    # annotated onto the event by the caller — mesh composition makes this
+    # cross-account rather than single-account detection).
+    risky = {t.get("counterparty") for t in incoming
+             if t.get("counterparty")
+             and float(t.get("counterparty_risk") or 0) >= REVIEW_MIN}
+    if len(risky) >= MULE_HIGH_RISK_FAN_IN_MIN:
+        score += 0.30
+        f.append({"code": "high_risk_fan_in",
+                  "detail": f"{len(risky)} distinct senders with elevated own-risk scores",
+                  "weight": 0.30})
     if payload.get("dormant_days_before") is not None and payload["dormant_days_before"] >= 90 and txs:
         score += 0.20
         f.append({"code": "dormancy_burst", "detail": f"{payload['dormant_days_before']}d dormant, sudden activity", "weight": 0.20})
@@ -214,6 +231,23 @@ def issuance(payload: dict[str, Any], history: list[dict]) -> tuple[float, str, 
     if payload.get("registry_survey_mismatch"):
         score += 0.30
         f.append({"code": "registry_survey_mismatch", "detail": "registry record's survey hash != physical survey plan", "weight": 0.30})
+    # Beneficiary-side anomaly: a slow insider evades officer velocity, but
+    # the RECEIVER can't hide accumulating certificates fast (land-grab via
+    # patient insider).
+    burst = payload.get("beneficiary_certificates_30d")
+    if burst is not None and int(burst) >= ISSUANCE_BENEFICIARY_BURST_MIN:
+        score += 0.25
+        f.append({"code": "beneficiary_issuance_burst",
+                  "detail": f"beneficiary received {burst} certificates in 30d",
+                  "weight": 0.25})
+    # Four-eyes: a single approval on a high-value certificate is a control
+    # violation regardless of officer velocity.
+    value = float(payload.get("certificate_value_ngn") or 0)
+    if value >= HIGH_VALUE_SINGLE_APPROVAL_NGN and int(payload.get("approvals") or 1) < 2:
+        score += 0.20
+        f.append({"code": "high_value_single_approval",
+                  "detail": f"certificate value N{value:,.0f} approved by a single officer — four-eyes required",
+                  "weight": 0.20})
     if not history and peer_mean is None:
         f.append({"code": "history_unavailable", "detail": "no officer issuance baseline — velocity signal skipped", "weight": 0.0})
     return _cap(score), _verdict(_cap(score)), f
@@ -226,10 +260,20 @@ def issuance(payload: dict[str, Any], history: list[dict]) -> tuple[float, str, 
 def channel(payload: dict[str, Any], history: list[dict]) -> tuple[float, str, list[dict]]:
     f: list[dict] = []
     score = 0.05
-    if payload.get("channel") == "ussd" and payload.get("sim_change_hours") is not None \
-            and float(payload["sim_change_hours"]) < 24:
+    sim_hours = payload.get("sim_change_hours")
+    if payload.get("channel") == "ussd" and sim_hours is not None \
+            and float(sim_hours) < 24:
         score += 0.40
         f.append({"code": "ussd_after_sim_change", "detail": "USSD session <24h after SIM swap/change", "weight": 0.40})
+    # SIM-age step-up: the 24h hard cliff let patient swappers wait a day.
+    # High-value transactions within a WEEK of a SIM change still escalate —
+    # scrutiny scales with SIM age and amount, not a fixed cliff.
+    if sim_hours is not None and 24 <= float(sim_hours) < SIM_STEPUP_WINDOW_HOURS \
+            and float(payload.get("amount_ngn") or 0) >= SIM_STEPUP_AMOUNT_MIN_NGN:
+        score += 0.30
+        f.append({"code": "sim_age_high_value_stepup",
+                  "detail": f"high-value transaction {float(sim_hours):.0f}h after SIM change (step-up window {SIM_STEPUP_WINDOW_HOURS}h)",
+                  "weight": 0.30})
     if payload.get("imei_is_new") and float(payload.get("amount_ngn") or 0) > 100_000:
         score += 0.25
         f.append({"code": "new_imei_high_value", "detail": "high-value transaction from an unrecognised handset", "weight": 0.25})

@@ -37,6 +37,48 @@ def ev(days_ago, **payload):
 # ---------------------------------------------------------------------------
 
 class TestEvasionResisted:
+    def test_sim_swap_25h_high_value_caught_by_stepup(self):
+        """CLOSED (Round 21): patient SIM-swapper waits 25h, then moves
+        ₦400k — the fixed 24h cliff is gone; the 7-day SIM-age step-up
+        window catches high-value moves. Low-value at 25h stays clear by
+        design (see residual note in TestKnownGaps)."""
+        score, verdict, factors = detectors.channel(
+            {"channel": "ussd", "sim_change_hours": 25,
+             "amount_ngn": 400_000, "phone_tenure_days": 400}, [])
+        assert verdict in ("review", "block")
+        assert "sim_age_high_value_stepup" in {f["code"] for f in factors}
+
+    def test_small_fan_in_of_risky_senders_caught(self):
+        """CLOSED (Round 21): 4 senders (under fan-in 5) at 80% pass-through
+        (under 0.85) — but 3 of the senders carry their own elevated risk
+        scores, propagated onto the events by the caller (mesh composition).
+        high_risk_fan_in catches what count-based fan-in cannot."""
+        history = [ev(1, direction="in", amount_ngn=100_000,
+                      counterparty=f"s{i}", counterparty_risk=0.6)
+                   for i in range(3)]
+        history += [ev(1, direction="in", amount_ngn=100_000,
+                       counterparty="s3", counterparty_risk=0.1)]
+        history += [ev(0.5, direction="out", amount_ngn=80_000, counterparty="x")]
+        score, verdict, factors = detectors.mule({}, history)
+        assert verdict in ("review", "block")
+        assert "high_risk_fan_in" in {f["code"] for f in factors}
+        assert "fan_in" not in {f["code"] for f in factors}  # evasion on that factor held
+
+    def test_slow_insider_caught_beneficiary_side(self):
+        """CLOSED (Round 21): the patient insider (2 certs/day, business
+        hours, clean surveys) is invisible officer-side — but the
+        beneficiary accumulating 4 certificates in 30d and a ₦12M cert
+        signed by a single officer are both visible beneficiary-side."""
+        score, verdict, factors = detectors.issuance(
+            {"peer_officer_mean_per_day": 5, "peer_officer_std_per_day": 3,
+             "issued_hour_local": 10, "beneficiary_certificates_30d": 4,
+             "certificate_value_ngn": 12_000_000, "approvals": 1},
+            [ev(0.3, certificate="C1"), ev(0.1, certificate="C2")])
+        assert verdict in ("review", "block")
+        codes = {f["code"] for f in factors}
+        assert "officer_velocity_outlier" not in codes  # officer-side stayed dark
+        assert {"beneficiary_issuance_burst", "high_value_single_approval"} <= codes
+
     def test_structuring_below_the_structuring_window(self):
         """Attacker splits at ₦30k — below the 45–50k structuring window.
         The structuring factor goes blind, but 7 same-day cash-outs against a
@@ -102,24 +144,24 @@ class TestEvasionResisted:
 # ---------------------------------------------------------------------------
 
 class TestKnownGaps:
-    def test_sim_swap_plus_25h_wait_evades(self):
-        """GAP: patient SIM-swapper waits 25h before the USSD session.
-        ussd_after_sim_change goes blind; with an established device and
-        number the score stays clear.
-        Compensating control: step-up auth window scaled to SIM age, not a
-        fixed 24h cliff."""
+    def test_sim_swap_25h_low_value_residual(self):
+        """RESIDUAL GAP (Round 21 narrowed this from the full 25h evasion):
+        patient SIM-swapper waits 25h and keeps amounts under ₦100k — the
+        step-up window only bites on high value.
+        Compensating control: cumulative-amount step-up (sum of post-swap
+        transactions vs window), needs issuer-side session aggregation."""
         _, verdict, factors = detectors.channel(
             {"channel": "ussd", "sim_change_hours": 25,
-             "phone_tenure_days": 400}, [])
+             "amount_ngn": 50_000, "phone_tenure_days": 400}, [])
         assert verdict == "clear"
         assert not [f for f in factors if f["weight"] > 0]
 
-    def test_mule_below_fan_in_and_pass_through_evades(self):
-        """GAP: 4 senders (under fan-in 5) forwarding 80% (under 0.85).
-        Both behavioural factors miss; a fresh account with this pattern is
-        clear.
-        Compensating control: graph analytics — the SENDERS' risk scores
-        feeding the receiver (partially available via mesh composition)."""
+    def test_mule_small_fan_in_unannotated_residual(self):
+        """RESIDUAL GAP (Round 21 closed the ANNOTATED variant): 4 senders,
+        80% pass-through, and no sender-risk annotation on the events —
+        propagation only works when the caller annotates via the mesh.
+        Compensating control: fraud-signals could self-enrich by querying
+        stored evals for each sender — roadmap service-side enrichment."""
         history = [ev(1, direction="in", amount_ngn=100_000, counterparty=f"s{i}")
                    for i in range(4)]
         history += [ev(0.5, direction="out", amount_ngn=80_000, counterparty="x")]
@@ -159,15 +201,16 @@ class TestKnownGaps:
              "identity_hash": "X"}, [])
         assert verdict == "clear"
 
-    def test_slow_insider_issuance_evades(self):
-        """GAP: an insider issuing 2 fraudulent certificates per day (inside
-        the peer band), during hours, with consistent survey records.
-        Compensating control: beneficiary-side anomaly detection (the
-        RECEIVER's profile, not the officer's velocity) + mandatory
-        four-eyes review for high-value issuances."""
+    def test_slow_insider_clean_beneficiary_residual(self):
+        """RESIDUAL GAP (Round 21 closed the beneficiary-burst/four-eyes
+        variants): a patient insider issuing to a NORMAL beneficiary, dual
+        approvals, moderate value — no signal on either side.
+        Compensating control: random audit sampling + registry physical
+        verification for a percentage of clean-looking issuances."""
         _, verdict, _ = detectors.issuance(
             {"peer_officer_mean_per_day": 5, "peer_officer_std_per_day": 3,
-             "issued_hour_local": 10},
+             "issued_hour_local": 10, "beneficiary_certificates_30d": 1,
+             "certificate_value_ngn": 2_000_000, "approvals": 2},
             [ev(0.3, certificate="C1"), ev(0.1, certificate="C2")])
         assert verdict == "clear"
 

@@ -22,6 +22,11 @@ pub const MULE_FAN_IN_MIN: usize = 5;
 pub const GHOST_SHARED_ACCOUNT_MIN: usize = 2;
 pub const ISSUANCE_OFFICER_Z: f64 = 3.0;
 pub const SUBSIDY_MAX_NGN_PER_HECTARE: f64 = 150_000.0;
+pub const MULE_HIGH_RISK_FAN_IN_MIN: usize = 3;
+pub const ISSUANCE_BENEFICIARY_BURST_MIN: f64 = 3.0;
+pub const HIGH_VALUE_SINGLE_APPROVAL_NGN: f64 = 10_000_000.0;
+pub const SIM_STEPUP_WINDOW_HOURS: f64 = 168.0;
+pub const SIM_STEPUP_AMOUNT_MIN_NGN: f64 = 100_000.0;
 
 pub type Payload = Map<String, Value>;
 
@@ -144,6 +149,7 @@ pub fn mule(p: &Payload, history: &[HistoryEvent], now: DateTime<Utc>) -> Detect
     let mut in_sum = 0.0;
     let mut out_sum = 0.0;
     let mut senders: HashSet<&str> = HashSet::new();
+    let mut risky: HashSet<&str> = HashSet::new();
     for e in &txs {
         let t = &e.payload;
         let amt = num(t.get("amount_ngn")).unwrap_or(0.0);
@@ -153,6 +159,9 @@ pub fn mule(p: &Payload, history: &[HistoryEvent], now: DateTime<Utc>) -> Detect
                 let cp = s(t.get("counterparty"));
                 if !cp.is_empty() {
                     senders.insert(cp);
+                    if num(t.get("counterparty_risk")).unwrap_or(0.0) >= REVIEW_MIN {
+                        risky.insert(cp);
+                    }
                 }
             }
             "out" => out_sum += amt,
@@ -166,6 +175,11 @@ pub fn mule(p: &Payload, history: &[HistoryEvent], now: DateTime<Utc>) -> Detect
     if senders.len() >= MULE_FAN_IN_MIN {
         score += 0.25;
         f.push(factor("fan_in", "many distinct senders in 7d", 0.25));
+    }
+    if risky.len() >= MULE_HIGH_RISK_FAN_IN_MIN {
+        score += 0.30;
+        f.push(factor("high_risk_fan_in",
+                      "distinct senders with elevated own-risk scores", 0.30));
     }
     if let Some(d) = num(p.get("dormant_days_before")) {
         if d >= 90.0 && !txs.is_empty() {
@@ -297,6 +311,20 @@ pub fn issuance(p: &Payload, history: &[HistoryEvent], now: DateTime<Utc>) -> De
         f.push(factor("registry_survey_mismatch",
                       "registry record's survey hash != physical survey plan", 0.30));
     }
+    if let Some(b) = num(p.get("beneficiary_certificates_30d")) {
+        if b >= ISSUANCE_BENEFICIARY_BURST_MIN {
+            score += 0.25;
+            f.push(factor("beneficiary_issuance_burst",
+                          "beneficiary received many certificates in 30d", 0.25));
+        }
+    }
+    let value = num(p.get("certificate_value_ngn")).unwrap_or(0.0);
+    let approvals = num(p.get("approvals")).unwrap_or(1.0);
+    if value >= HIGH_VALUE_SINGLE_APPROVAL_NGN && approvals < 2.0 {
+        score += 0.20;
+        f.push(factor("high_value_single_approval",
+                      "high-value certificate approved by a single officer — four-eyes required", 0.20));
+    }
     if history.is_empty() && peer_mean.is_none() {
         f.push(factor("history_unavailable",
                       "no officer issuance baseline — velocity signal skipped", 0.0));
@@ -308,8 +336,9 @@ pub fn issuance(p: &Payload, history: &[HistoryEvent], now: DateTime<Utc>) -> De
 pub fn channel(p: &Payload, _history: &[HistoryEvent], _now: DateTime<Utc>) -> DetectorResult {
     let mut f = vec![];
     let mut score = 0.05;
+    let sim_hours = num(p.get("sim_change_hours"));
     if s(p.get("channel")) == "ussd" {
-        if let Some(h) = num(p.get("sim_change_hours")) {
+        if let Some(h) = sim_hours {
             if h < 24.0 {
                 score += 0.40;
                 f.push(factor("ussd_after_sim_change",
@@ -317,7 +346,15 @@ pub fn channel(p: &Payload, _history: &[HistoryEvent], _now: DateTime<Utc>) -> D
             }
         }
     }
-    if truthy(p.get("imei_is_new")) && num(p.get("amount_ngn")).unwrap_or(0.0) > 100_000.0 {
+    let channel_amount = num(p.get("amount_ngn")).unwrap_or(0.0);
+    if let Some(h) = sim_hours {
+        if h >= 24.0 && h < SIM_STEPUP_WINDOW_HOURS && channel_amount >= SIM_STEPUP_AMOUNT_MIN_NGN {
+            score += 0.30;
+            f.push(factor("sim_age_high_value_stepup",
+                          "high-value transaction within the SIM-age step-up window", 0.30));
+        }
+    }
+    if truthy(p.get("imei_is_new")) && channel_amount > 100_000.0 {
         score += 0.25;
         f.push(factor("new_imei_high_value",
                       "high-value transaction from an unrecognised handset", 0.25));

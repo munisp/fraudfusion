@@ -65,6 +65,21 @@ CASES = [
      [ev(1, claim_id="c2", identity_hash="X")]),
     ("subsidy", {"farm_hectares": 5, "claim_ngn": 200_000,
                  "claim_id": "c1", "identity_hash": "X"}, []),
+    # Round 21 factors (gap closures #1, #2, #6)
+    ("channel", {"channel": "ussd", "sim_change_hours": 48,
+                 "amount_ngn": 500_000, "phone_tenure_days": 400}, []),
+    ("mule", {}, [ev(1, direction="in", amount_ngn=100_000,
+                     counterparty=f"s{i}", counterparty_risk=0.6)
+                  for i in range(3)]
+                 + [ev(1, direction="in", amount_ngn=100_000,
+                       counterparty="s3", counterparty_risk=0.1),
+                    ev(0.5, direction="out", amount_ngn=80_000,
+                       counterparty="x")]),
+    ("issuance", {"peer_officer_mean_per_day": 5,
+                  "peer_officer_std_per_day": 3, "issued_hour_local": 10,
+                  "beneficiary_certificates_30d": 4,
+                  "certificate_value_ngn": 12_000_000, "approvals": 1},
+     [ev(0.3, certificate="C1"), ev(0.1, certificate="C2")]),
 ]
 
 

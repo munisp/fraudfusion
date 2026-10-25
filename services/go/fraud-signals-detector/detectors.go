@@ -22,8 +22,13 @@ const (
 	LoanStackingWindowDays   = 14
 	MulePassThroughMin       = 0.85
 	MuleFanInMin             = 5
+	MuleHighRiskFanInMin     = 3
 	GhostSharedAccountMin    = 2
 	IssuanceOfficerZ         = 3.0
+	IssuanceBeneficiaryBurstMin = 3
+	HighValueSingleApprovalNgn  = 10_000_000.0
+	SimStepupWindowHours     = 168.0
+	SimStepupAmountMinNgn    = 100_000.0
 	SubsidyMaxNgnPerHectare  = 150_000.0
 )
 
@@ -160,6 +165,7 @@ func Mule(p Payload, history []HistoryEvent, now time.Time) Result {
 	txs := payloadOf(windowDays(history, 7, now))
 	var inSum, outSum float64
 	senders := map[string]bool{}
+	risky := map[string]bool{}
 	for _, t := range txs {
 		amt, _ := num(t["amount_ngn"])
 		switch t["direction"] {
@@ -167,6 +173,9 @@ func Mule(p Payload, history []HistoryEvent, now time.Time) Result {
 			inSum += amt
 			if cp := strOf(t["counterparty"]); cp != "" {
 				senders[cp] = true
+				if r, ok := num(t["counterparty_risk"]); ok && r >= ReviewMin {
+					risky[cp] = true
+				}
 			}
 		case "out":
 			outSum += amt
@@ -179,6 +188,10 @@ func Mule(p Payload, history []HistoryEvent, now time.Time) Result {
 	if len(senders) >= MuleFanInMin {
 		score += 0.25
 		f = append(f, Factor{"fan_in", "many distinct senders in 7d", 0.25})
+	}
+	if len(risky) >= MuleHighRiskFanInMin {
+		score += 0.30
+		f = append(f, Factor{"high_risk_fan_in", "distinct senders with elevated own-risk scores", 0.30})
 	}
 	if d, ok := num(p["dormant_days_before"]); ok && d >= 90 && len(txs) > 0 {
 		score += 0.20
@@ -287,6 +300,19 @@ func Issuance(p Payload, history []HistoryEvent, now time.Time) Result {
 		score += 0.30
 		f = append(f, Factor{"registry_survey_mismatch", "registry record's survey hash != physical survey plan", 0.30})
 	}
+	if b, ok := num(p["beneficiary_certificates_30d"]); ok && b >= IssuanceBeneficiaryBurstMin {
+		score += 0.25
+		f = append(f, Factor{"beneficiary_issuance_burst", "beneficiary received many certificates in 30d", 0.25})
+	}
+	value, _ := num(p["certificate_value_ngn"])
+	approvals, hasApprovals := num(p["approvals"])
+	if !hasApprovals {
+		approvals = 1
+	}
+	if value >= HighValueSingleApprovalNgn && approvals < 2 {
+		score += 0.20
+		f = append(f, Factor{"high_value_single_approval", "high-value certificate approved by a single officer — four-eyes required", 0.20})
+	}
 	if len(history) == 0 && !hasMean {
 		f = append(f, Factor{"history_unavailable", "no officer issuance baseline — velocity signal skipped", 0})
 	}
@@ -303,6 +329,10 @@ func Channel(p Payload, _ []HistoryEvent, _ time.Time) Result {
 		f = append(f, Factor{"ussd_after_sim_change", "USSD session <24h after SIM swap/change", 0.40})
 	}
 	amt, _ := num(p["amount_ngn"])
+	if hasSim && simHours >= 24 && simHours < SimStepupWindowHours && amt >= SimStepupAmountMinNgn {
+		score += 0.30
+		f = append(f, Factor{"sim_age_high_value_stepup", "high-value transaction within the SIM-age step-up window", 0.30})
+	}
 	if truthy(p["imei_is_new"]) && amt > 100_000 {
 		score += 0.25
 		f = append(f, Factor{"new_imei_high_value", "high-value transaction from an unrecognised handset", 0.25})

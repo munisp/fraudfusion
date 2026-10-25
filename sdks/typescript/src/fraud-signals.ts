@@ -19,6 +19,11 @@ export const MULE_FAN_IN_MIN = 5;
 export const GHOST_SHARED_ACCOUNT_MIN = 2;
 export const ISSUANCE_OFFICER_Z = 3.0;
 export const SUBSIDY_MAX_NGN_PER_HECTARE = 150_000;
+export const MULE_HIGH_RISK_FAN_IN_MIN = 3;
+export const ISSUANCE_BENEFICIARY_BURST_MIN = 3;
+export const HIGH_VALUE_SINGLE_APPROVAL_NGN = 10_000_000;
+export const SIM_STEPUP_WINDOW_HOURS = 168;
+export const SIM_STEPUP_AMOUNT_MIN_NGN = 100_000;
 
 export type Payload = Record<string, unknown>;
 export interface HistoryEvent { payload: Payload; created_at: string }
@@ -108,6 +113,11 @@ export function mule(payload: Payload, history: HistoryEvent[], now?: Date): Res
   if (senders.size >= MULE_FAN_IN_MIN) {
     score += 0.25;
     f.push({ code: "fan_in", detail: `${senders.size} distinct senders in 7d`, weight: 0.25 });
+  }
+  const risky = new Set(incoming.filter((t) => t.counterparty && (num(t.counterparty_risk) ?? 0) >= REVIEW_MIN).map((t) => t.counterparty));
+  if (risky.size >= MULE_HIGH_RISK_FAN_IN_MIN) {
+    score += 0.30;
+    f.push({ code: "high_risk_fan_in", detail: `${risky.size} distinct senders with elevated own-risk scores`, weight: 0.30 });
   }
   const dormant = num(payload.dormant_days_before);
   if (dormant !== null && dormant >= 90 && txs.length > 0) {
@@ -211,6 +221,16 @@ export function issuance(payload: Payload, history: HistoryEvent[], now?: Date):
     score += 0.30;
     f.push({ code: "registry_survey_mismatch", detail: "registry record's survey hash != physical survey plan", weight: 0.30 });
   }
+  const burst = num(payload.beneficiary_certificates_30d);
+  if (burst !== null && burst >= ISSUANCE_BENEFICIARY_BURST_MIN) {
+    score += 0.25;
+    f.push({ code: "beneficiary_issuance_burst", detail: `beneficiary received ${burst} certificates in 30d`, weight: 0.25 });
+  }
+  const value = num(payload.certificate_value_ngn) ?? 0;
+  if (value >= HIGH_VALUE_SINGLE_APPROVAL_NGN && (num(payload.approvals) ?? 1) < 2) {
+    score += 0.20;
+    f.push({ code: "high_value_single_approval", detail: "high-value certificate approved by a single officer — four-eyes required", weight: 0.20 });
+  }
   if (history.length === 0 && peerMean === null) {
     f.push({ code: "history_unavailable", detail: "no officer issuance baseline — velocity signal skipped", weight: 0 });
   }
@@ -226,7 +246,12 @@ export function channel(payload: Payload, _history: HistoryEvent[], _now?: Date)
     score += 0.40;
     f.push({ code: "ussd_after_sim_change", detail: "USSD session <24h after SIM swap/change", weight: 0.40 });
   }
-  if (payload.imei_is_new && (num(payload.amount_ngn) ?? 0) > 100_000) {
+  const chanAmount = num(payload.amount_ngn) ?? 0;
+  if (simHours !== null && simHours >= 24 && simHours < SIM_STEPUP_WINDOW_HOURS && chanAmount >= SIM_STEPUP_AMOUNT_MIN_NGN) {
+    score += 0.30;
+    f.push({ code: "sim_age_high_value_stepup", detail: `high-value transaction ${simHours}h after SIM change (step-up window ${SIM_STEPUP_WINDOW_HOURS}h)`, weight: 0.30 });
+  }
+  if (payload.imei_is_new && chanAmount > 100_000) {
     score += 0.25;
     f.push({ code: "new_imei_high_value", detail: "high-value transaction from an unrecognised handset", weight: 0.25 });
   }

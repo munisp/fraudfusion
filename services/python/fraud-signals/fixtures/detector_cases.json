@@ -610,6 +610,113 @@
         "verdict": "clear",
         "factor_codes": []
       }
+    },
+    {
+      "detector": "channel",
+      "payload": {
+        "channel": "ussd",
+        "sim_change_hours": 48,
+        "amount_ngn": 500000,
+        "phone_tenure_days": 400
+      },
+      "history": [],
+      "expected": {
+        "score": 0.35,
+        "verdict": "review",
+        "factor_codes": [
+          "sim_age_high_value_stepup"
+        ]
+      }
+    },
+    {
+      "detector": "mule",
+      "payload": {},
+      "history": [
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s0",
+            "counterparty_risk": 0.6
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s1",
+            "counterparty_risk": 0.6
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s2",
+            "counterparty_risk": 0.6
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s3",
+            "counterparty_risk": 0.1
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "out",
+            "amount_ngn": 80000,
+            "counterparty": "x"
+          },
+          "created_at": "2026-10-30T00:00:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.35,
+        "verdict": "review",
+        "factor_codes": [
+          "high_risk_fan_in"
+        ]
+      }
+    },
+    {
+      "detector": "issuance",
+      "payload": {
+        "peer_officer_mean_per_day": 5,
+        "peer_officer_std_per_day": 3,
+        "issued_hour_local": 10,
+        "beneficiary_certificates_30d": 4,
+        "certificate_value_ngn": 12000000,
+        "approvals": 1
+      },
+      "history": [
+        {
+          "payload": {
+            "certificate": "C1"
+          },
+          "created_at": "2026-10-30T04:48:00+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C2"
+          },
+          "created_at": "2026-10-30T09:36:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.5,
+        "verdict": "review",
+        "factor_codes": [
+          "beneficiary_issuance_burst",
+          "high_value_single_approval"
+        ]
+      }
     }
   ]
 }
