@@ -318,6 +318,56 @@ class VLMAdapter(BackendAdapter):
                 "template_match": bool(body.get("template_match", not anomalies)),
                 "model": self.model, **base}
 
+    def deepfake_inspect(self, image_bytes: bytes) -> dict[str, Any]:
+        """Advisory VLM deepfake assessment of a single selfie frame.
+
+        Fail-closed and advisory-only: its output NEVER auto-passes or
+        auto-fails liveness — it supplements the deterministic deepfake.py
+        signals and routes borderline cases to manual review.
+        """
+        base = {"adapter": self.name, "source": self.base_url or None}
+        if not self.available:
+            return {"status": "unavailable", "reason": self.unavailable_reason,
+                    **base}
+        prompt = (
+            "You are a forensic analyst screening a KYC selfie for AI-"
+            "generated or face-swap artifacts. Look for: uncanny skin "
+            "smoothing inconsistent with the scene, blending seams along "
+            "the jawline/hairline/ears, asymmetric or glassy eyes, warped "
+            "accessories or background near the face boundary, mismatched "
+            "lighting direction between face and scene, identity shimmer "
+            "cues.\nReport ONLY what is visually evident — never invent "
+            'findings. Respond with a single JSON object, no prose: '
+            '{"findings": ["..."], "synthetic_likelihood": "low|medium|high"}'
+        )
+        payload = {"model": self.model, "prompt": prompt,
+                   "images": [base64.b64encode(image_bytes).decode()],
+                   "stream": False, "format": "json"}
+        try:
+            with self._client() as client:
+                resp = client.post(f"{self.base_url}/api/generate", json=payload)
+        except httpx.HTTPError as exc:
+            logger.error("ollama vision unreachable: %s", exc)
+            return {"status": "unavailable",
+                    "reason": f"ollama endpoint unreachable "
+                              f"({exc.__class__.__name__})", **base}
+        if resp.status_code != 200:
+            return {"status": "unavailable",
+                    "reason": f"ollama returned HTTP {resp.status_code}", **base}
+        try:
+            body = json.loads(resp.json().get("response", ""))
+        except (ValueError, AttributeError):
+            return {"status": "unavailable",
+                    "reason": "ollama returned non-JSON inspection", **base}
+        findings = [str(f).strip() for f in body.get("findings", [])
+                    if str(f).strip()]
+        likelihood = str(body.get("synthetic_likelihood", "low")).lower()
+        if likelihood not in ("low", "medium", "high"):
+            likelihood = "low"
+        return {"status": "ok", "findings": findings,
+                "synthetic_likelihood": likelihood,
+                "model": self.model, **base}
+
 
 # ---------------------------------------------------------------------------
 # Docling (PDF layout parsing)

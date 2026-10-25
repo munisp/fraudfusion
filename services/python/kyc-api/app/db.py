@@ -145,6 +145,23 @@ CREATE TABLE IF NOT EXISTS document_verifications (
 CREATE INDEX IF NOT EXISTS document_verifications_sha_idx
     ON document_verifications (sha256);
 
+-- Single-use liveness challenges (canonical PG:
+-- database/20261029_liveness_challenge_single_use.sql). Issued challenges
+-- are recorded at POST /biometric/liveness/challenge and atomically
+-- consumed (consumed_at IS NULL -> set) at verify-frames; a replayed or
+-- unknown challenge_id gets 409. consumed_at IS NULL distinguishes spent
+-- from unspent.
+CREATE TABLE IF NOT EXISTS liveness_challenges (
+    challenge_id TEXT PRIMARY KEY,
+    actor_sub    TEXT NOT NULL DEFAULT '',
+    phases       TEXT NOT NULL,
+    expires_at   INTEGER NOT NULL,
+    consumed_at  TEXT,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS liveness_challenges_exp_idx
+    ON liveness_challenges (expires_at);
+
 -- Idempotency keys for mutating verify endpoints (canonical PG:
 -- database/20260930_kyc_idempotency.sql). First-wins response replay:
 -- (tenant_id, key) stores the request hash + full response payload; a

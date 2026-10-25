@@ -38,7 +38,10 @@ CHALLENGE_TTL_SECONDS = int(os.getenv("LIVENESS_CHALLENGE_TTL_SECONDS", "120"))
 MAX_FRAMES = int(os.getenv("LIVENESS_MAX_FRAMES", "12"))
 MAX_FRAME_BYTES = 2 * 1024 * 1024  # 2MB per frame
 
-_PHASE_POOL = ("still", "move")
+# Directional phases ("left"/"right") defeat generic wiggle replays: the
+# subject must pan in the freshly challenged direction, verified by phase
+# correlation in the engine.
+_PHASE_POOL = ("still", "move", "left", "right")
 
 
 def _secret() -> bytes:
@@ -62,12 +65,32 @@ def create_liveness_router() -> APIRouter:
     @router.post("/api/v1/biometric/liveness/challenge")
     async def issue_challenge(
         principal: Principal = Depends(require_scope("kyc_verify")),
+        db: Database = Depends(get_db),
     ) -> dict:
-        """Issue a signed, stateless challenge: a random still/move phase
-        sequence the client must capture against within the TTL."""
+        """Issue a signed challenge: a random still/move/left/right phase
+        sequence the client must capture against within the TTL.
+
+        The challenge id is recorded so verify-frames can enforce
+        SINGLE-USE consumption — a captured (id, signature) pair cannot be
+        replayed for a second verification inside the TTL."""
         phases = [secrets.choice(_PHASE_POOL) for _ in range(3)]
         challenge_id = uuid.uuid4().hex
         expires_at = int(time.time()) + CHALLENGE_TTL_SECONDS
+        try:
+            db.execute(
+                "INSERT INTO liveness_challenges (challenge_id, actor_sub,"
+                " phases, expires_at, consumed_at)"
+                " VALUES (:cid, :actor, :phases, :exp, NULL)",
+                {"cid": challenge_id,
+                 "actor": getattr(principal, "sub", ""),
+                 "phases": ",".join(phases), "exp": expires_at},
+            )
+        except Exception as exc:
+            # Replay protection is security-critical: fail closed.
+            logger.error("liveness challenge persistence failed: %s", exc)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "liveness challenge store unavailable")
         return {
             "challenge_id": challenge_id,
             "phases": phases,
@@ -105,6 +128,27 @@ def create_liveness_router() -> APIRouter:
                                     "frame exceeds 2MB limit")
             payload.append(data)
 
+        # Single-use: atomically consume the challenge only AFTER the
+        # request validated (a malformed upload must not burn it). The
+        # UPDATE lands only when the id exists and is unconsumed; rowcount
+        # 0 means unknown or already spent -> 409 replay/unknown.
+        try:
+            consumed = db.execute(
+                "UPDATE liveness_challenges SET consumed_at = :now"
+                " WHERE challenge_id = :cid AND consumed_at IS NULL",
+                {"now": datetime.now(timezone.utc).isoformat(),
+                 "cid": challenge_id},
+            )
+        except Exception as exc:
+            logger.error("liveness challenge consumption failed: %s", exc)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "liveness challenge store unavailable")
+        if not consumed:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "challenge unknown or already consumed — request a fresh one")
+
         verification_id = uuid.uuid4().hex
         if not docverification.DOCVERIFICATION_AVAILABLE:
             return {
@@ -116,6 +160,27 @@ def create_liveness_router() -> APIRouter:
             }
         result = docverification.liveness.analyze_frame_sequence(
             payload, challenge_phases=phase_list)
+
+        # Optional VLM deepfake advisory on the middle frame — never blocks,
+        # never auto-passes; "high" synthetic likelihood forces review.
+        advisory = docverification.vlm_deepfake_advisory(
+            payload[len(payload) // 2])
+        if advisory and advisory.get("status") == "ok":
+            result.setdefault("signals", []).append({
+                "signal": "vlm_deepfake_advisory", "status": "ran",
+                "synthetic_likelihood": advisory["synthetic_likelihood"],
+                "findings": advisory["findings"],
+                "model": advisory.get("model")})
+            if (advisory["synthetic_likelihood"] == "high"
+                    and result["verdict"] == "live"):
+                result["verdict"] = "inconclusive"
+                result.setdefault("reasons", []).append(
+                    "VLM advisory: high synthetic likelihood — routed to "
+                    "manual review")
+        elif advisory:
+            result.setdefault("signals", []).append({
+                "signal": "vlm_deepfake_advisory", "status": "unavailable",
+                "reason": advisory.get("reason", "advisory unavailable")})
 
         # Hash-only audit: frame hashes + verdict, never the frames.
         try:

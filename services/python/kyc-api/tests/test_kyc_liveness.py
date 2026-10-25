@@ -62,7 +62,7 @@ def _issue(client) -> dict:
     body = resp.json()
     assert body["challenge_id"] and body["signature"]
     assert len(body["phases"]) == 3
-    assert all(p in ("still", "move") for p in body["phases"])
+    assert all(p in ("still", "move", "left", "right") for p in body["phases"])
     return body
 
 
@@ -80,13 +80,16 @@ def _submit(client, challenge: dict, frames: list[bytes]):
 
 def _genuine_frames(phases: list[str]) -> list[bytes]:
     """Build a frame sequence whose motion matches the issued phases:
-    identical frames for "still", whole-frame shifts for "move"."""
+    identical frames for "still", whole-frame shifts for "move", shifts
+    RIGHT (increasing) for "right" and LEFT (decreasing) for "left"."""
     still = _frame(1)
     frames: list[bytes] = []
     for phase in phases:
         if phase == "still":
             frames += [still] * 4
-        else:
+        elif phase == "left":
+            frames += [_frame(1, s) for s in (-15, -30, -45, -60)]
+        else:  # move / right: positive direction
             frames += [_frame(1, s) for s in (15, 30, 45, 60)]
     return frames
 
@@ -165,3 +168,44 @@ class TestVerifyFrames:
         ch = _issue(client)
         resp = _submit(client, ch, [_frame(1)] * 20)
         assert resp.status_code == 413
+
+
+class TestReplayProtection:
+    def test_challenge_is_single_use(self, client):
+        ch = _issue(client)
+        frames = _genuine_frames(ch["phases"])
+        first = _submit(client, ch, frames)
+        assert first.status_code == 200, first.text
+        # Replaying the SAME signed challenge tuple must be rejected.
+        replay = _submit(client, ch, frames)
+        assert replay.status_code == 409
+        assert "consumed" in replay.json()["detail"]
+
+    def test_unknown_challenge_is_409(self, client):
+        ch = _issue(client)  # issued but we forge a different id + re-sign
+        import hashlib, hmac
+        forged_id = "f" * 32
+        key = hashlib.sha256(SECRET.encode()).hexdigest().encode()
+        msg = f"{forged_id}|{','.join(ch['phases'])}|{ch['expires_at']}"
+        forged = {"challenge_id": forged_id, "phases": ch["phases"],
+                  "expires_at": ch["expires_at"],
+                  "signature": hmac.new(key, msg.encode(),
+                                        hashlib.sha256).hexdigest()}
+        # Signature is VALID for the forged id — only single-use
+        # consumption catches it (the id was never issued).
+        resp = _submit(client, forged, [_frame(1), _frame(1)])
+        assert resp.status_code == 409
+
+    def test_fresh_challenge_works_after_consumption(self, client):
+        ch1 = _issue(client)
+        assert _submit(client, ch1, _genuine_frames(ch1["phases"])).status_code == 200
+        ch2 = _issue(client)
+        resp = _submit(client, ch2, _genuine_frames(ch2["phases"]))
+        assert resp.status_code == 200, resp.text
+
+    def test_malformed_upload_does_not_burn_challenge(self, client):
+        ch = _issue(client)
+        assert _submit(client, ch, [_frame(1)] * 20).status_code == 413
+        # Same challenge still usable afterwards.
+        resp = _submit(client, ch, _genuine_frames(ch["phases"]))
+        assert resp.status_code == 200, resp.text

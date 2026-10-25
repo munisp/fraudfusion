@@ -16,14 +16,18 @@ conformance harness ready for the certification pathway:
                        refresh aliasing beats against camera shutter)
   Static/looped video  inter-frame motion ~= 0 across all frames, or
                        motion sequence repeats with near-zero novelty
-  Mask / 3D / deepfake OUT OF SCOPE — requires trained models; any
-                       inconclusive case routes to manual review and/or
-                       the remote OpenKYC-compatible IDV when configured.
+  Mask / 3D / deepfake deepfake.py — deterministic face-swap artifacts
+                       (noise inconsistency, blending boundary, colour
+                       mismatch, temporal flicker); composite score folds
+                       into the verdict below. Trained-model detection
+                       remains a separate lane (remote IDV when configured).
 
-Challenge-response: the API issues a signed phase sequence (e.g.
-["still","move","still"]); the engine segments the frame series into phases
-and checks that observed motion matches the expected pattern — a pre-recorded
-or static video cannot follow a freshly minted random challenge.
+Challenge-response: the API issues a signed phase sequence drawn from
+"still" | "move" | "left" | "right" (e.g. ["left","still","right"]); the
+engine segments the frame series into phases and checks that observed
+motion — including DIRECTION via phase correlation — matches the expected
+pattern. A pre-recorded or static video cannot follow a freshly minted
+random challenge, and a generic wiggle cannot satisfy a directional one.
 
 No face detector is available without ML dependencies; the face region is a
 documented center-crop heuristic (faces dominate the central field in guided
@@ -40,6 +44,7 @@ import cv2
 import numpy as np
 
 import local_cv
+import deepfake
 
 # --- thresholds (documented, synthetic-calibrated, tunable) ---------------
 # Inter-frame motion: mean absolute difference on 64x64 grayscale, 0..255.
@@ -55,6 +60,12 @@ FACE_FLAT_BUCKETS_MAX = 12.0
 # Phase match tolerance: a phase counts as matched when its mean motion is
 # on the expected side of the thresholds; ALL phases must match.
 PHASE_MISMATCH_TOLERANCE = 0  # strict: any mismatched phase -> challenge fail
+# Directional phases: mean horizontal shift (px, on 64px downscale, via
+# phase correlation) must exceed this in the challenged direction.
+DIRECTION_SHIFT_MIN = 1.5
+# Deepfake composite thresholds (single source of truth: deepfake.py).
+DEEPFAKE_SPOOF_SCORE = deepfake.SCORE_DEEPFAKE_SUSPECTED
+DEEPFAKE_REVIEW_SCORE = deepfake.SCORE_REVIEW
 
 DOWNSCALE = 64
 
@@ -169,6 +180,21 @@ def analyze_frame_sequence(
     if all_static:
         reasons.append("no inter-frame motion — static image or frozen video")
 
+    # --- signal 2b: motion direction (phase correlation) -------------------
+    # (dx, dy) of the global shift between consecutive downscaled frames.
+    # Phase correlation is deterministic and robust to lighting flicker —
+    # exactly what a directional challenge needs.
+    window = cv2.createHanningWindow((DOWNSCALE, DOWNSCALE), cv2.CV_64F)
+    shifts: list[tuple[float, float]] = []
+    for i in range(1, n):
+        (dx, dy), _resp = cv2.phaseCorrelate(
+            smalls[i - 1].astype(np.float64) * window,
+            smalls[i].astype(np.float64) * window)
+        shifts.append((float(dx), float(dy)))
+    sig("motion_direction", "ran",
+        f"per_pair_dx={[round(s[0], 2) for s in shifts]}",
+        per_pair_dx=[round(s[0], 2) for s in shifts])
+
     # --- signal 3: face-region texture (print attack) ----------------------
     crops = [_face_crop(f) for f in decoded]
     buckets = [_colour_buckets(c) for c in crops]
@@ -186,7 +212,8 @@ def analyze_frame_sequence(
     challenge_passed: Optional[bool] = None
     if challenge_phases:
         challenge_checked = True
-        phases = [p for p in challenge_phases if p in ("still", "move")]
+        valid = ("still", "move", "left", "right")
+        phases = [p for p in challenge_phases if p in valid]
         if not phases or n - 1 < len(phases):
             sig("challenge_response", "unavailable",
                 "phase count incompatible with frame count")
@@ -202,35 +229,70 @@ def analyze_frame_sequence(
             # is still THROUGHOUT a move phase or moving THROUGHOUT a still
             # phase still fails.
             seg = np.array_split(np.array(motion), len(phases))
+            seg_dx = np.array_split(np.array([s[0] for s in shifts]),
+                                    len(phases))
             seg_means = []
             for phase, s in zip(phases, seg):
                 values = s.tolist()
                 if phase == "still" and len(values) >= 3:
                     values = values[1:-1]
                 seg_means.append(float(np.mean(values)) if values else 0.0)
+            seg_dx_means = [float(np.mean(s)) if len(s) else 0.0
+                            for s in seg_dx]
             mismatches = []
-            for idx, (phase, m) in enumerate(zip(phases, seg_means)):
+            for idx, (phase, m, sdx) in enumerate(
+                    zip(phases, seg_means, seg_dx_means)):
                 if phase == "still" and m >= MOTION_STILL_MAX:
                     mismatches.append((idx, phase, round(m, 2)))
                 if phase == "move" and m < MOTION_MOVE_MIN:
                     mismatches.append((idx, phase, round(m, 2)))
+                # Directional: real horizontal shift in the challenged
+                # direction, plus enough overall motion to rule out noise.
+                if phase == "left" and not (
+                        sdx <= -DIRECTION_SHIFT_MIN and m >= MOTION_STILL_MAX):
+                    mismatches.append((idx, phase, round(sdx, 2)))
+                if phase == "right" and not (
+                        sdx >= DIRECTION_SHIFT_MIN and m >= MOTION_STILL_MAX):
+                    mismatches.append((idx, phase, round(sdx, 2)))
             challenge_passed = len(mismatches) <= PHASE_MISMATCH_TOLERANCE
             sig("challenge_response", "ran",
                 f"phases={phases} segment_motion={[round(m,2) for m in seg_means]} "
+                f"segment_dx={[round(d,2) for d in seg_dx_means]} "
                 f"mismatches={mismatches}",
                 passed=challenge_passed)
             if not challenge_passed:
                 reasons.append("observed motion does not match the issued "
                                "challenge phases")
 
+    # --- signal 5: deepfake / face-swap forensics ---------------------------
+    deepfake_result = deepfake.analyze(decoded)
+    deepfake_score = int(deepfake_result.get("deepfake_score", 0))
+    deepfake_assessment = deepfake_result.get("assessment", "unmeasurable")
+    for s in deepfake_result.get("signals", []):
+        entry = {"signal": f"deepfake_{s['signal']}", "status": s["status"]}
+        for k in ("detail", "fired"):
+            if k in s:
+                entry[k] = s[k]
+        signals.append(entry)
+    if deepfake_assessment == "deepfake_suspected":
+        reasons.append(f"deepfake artifacts detected (score {deepfake_score})")
+    elif deepfake_assessment == "review":
+        reasons.append(f"possible face-swap artifacts (score {deepfake_score}) "
+                       "— manual review recommended")
+
     # --- verdict -------------------------------------------------------------
-    hard_spoof = moire_replay or (challenge_checked and challenge_passed is False)
+    hard_spoof = (moire_replay
+                  or (challenge_checked and challenge_passed is False)
+                  or deepfake_score >= DEEPFAKE_SPOOF_SCORE)
     weak_signals = all_static or flat_face
     if hard_spoof:
         verdict = "spoof"
     elif weak_signals:
         verdict = "inconclusive"
         reasons.append("weak liveness signals — routed to manual review")
+    elif deepfake_score >= DEEPFAKE_REVIEW_SCORE:
+        # Moderate face-swap evidence never auto-passes, challenge or not.
+        verdict = "inconclusive"
     elif challenge_checked and challenge_passed:
         verdict = "live"
     else:
@@ -249,4 +311,6 @@ def analyze_frame_sequence(
         "challenge_passed": challenge_passed,
         "motion": {"mean": mean_motion, "max": max_motion},
         "moire": {"max_peakiness": max_pk, "peakiness_std": pk_var},
+        "deepfake": {"score": deepfake_score,
+                     "assessment": deepfake_assessment},
     }

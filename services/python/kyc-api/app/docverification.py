@@ -59,6 +59,21 @@ def get_idv_adapter():
     return adapters.OpenKYCCompatibleIDVAdapter()
 
 
+def vlm_deepfake_advisory(frame_bytes: bytes) -> dict | None:
+    """Advisory VLM deepfake read on one liveness frame.
+
+    Returns the adapter result dict, or None when the doc-verification
+    package or ollama sidecar is unavailable — advisory only, never blocks.
+    """
+    if not DOCVERIFICATION_AVAILABLE:
+        return None
+    try:
+        result = adapters.VLMAdapter().deepfake_inspect(frame_bytes)
+    except Exception:
+        return None
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Round-14 document intelligence engine (in-process)
 # ---------------------------------------------------------------------------
