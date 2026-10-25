@@ -39,6 +39,9 @@ REGISTRY = {
     "webhook": "WEBHOOK_SERVICE_URL",
     "doc_intel": "DOC_INTEL_URL",
     "fraud_signals": "FRAUD_SIGNALS_URL",
+    "account_takeover": "ACCOUNT_TAKEOVER_URL",
+    "identity_theft": "IDENTITY_THEFT_URL",
+    "kg_qa": "KG_QA_URL",
 }
 
 

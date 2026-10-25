@@ -24,12 +24,27 @@ services:
       timeout: 3s
       retries: 20
 
+  keycloak:
+    # Local-dev identity provider; the realm (fraudfusion) is imported from
+    # deploy/keycloak/fraudfusion-realm.json. Production uses the k8s
+    # manifest (deploy/kubernetes/keycloak.yaml) with TLS.
+    image: quay.io/keycloak/keycloak:24.0
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set KEYCLOAK_ADMIN_PASSWORD}
+    volumes:
+      - ./keycloak/fraudfusion-realm.json:/opt/keycloak/data/import/fraudfusion-realm.json:ro
+    ports: ["8080:8080"]
+
   intel-service:
     build: ../services/python/intel-service
     environment: &common
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/fraudfusion
       FRAUDFUSION_REQUIRE_POSTGRES: "1"
       KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080}
+      # Local-dev only: the compose Keycloak is plain HTTP. Never set in prod.
+      KEYCLOAK_INSECURE_HTTP: ${KEYCLOAK_INSECURE_HTTP:-true}
       KEYCLOAK_REALM: ${KEYCLOAK_REALM:-fraudfusion}
       KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-fraudfusion}
       KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-}
@@ -46,6 +61,7 @@ services:
       KYC_API_KEY: ${KYC_SERVICE_API_KEY:-}
       DOC_INTEL_URL: http://doc-intelligence:8800
       FRAUD_SIGNALS_URL: http://fraud-signals:8900
+      ACCOUNT_TAKEOVER_URL: http://account-takeover:8092
       OLLAMA_URL: http://ollama:11434
     depends_on:
       postgres: {condition: service_healthy}
@@ -99,6 +115,19 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
     ports: ["8900:8900"]
+
+  account-takeover:
+    build: ../services/python/account-takeover-detector
+    environment:
+      <<: *common
+      KEYCLOAK_CLIENT_ID: account-takeover-detector
+      KEYCLOAK_REQUIRED_ROLES: ${ATO_REQUIRED_ROLES:-fraud_analyst,service}
+      ATO_ARTIFACT_DIR: /models/fraud_net
+    volumes:
+      - ../ml/artifacts/fraud_net/v1:/models/fraud_net:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8092:8092"]
 
 volumes:
   pgdata:

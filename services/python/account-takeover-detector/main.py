@@ -15,7 +15,7 @@ import asyncpg
 import httpx
 import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(SERVICE_NAME := "account-takeover-detector")
@@ -143,6 +143,16 @@ class LoginEvent(BaseModel):
     timestamp: datetime
     user_agent: str | None = Field(default=None, max_length=2048)
 
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def _require_tz(cls, v):
+        if isinstance(v, datetime) and v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        if isinstance(v, str):
+            parsed = datetime.fromisoformat(v.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return v
+
 
 class DeviceVerificationRequest(BaseModel):
     tenant_id: str = Field(min_length=1, max_length=255)
@@ -161,6 +171,15 @@ class CredentialStuffingRequest(BaseModel):
 class AuthenticatedSubject(BaseModel):
     subject: str
     roles: set[str]
+    tenant_id: str | None = None  # token claim; service accounts carry none
+
+    def require_tenant(self, tenant_id: str) -> None:
+        """Tenant binding: when the token carries a tenant claim it MUST
+        match the requested tenant. Tokens without a tenant claim are
+        platform service accounts and are allowed (role-gated above)."""
+        if self.tenant_id and self.tenant_id != tenant_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail="token is not authorized for this tenant")
 
 
 @asynccontextmanager
@@ -265,8 +284,10 @@ async def authenticate(request: Request, authorization: str = Header(default="")
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="bearer token required")
 
     keycloak_url = required_env("KEYCLOAK_URL").rstrip("/")
-    if not keycloak_url.startswith("https://"):
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Keycloak must use HTTPS")
+    if not keycloak_url.startswith("https://") and os.getenv(
+            "KEYCLOAK_INSECURE_HTTP", "").lower() != "true":
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail="Keycloak must use HTTPS (KEYCLOAK_INSECURE_HTTP=true for local dev only)")
     endpoint = f"{keycloak_url}/realms/{required_env('KEYCLOAK_REALM')}/protocol/openid-connect/token/introspect"
     try:
         claims = await _introspect_cached(
@@ -290,14 +311,17 @@ async def authenticate(request: Request, authorization: str = Header(default="")
         roles.update(realm_access.get("roles") or [])
     if not roles.intersection(required_roles()):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient role")
-    return AuthenticatedSubject(subject=claims["sub"], roles=roles)
+    tenant_id = claims.get("tenant_id") or claims.get("tenant") or None
+    if tenant_id is not None and not isinstance(tenant_id, str):
+        tenant_id = str(tenant_id)
+    return AuthenticatedSubject(subject=claims["sub"], roles=roles, tenant_id=tenant_id or None)
 
 
 @app.get("/health")
 async def health_check(request: Request):
     try:
         await request.app.state.pool.fetchval("SELECT 1")
-    except asyncpg.PostgresError:
+    except Exception:  # noqa: BLE001 - any DB failure is honestly "unavailable"
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="database unavailable")
     return {
         "status": "healthy",
@@ -309,7 +333,8 @@ async def health_check(request: Request):
 
 
 @app.post("/detect-takeover")
-async def detect_takeover(event: LoginEvent, request: Request, _: AuthenticatedSubject = Depends(authenticate)):
+async def detect_takeover(event: LoginEvent, request: Request, subject: AuthenticatedSubject = Depends(authenticate)):
+    subject.require_tenant(event.tenant_id)
     async with request.app.state.pool.acquire() as connection:
         async with connection.transaction():
             history = await connection.fetchrow(
@@ -345,7 +370,8 @@ async def detect_takeover(event: LoginEvent, request: Request, _: AuthenticatedS
 
 
 @app.post("/analyze-login")
-async def analyze_login(event: LoginEvent, request: Request, _: AuthenticatedSubject = Depends(authenticate)):
+async def analyze_login(event: LoginEvent, request: Request, subject: AuthenticatedSubject = Depends(authenticate)):
+    subject.require_tenant(event.tenant_id)
     async with request.app.state.pool.acquire() as connection:
         history = await connection.fetchrow(
             """
@@ -371,7 +397,8 @@ async def analyze_login(event: LoginEvent, request: Request, _: AuthenticatedSub
 
 
 @app.post("/verify-device")
-async def verify_device(payload: DeviceVerificationRequest, request: Request, _: AuthenticatedSubject = Depends(authenticate)):
+async def verify_device(payload: DeviceVerificationRequest, request: Request, subject: AuthenticatedSubject = Depends(authenticate)):
+    subject.require_tenant(payload.tenant_id)
     async with request.app.state.pool.acquire() as connection:
         existing = await connection.fetchrow(
             "SELECT fingerprint, is_trusted FROM device_fingerprints WHERE tenant_id=$1 AND user_id=$2 AND device_id=$3 ORDER BY created_at DESC LIMIT 1",
@@ -399,7 +426,8 @@ async def verify_device(payload: DeviceVerificationRequest, request: Request, _:
 
 
 @app.post("/detect-credential-stuffing")
-async def detect_credential_stuffing(payload: CredentialStuffingRequest, request: Request, _: AuthenticatedSubject = Depends(authenticate)):
+async def detect_credential_stuffing(payload: CredentialStuffingRequest, request: Request, subject: AuthenticatedSubject = Depends(authenticate)):
+    subject.require_tenant(payload.tenant_id)
     async with request.app.state.pool.acquire() as connection:
         async with connection.transaction():
             await connection.execute(
@@ -423,7 +451,8 @@ async def detect_credential_stuffing(payload: CredentialStuffingRequest, request
 
 
 @app.post("/detect-session-hijacking")
-async def detect_session_hijacking(event: LoginEvent, request: Request, _: AuthenticatedSubject = Depends(authenticate)):
+async def detect_session_hijacking(event: LoginEvent, request: Request, subject: AuthenticatedSubject = Depends(authenticate)):
+    subject.require_tenant(event.tenant_id)
     async with request.app.state.pool.acquire() as connection:
         previous = await connection.fetchrow(
             "SELECT ip_address, device_id, location FROM login_patterns WHERE tenant_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 1",
@@ -452,7 +481,8 @@ async def detect_session_hijacking(event: LoginEvent, request: Request, _: Authe
 
 
 @app.post("/check-impossible-travel")
-async def check_impossible_travel(event: LoginEvent, request: Request, _: AuthenticatedSubject = Depends(authenticate)):
+async def check_impossible_travel(event: LoginEvent, request: Request, subject: AuthenticatedSubject = Depends(authenticate)):
+    subject.require_tenant(event.tenant_id)
     async with request.app.state.pool.acquire() as connection:
         previous = await connection.fetchrow(
             "SELECT location, created_at FROM login_patterns WHERE tenant_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 1",
@@ -479,9 +509,10 @@ async def check_impossible_travel(event: LoginEvent, request: Request, _: Authen
 
 
 @app.get("/ato-alerts")
-async def get_ato_alerts(request: Request, tenant_id: str, limit: int = 50, _: AuthenticatedSubject = Depends(authenticate)):
+async def get_ato_alerts(request: Request, tenant_id: str, limit: int = 50, subject: AuthenticatedSubject = Depends(authenticate)):
     if not tenant_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tenant_id is required")
+    subject.require_tenant(tenant_id)
     limit = min(max(limit, 1), 200)
     rows = await request.app.state.pool.fetch(
         "SELECT id,user_id,alert_type,risk_level,created_at FROM ato_alerts WHERE tenant_id=$1 ORDER BY created_at DESC LIMIT $2",
