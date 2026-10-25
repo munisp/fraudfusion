@@ -17,6 +17,8 @@ import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 
+import geo as geolibre
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(SERVICE_NAME := "account-takeover-detector")
 
@@ -127,6 +129,13 @@ def login_features(event: LoginEvent, history: Any, hour_window_logins: int | No
     }
 
 
+def get_geo(request: Request) -> "geolibre.GeoResolver":
+    resolver = getattr(request.app.state, "geo_resolver", None)
+    if resolver is None:
+        resolver = request.app.state.geo_resolver = geolibre.GeoResolver()
+    return resolver
+
+
 def get_scorer(request: Request) -> OnnxScorer:
     scorer = getattr(request.app.state, "scorer", None)
     if scorer is None:
@@ -192,6 +201,9 @@ async def lifespan(app: FastAPI):
         command_timeout=10,
     )
     app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+    # Geo layer: DB gazetteer (PostGIS or SQL haversine) or embedded fallback.
+    app.state.geo_resolver = geolibre.GeoResolver(
+        app.state.pool, await geolibre.detect_geo_mode(app.state.pool))
     # Load the ONNX artifact at startup so the first request does not pay
     # model-load latency.
     app.state.scorer = OnnxScorer()
@@ -327,6 +339,7 @@ async def health_check(request: Request):
         "status": "healthy",
         "service": SERVICE_NAME,
         "scoring_mode": get_scorer(request).mode,
+        "geo_mode": get_geo(request).mode,
         "model_path": str(MODEL_PATH),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -351,10 +364,11 @@ async def detect_takeover(event: LoginEvent, request: Request, subject: Authenti
             )
             await connection.execute(
                 """
-                INSERT INTO login_patterns (tenant_id, user_id, ip_address, device_id, location, user_agent, created_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                INSERT INTO login_patterns (tenant_id, user_id, ip_address, device_id, location, user_agent, created_at, lat, lon)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                 """,
                 event.tenant_id, event.user_id, event.ip_address, event.device_id, event.location, event.user_agent, event.timestamp,
+                *(await _geo_coords(request, event.location)),
             )
             rule_score, indicators = takeover_score(history, event)
             model_proba = await asyncio.to_thread(get_scorer(request).predict_proba, login_features(event, history))
@@ -383,8 +397,9 @@ async def analyze_login(event: LoginEvent, request: Request, subject: Authentica
             event.tenant_id, event.user_id, event.device_id, event.location,
         )
         await connection.execute(
-            "INSERT INTO login_patterns (tenant_id,user_id,ip_address,device_id,location,user_agent,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            "INSERT INTO login_patterns (tenant_id,user_id,ip_address,device_id,location,user_agent,created_at,lat,lon) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             event.tenant_id, event.user_id, event.ip_address, event.device_id, event.location, event.user_agent, event.timestamp,
+                *(await _geo_coords(request, event.location)),
         )
         rule_score, indicators = login_score(history, event)
         model_proba = await asyncio.to_thread(get_scorer(request).predict_proba, login_features(event, history))
@@ -471,8 +486,9 @@ async def detect_session_hijacking(event: LoginEvent, request: Request, subject:
                 score += 25
                 indicators.append("location_changed")
         await connection.execute(
-            "INSERT INTO login_patterns (tenant_id,user_id,ip_address,device_id,location,user_agent,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            "INSERT INTO login_patterns (tenant_id,user_id,ip_address,device_id,location,user_agent,created_at,lat,lon) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             event.tenant_id, event.user_id, event.ip_address, event.device_id, event.location, event.user_agent, event.timestamp,
+                *(await _geo_coords(request, event.location)),
         )
         await record_event(connection, event.tenant_id, event.user_id, "session_hijacking", score, indicators)
         if score >= 60:
@@ -492,7 +508,7 @@ async def check_impossible_travel(event: LoginEvent, request: Request, subject: 
         impossible = False
         indicators: list[str] = []
         if previous:
-            dist = city_distance_km(previous["location"], event.location)
+            dist = await get_geo(request).distance_km(previous["location"], event.location)
             if dist is None:
                 # Honest gap: an unknown city must never look like zero travel.
                 indicators.append("location_unresolved")
@@ -504,8 +520,9 @@ async def check_impossible_travel(event: LoginEvent, request: Request, subject: 
                     indicators.append("impossible_travel_velocity")
         score = 70 if impossible else 0
         await connection.execute(
-            "INSERT INTO login_patterns (tenant_id,user_id,ip_address,device_id,location,user_agent,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            "INSERT INTO login_patterns (tenant_id,user_id,ip_address,device_id,location,user_agent,created_at,lat,lon) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             event.tenant_id, event.user_id, event.ip_address, event.device_id, event.location, event.user_agent, event.timestamp,
+                *(await _geo_coords(request, event.location)),
         )
         await record_event(connection, event.tenant_id, event.user_id, "impossible_travel", score, indicators)
         if impossible:
@@ -572,6 +589,13 @@ def login_score(history: asyncpg.Record, event: LoginEvent) -> tuple[int, list[s
     return min(score, 100), indicators
 
 
+async def _geo_coords(request: Request, location: str) -> tuple[float | None, float | None]:
+    """Resolve a place name to (lat, lon) for persistence; (None, None)
+    when unresolved — never fabricated coordinates."""
+    coords = await get_geo(request).resolve(location)
+    return coords if coords else (None, None)
+
+
 def response(user_id: str, score: int, indicators: list[str], boolean_field: str, value: bool) -> dict[str, Any]:
     return {"user_id": user_id, boolean_field: value, "risk_score": score, "risk_level": risk_level(score), "indicators": indicators, "timestamp": datetime.now(timezone.utc).isoformat()}
 
@@ -587,55 +611,9 @@ def risk_level(score: int) -> str:
 
 
 def city_distance_km(origin: str, destination: str) -> float | None:
-    """Great-circle distance in km, or None when either city is unknown —
-    callers MUST surface that honestly (a silent 0.0 reads as 'no travel')."""
-    coordinates = {
-        # Nigerian state capitals and major cities
-        "abuja": (9.0765, 7.3986), "lagos": (6.5244, 3.3792),
-        "kano": (12.0022, 8.5920), "ibadan": (7.3775, 3.9470),
-        "port harcourt": (4.8156, 7.0498), "benin city": (6.3350, 5.6037),
-        "kaduna": (10.5105, 7.4165), "jos": (9.8965, 8.8583),
-        "ilorin": (8.4966, 4.5426), "enugu": (6.4403, 7.4942),
-        "aba": (5.1166, 7.3667), "onitsha": (6.1667, 6.7833),
-        "warri": (5.5167, 5.7500), "owerri": (5.4833, 7.0333),
-        "calabar": (4.9517, 8.3220), "uyo": (5.0333, 7.9167),
-        "akure": (7.2571, 5.2058), "osogbo": (7.7667, 4.5667),
-        "abeokuta": (7.1475, 3.3619), "maiduguri": (11.8311, 13.1510),
-        "zaria": (11.0855, 7.7199), "sokoto": (13.0059, 5.2476),
-        "katsina": (12.9908, 7.6018), "bauchi": (10.3158, 9.8442),
-        "gombe": (10.2897, 11.1673), "yola": (9.2000, 12.4833),
-        "makurdi": (7.7322, 8.5391), "minna": (9.6136, 6.5569),
-        "lafia": (8.4833, 8.5167), "asaba": (6.1833, 6.7333),
-        "awka": (6.2167, 7.0833), "lokoja": (7.8023, 6.7333),
-        "dutse": (11.7594, 9.3392), "damaturu": (11.7469, 11.9609),
-        "birnin kebbi": (12.4539, 4.1975), "jalingo": (8.8833, 11.3667),
-        "yenegoa": (4.9267, 6.2676), "ado ekiti": (7.6167, 5.2167),
-        "ogbomosho": (8.1333, 4.2667), "nsukka": (6.8567, 7.3958),
-        # Regional and global hubs
-        "accra": (5.6037, -0.1870), "abidjan": (5.3600, -4.0083),
-        "dakar": (14.7167, -17.4677), "nairobi": (-1.2921, 36.8219),
-        "johannesburg": (-26.2041, 28.0473), "cairo": (30.0444, 31.2357),
-        "london": (51.5072, -0.1276), "paris": (48.8566, 2.3522),
-        "frankfurt": (50.1109, 8.6821), "amsterdam": (52.3676, 4.9041),
-        "madrid": (40.4168, -3.7038), "rome": (41.9028, 12.4964),
-        "istanbul": (41.0082, 28.9784), "dubai": (25.2048, 55.2708),
-        "doha": (25.2854, 51.5310), "riyadh": (24.7136, 46.6753),
-        "mumbai": (19.0760, 72.8777), "delhi": (28.7041, 77.1025),
-        "singapore": (1.3521, 103.8198), "hong kong": (22.3193, 114.1694),
-        "tokyo": (35.6762, 139.6503), "beijing": (39.9042, 116.4074),
-        "shanghai": (31.2304, 121.4737), "sydney": (-33.8688, 151.2093),
-        "new york": (40.7128, -74.0060), "los angeles": (34.0522, -118.2437),
-        "chicago": (41.8781, -87.6298), "houston": (29.7604, -95.3698),
-        "atlanta": (33.7490, -84.3880), "miami": (25.7617, -80.1918),
-        "toronto": (43.6532, -79.3832), "sao paulo": (-23.5505, -46.6333),
-    }
-    source = coordinates.get(origin.strip().lower())
-    target = coordinates.get(destination.strip().lower())
-    if not source or not target:
-        return None
-    lat1, lon1, lat2, lon2 = map(math.radians, (*source, *target))
-    haversine = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
-    return 6371.0 * 2 * math.asin(math.sqrt(haversine))
+    """Great-circle distance in km, or None when either place is unknown.
+    Delegates to the libre geo layer's embedded gazetteer (geo.py)."""
+    return geolibre.embedded_distance_km(origin, destination)
 
 
 if __name__ == "__main__":

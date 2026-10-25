@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import asyncpg  # noqa: E402
 import httpx  # noqa: E402
+import geo as geolibre  # noqa: E402
 import main as ato  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -60,6 +61,9 @@ class FakeConnection:
 
     async def fetchrow(self, sql, *args):
         s = " ".join(sql.split())
+        if "FROM geo_resolve" in s:
+            coords = geolibre.embedded_resolve(args[0])
+            return {"lat": coords[0], "lon": coords[1]} if coords else None
         if "COUNT(*) AS recent_logins" in s and "distinct_locations" in s:
             tenant, user, device, location = args
             rows = self._logins(tenant, user)
@@ -104,11 +108,11 @@ class FakeConnection:
     async def execute(self, sql, *args):
         s = " ".join(sql.split())
         if "INSERT INTO login_patterns" in s:
-            tenant, user, ip, device, location, ua, created = args
+            tenant, user, ip, device, location, ua, created, lat, lon = args
             self.state["login_patterns"].append({
                 "tenant_id": tenant, "user_id": user, "ip_address": ip,
                 "device_id": device, "location": location, "user_agent": ua,
-                "created_at": created,
+                "created_at": created, "lat": lat, "lon": lon,
             })
         elif "INSERT INTO device_fingerprints" in s:
             tenant, user, device, fp = args
@@ -162,10 +166,22 @@ class FakePool:
     def acquire(self):
         return FakeConnection(self.state)
 
-    async def fetchval(self, sql):
+    async def fetchval(self, sql, *args):
         if not self.healthy:
             raise asyncpg.PostgresError("boom")
+        s = " ".join(sql.split())
+        if "pg_extension" in s:
+            return False  # embedded PG: honest sql-haversine mode
+        if "geo_distance_km" in s:
+            if args:
+                return geolibre.embedded_distance_km(args[0], args[1])
+            import re
+            m = re.search(r"geo_distance_km\('([^']+)', '([^']+)'\)", s)
+            return geolibre.embedded_distance_km(m.group(1), m.group(2))
         return 1
+
+    async def fetchrow(self, sql, *args):
+        return await FakeConnection(self.state).fetchrow(sql, *args)
 
     async def fetch(self, sql, *args):
         return await FakeConnection(self.state).fetch(sql, *args)
@@ -500,3 +516,66 @@ class TestGeoHonesty:
     def test_city_distance_unknown_returns_none(self):
         assert ato.city_distance_km("lagos", "atlantis") is None
         assert ato.city_distance_km("Kano", "LAGOS") > 800  # case-insensitive
+
+
+class TestGeoLayer:
+    def test_health_reports_geo_mode(self, client):
+        tc, _ = client
+        out = tc.get("/health").json()
+        assert out["geo_mode"] == "sql-haversine"  # fake DB has no postgis ext
+
+    def test_logins_persist_resolved_coordinates(self, client):
+        tc, pool = client
+        tc.post("/analyze-login", json=login_event(location="lagos"), headers=auth())
+        row = pool.state["login_patterns"][-1]
+        assert row["lat"] == pytest.approx(6.5244) and row["lon"] == pytest.approx(3.3792)
+
+    def test_unresolved_place_persists_null_coordinates(self, client):
+        tc, pool = client
+        tc.post("/analyze-login", json=login_event(location="atlantis"), headers=auth())
+        row = pool.state["login_patterns"][-1]
+        assert row["lat"] is None and row["lon"] is None
+
+    def test_db_geo_failure_degrades_to_embedded(self, client):
+        """If the DB geo functions break mid-run, distance queries honestly
+        fall back to the embedded gazetteer — detection keeps working."""
+        tc, pool = client
+
+        class BrokenGeoPool(FakePool):
+            async def fetchval(self, sql, *args):
+                if "geo_distance_km" in sql:
+                    raise asyncpg.PostgresError("function gone")
+                return await super().fetchval(sql, *args)
+
+        pool.__class__ = BrokenGeoPool
+        pool.state["login_patterns"].append({
+            "tenant_id": "tenant-1", "user_id": "u-1", "ip_address": "1.1.1.1",
+            "device_id": "dev-a", "location": "lagos", "user_agent": "x",
+            "created_at": NOW - timedelta(hours=1)})
+        out = tc.post("/check-impossible-travel",
+                      json=login_event(location="london"), headers=auth()).json()
+        assert out["impossible_travel"] is True  # embedded fallback caught it
+
+    def test_detect_geo_mode_never_raises(self):
+        class DeadPool:
+            async def fetchval(self, *a):
+                raise asyncpg.PostgresError("down")
+
+        import asyncio
+        assert asyncio.run(geolibre.detect_geo_mode(DeadPool())) == "embedded-fallback"
+
+
+class TestGazetteerParity:
+    """The embedded gazetteer MUST match the migration seed — the DB is the
+    source of truth and drift between the two layers would silently change
+    verdicts by deployment mode."""
+
+    def test_embedded_matches_migration_seed(self):
+        import re
+        migration = (Path(ato.__file__).resolve().parents[3]
+                     / "database" / "20261026_postgis_geo.sql").read_text()
+        rows = re.findall(
+            r"\('([^']+)',\s*(-?\d+\.\d+),\s*(-?\d+\.\d+),", migration)
+        seed = {name: (float(lat), float(lon)) for name, lat, lon in rows}
+        assert len(seed) >= 70  # guard against a regex regression hiding rows
+        assert seed == geolibre.GAZETTEER

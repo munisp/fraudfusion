@@ -55,6 +55,10 @@ jobs:
           set -euo pipefail
           pip install -r ml/requirements.txt
           python -m pytest ml/tests -q
+      - name: geo-analytics reference tests (Sedona jobs are honestly gated)
+        run: |
+          set -euo pipefail
+          python -m pytest intelligence/geo_analytics/tests -q
 
   go-modules:
     runs-on: ubuntu-latest

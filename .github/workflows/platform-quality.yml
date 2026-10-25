@@ -20,7 +20,7 @@ jobs:
       - name: Compile-check every Python module
         run: |
           set -euo pipefail
-          python -m compileall -q ml mlops services/python services/land-verification-service
+          python -m compileall -q ml mlops intelligence services/python services/land-verification-service
       - name: onboarding-service unit tests (SQLite backend)
         working-directory: services/python/onboarding-service
         run: |
