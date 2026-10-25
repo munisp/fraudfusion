@@ -469,3 +469,34 @@ class TestOnnxScorer:
         assert ato.blend_score(None, 50) == (50, "rule_fallback")
         score, mode = ato.blend_score(1.0, 0)
         assert mode == "hybrid" and score == round(ato.MODEL_BLEND_WEIGHT * 100)
+
+
+class TestGeoHonesty:
+    def test_unknown_city_is_flagged_not_silently_zero(self, client):
+        tc, pool = client
+        pool.state["login_patterns"].append({
+            "tenant_id": "tenant-1", "user_id": "u-1", "ip_address": "1.1.1.1",
+            "device_id": "dev-a", "location": "lagos", "user_agent": "x",
+            "created_at": NOW - timedelta(hours=1)})
+        out = tc.post("/check-impossible-travel",
+                      json=login_event(location="ouagadougou"),
+                      headers=auth()).json()
+        assert out["impossible_travel"] is False
+        assert "location_unresolved" in out["indicators"]
+
+    def test_regional_cities_now_resolved(self, client):
+        # kano -> maiduguri (~500km) in 20 minutes: impossible with the
+        # expanded Nigerian table (both were unknown before R4).
+        tc, pool = client
+        pool.state["login_patterns"].append({
+            "tenant_id": "tenant-1", "user_id": "u-1", "ip_address": "1.1.1.1",
+            "device_id": "dev-a", "location": "kano", "user_agent": "x",
+            "created_at": NOW - timedelta(minutes=20)})
+        out = tc.post("/check-impossible-travel",
+                      json=login_event(location="maiduguri"),
+                      headers=auth()).json()
+        assert out["impossible_travel"] is True
+
+    def test_city_distance_unknown_returns_none(self):
+        assert ato.city_distance_km("lagos", "atlantis") is None
+        assert ato.city_distance_km("Kano", "LAGOS") > 800  # case-insensitive

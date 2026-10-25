@@ -645,3 +645,47 @@ def test_internal_usage_validates_operation_and_tenant(db, monkeypatch):
     resp = client.post("/internal/usage", json=_usage_body(tenant="tenant-ghost"),
                        headers=headers)
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Keycloak introspection cache wiring
+# ---------------------------------------------------------------------------
+def test_billing_auth_uses_cache_across_requests(db, monkeypatch):
+    """Wiring proof: two control-plane calls with the same bearer token
+    perform ONE Keycloak introspection."""
+    import app.auth as auth_mod
+    from app.token_cache import reset_token_cache
+
+    reset_token_cache()
+    monkeypatch.setattr(auth_mod, "KEYCLOAK_URL", "https://keycloak.test")
+    monkeypatch.setattr(auth_mod, "KEYCLOAK_CLIENT_SECRET", "s")
+
+    calls = []
+
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"active": True, "sub": "user-1",
+                    "preferred_username": "ada", "tenant_id": "tenant-1",
+                    "realm_access": {"roles": []}}
+
+    def fake_post(url, data, timeout):
+        calls.append(url)
+        return Resp()
+
+    monkeypatch.setattr(auth_mod.httpx, "post", fake_post)
+    from app.main import create_app
+    from app.db import get_db
+    from fastapi.testclient import TestClient as _TC
+
+    app = create_app(db=db, flush_threshold=1)
+    app.dependency_overrides[get_db] = lambda: db
+    client = _TC(app)  # NOTE: no principal override — real auth path
+    headers = {"Authorization": "Bearer wiring-proof-token"}
+    for _ in range(2):
+        resp = client.get("/v1/billing/usage/current",
+                          params={"tenant_id": "tenant-1"}, headers=headers)
+        assert resp.status_code == 200, resp.text
+    assert len(calls) == 1
+    reset_token_cache()

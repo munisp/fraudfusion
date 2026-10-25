@@ -129,5 +129,42 @@ services:
       postgres: {condition: service_healthy}
     ports: ["8092:8092"]
 
+  # --- optional document-intelligence sidecars (profile: doc-intel) --------
+  # Boot the full stack including AI document intelligence with:
+  #   docker compose -f deploy/docker-compose.platform.yml --profile doc-intel up -d
+  #   docker exec fraudfusion-ollama ollama pull qwen2.5vl:7b
+  # The engine is fail-closed: a down sidecar reports "unavailable" in
+  # provenance and contributes zero factors. (Merged from
+  # docker-compose.doc-intel.yml, which is kept for standalone sidecar use.)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: fraudfusion-ollama
+    profiles: ["doc-intel"]
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+    # GPU strongly recommended for qwen2.5vl:7b (CPU works but 30-90s/page).
+    restart: unless-stopped
+
+  doc-intelligence:
+    build:
+      context: ../services/python/doc-verification
+      dockerfile: ../../deploy/doc-intel.Dockerfile
+    container_name: fraudfusion-doc-intel
+    profiles: ["doc-intel"]
+    environment:
+      <<: *common
+      OLLAMA_VISION_MODEL: qwen2.5vl:7b
+      OLLAMA_TIMEOUT_S: "60"
+      PADDLEOCR_ENABLED: "true"
+    ports:
+      - "8090:8090"
+    depends_on:
+      - ollama
+      - postgres
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  ollama-models:

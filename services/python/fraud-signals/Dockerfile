@@ -8,8 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8900
 
 WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt requirements.lock /app/
+# Reproducible builds: install the lock (pip-compile output), not the floors.
+RUN pip install --no-cache-dir -r /app/requirements.lock
 COPY detectors.py store.py main.py /app/
 
 RUN groupadd --system app && useradd --system --gid app app \

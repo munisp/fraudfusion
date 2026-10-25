@@ -37,14 +37,41 @@ kyc-api screening. Unset URL = honestly unavailable, never fabricated.
 
 ## Deployment
 
-`deploy/docker-compose.platform.yml` boots Postgres + the seven python
-services with the full registry wired. Combine with
-`docker-compose.doc-intel.yml` for the AI sidecars:
+`deploy/docker-compose.platform.yml` boots Postgres, Keycloak (local-dev
+realm import), and the Python services with the full registry wired. The AI
+document-intelligence sidecars (ollama + doc-intelligence) are merged into
+the same file behind the `doc-intel` profile:
 
 ```bash
-docker compose -f deploy/docker-compose.platform.yml \
-               -f deploy/docker-compose.doc-intel.yml up
+docker compose -f deploy/docker-compose.platform.yml up                    # core stack
+docker compose -f deploy/docker-compose.platform.yml --profile doc-intel up # + AI sidecars
 ```
+
+`docker-compose.doc-intel.yml` is kept for standalone sidecar boots only.
+
+## Go detector services — deployment posture
+
+`services/go/` contains eleven Go modules: seven standalone fraud detectors
+(advance-fee, aml-monitor, chargeback, crypto, insider, investment,
+sim-swap), `authcommon`, `ledger-command`, `temporal-orchestrator`, and the
+`fraud-signals-detector` parity port.
+
+Posture (decided 2026-10-25):
+
+- **fraud-signals-detector** is an embeddable parity port of the Python
+  fraud-signals detectors (pinned by `fixtures/detector_cases.json`), for
+  partners embedding detection inside their own switch. Not deployed as a
+  platform service.
+- **The seven standalone detectors** are deployable services (each has a
+  Dockerfile and CI builds the image) but are NOT in the platform compose;
+  they are consumed via their own endpoints in k8s
+  (`deploy/kubernetes/detectors.yaml`). Compose users route through the
+  Python fraud-signals service instead.
+- **ledger-command / temporal-orchestrator** back the ledger and journey
+  flows; deployed via k8s manifests, not compose.
+- CI gates all Go modules with `gofmt -l`, `go vet`, and `go test ./...`
+  (`.github/workflows/verify.yml`), and the Rust port with
+  `cargo fmt --check` / `clippy -D warnings` / `cargo test`.
 
 ## Invariants (pinned by tests)
 

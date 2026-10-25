@@ -9,8 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv/doc-verification
-COPY services/python/doc-verification/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY services/python/doc-verification/requirements.txt services/python/doc-verification/requirements.lock ./
+# Reproducible builds: install the lock (pip-compile output), not the floors.
+RUN pip install --no-cache-dir -r requirements.lock
 
 # Heavy OCR backend (Round 16 rollout item 1). PaddlePaddle CPU wheel;
 # for CUDA use the paddlepaddle-gpu wheel matching your driver.

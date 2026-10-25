@@ -12,8 +12,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app
 
 WORKDIR /app
-COPY services/python/kg-qa/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY services/python/kg-qa/requirements.txt services/python/kg-qa/requirements.lock /app/
+# Reproducible builds: install the lock (pip-compile output), not the floors.
+RUN pip install --no-cache-dir -r /app/requirements.lock
 # The service imports intelligence.kg_pipeline for /v1/kg/refresh.
 COPY intelligence /app/intelligence
 COPY services/python/kg-qa/app /app/app

@@ -11,8 +11,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     WATCHLIST_PATH=/app/data/watchlist.json
 
 WORKDIR /app
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.txt requirements.lock /app/
+# Reproducible builds: install the lock (pip-compile output), not the floors.
+RUN pip install --no-cache-dir -r /app/requirements.lock
 COPY app /app/app
 COPY data/watchlist.json /app/data/watchlist.json
 

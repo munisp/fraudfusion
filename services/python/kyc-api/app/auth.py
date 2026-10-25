@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 import httpx
 from fastapi import Header, HTTPException, status
 
+from app.token_cache import cached_introspect
+
 KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "").rstrip("/")
 KEYCLOAK_REALM = os.getenv("KEYCLOAK_REALM", "fraudfusion")
 KEYCLOAK_CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID", "kyc-api")
@@ -41,27 +43,33 @@ def _introspect(token: str) -> dict:
             detail="Keycloak URL must be https (KEYCLOAK_INSECURE_HTTP=true for local dev only)",
         )
     endpoint = f"{KEYCLOAK_URL}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token/introspect"
-    try:
-        response = httpx.post(
-            endpoint,
-            data={
-                "token": token,
-                "client_id": KEYCLOAK_CLIENT_ID,
-                "client_secret": KEYCLOAK_CLIENT_SECRET,
-            },
-            timeout=5.0,
-        )
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"authentication provider unreachable: {exc.__class__.__name__}",
-        ) from exc
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"authentication provider error (status {response.status_code})",
-        )
-    return response.json()
+
+    def _fetch(tok: str) -> dict:
+        try:
+            response = httpx.post(
+                endpoint,
+                data={
+                    "token": tok,
+                    "client_id": KEYCLOAK_CLIENT_ID,
+                    "client_secret": KEYCLOAK_CLIENT_SECRET,
+                },
+                timeout=5.0,
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"authentication provider unreachable: {exc.__class__.__name__}",
+            ) from exc
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"authentication provider error (status {response.status_code})",
+            )
+        return response.json()
+
+    # Bounded TTL cache (token SHA-256 keyed): active claims 45s, inactive 5s,
+    # transport errors never cached. Fail-closed semantics unchanged.
+    return cached_introspect(token, _fetch)
 
 
 def get_current_principal(authorization: str = Header(default="")) -> Principal:
