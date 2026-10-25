@@ -1,0 +1,11 @@
+[package]
+name = "fraud-signals-detectors"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of the FraudFusion fraud-signal detectors (parity: fixtures/detector_cases.json)"
+license = "Proprietary"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }

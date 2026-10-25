@@ -1263,6 +1263,45 @@ def create_app() -> FastAPI:
                                "latency_ms": summary["latency_ms"]}
                               if summary["status"] == "ok"
                               else {"reason": summary.get("reason")})}
+        # APP-scam advisory: when the payload carries transfer context
+        # (payee/device/session fields), evaluate the app-scam detector and,
+        # when a payee is involved, the mule detector on the payee — the two
+        # signals combine (payee_mule_score feeds the app-scam factor).
+        # Advisory only, same fail-closed contract as the intel block.
+        scam_block = {"status": "unavailable",
+                      "reason": integration.INTEGRATION_UNAVAILABLE_REASON
+                      or "FRAUD_SIGNALS_URL not configured"}
+        if integration.INTEGRATION_AVAILABLE and (
+                payload.get("payee_is_new") is not None
+                or payload.get("payee_id")
+                or payload.get("session_seconds") is not None):
+            m = integration.fresh_mesh()
+            scam_payload = {
+                k: payload.get(k) for k in (
+                    "payee_is_new", "payee_age_hours", "amount_ngn",
+                    "customer_avg_amount", "session_seconds", "device_is_new")
+                if payload.get(k) is not None}
+            scam_payload.setdefault("amount_ngn", amount)
+            payee_id = payload.get("payee_id")
+            if payee_id:
+                mule_res = integration.flows.fraud_signal_mule(
+                    str(payee_id), {}, mesh=m)
+                if mule_res["status"] == "ok":
+                    scam_payload["payee_mule_score"] = \
+                        mule_res["data"].get("score")
+            scam_res = integration.flows.fraud_signal_app_scam(
+                str(payload.get("customer_id") or payload.get("subject_id")
+                    or "unknown"), scam_payload, mesh=m)
+            if scam_res["status"] == "ok":
+                scam_block = {"status": "ok",
+                              "score": scam_res["data"].get("score"),
+                              "verdict": scam_res["data"].get("verdict"),
+                              "factors": [f["code"] for f in
+                                          scam_res["data"].get("factors", [])],
+                              "latency_ms": scam_res["latency_ms"]}
+            else:
+                scam_block = {"status": scam_res["status"],
+                              "reason": scam_res.get("reason")}
         score = round(min(score, 1.0), 3)
         return {
             "assessment_id": uuid.uuid4().hex,
@@ -1272,6 +1311,7 @@ def create_app() -> FastAPI:
             "counterparty_verification_gap": gap["flag"],
             "counterparty_rigor": rigor,
             "national_intelligence": intel_block,
+            "scam_signals": scam_block,
             "model": "rules",
             "timestamp": _now(),
         }

@@ -27,7 +27,7 @@ def _clean_env(monkeypatch):
     for var in ("KYC_API_URL", "LAND_SERVICE_URL", "INTEL_SERVICE_URL",
                 "ONBOARDING_SERVICE_URL", "BACKOFFICE_API_URL",
                 "BILLING_SERVICE_URL", "WEBHOOK_SERVICE_URL",
-                "DOC_INTEL_URL", "KYC_API_KEY", "INTEL_INTERNAL_TOKEN",
+                "DOC_INTEL_URL", "FRAUD_SIGNALS_URL", "KYC_API_KEY", "INTEL_INTERNAL_TOKEN",
                 "FRAUDFUSION_INTERNAL_TOKEN"):
         monkeypatch.delenv(var, raising=False)
 
@@ -127,4 +127,30 @@ class TestFlows:
 
     def test_flow_on_unconfigured_peer_is_honest(self):
         result = flows.onboarding_kyb_status("app-1", Mesh())
+        assert result["status"] == "unavailable"
+
+
+class TestFraudSignalsFlows:
+    def test_fraud_signals_registered(self):
+        assert mesh_mod.REGISTRY["fraud_signals"] == "FRAUD_SIGNALS_URL"
+
+    def test_fraud_signal_flow_hits_detector_path(self, monkeypatch):
+        monkeypatch.setenv("FRAUD_SIGNALS_URL", "http://signals:8600")
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={"score": 0.8, "verdict": "block",
+                                             "factors": [], "audit_hash": "abc"})
+
+        m = Mesh(transport=httpx.MockTransport(handler))
+        result = flows.fraud_signal_app_scam("acct-1", {"payee_is_new": True}, m)
+        assert result["status"] == "ok"
+        assert seen["path"] == "/api/v1/signals/app_scam"
+        assert seen["body"]["subject_id"] == "acct-1"
+        assert result["data"]["verdict"] == "block"
+
+    def test_fraud_signal_unavailable_is_fail_closed(self):
+        result = flows.fraud_signal_mule("acct-1", {}, mesh=Mesh())
         assert result["status"] == "unavailable"

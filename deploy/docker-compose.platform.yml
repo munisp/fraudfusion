@@ -45,6 +45,7 @@ services:
       WEBHOOK_INTERNAL_TOKEN: ${FRAUDFUSION_INTERNAL_TOKEN}
       KYC_API_KEY: ${KYC_SERVICE_API_KEY:-}
       DOC_INTEL_URL: http://doc-intelligence:8800
+      FRAUD_SIGNALS_URL: http://fraud-signals:8900
       OLLAMA_URL: http://ollama:11434
     depends_on:
       postgres: {condition: service_healthy}
@@ -91,6 +92,13 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
     ports: ["8700:8700"]
+
+  fraud-signals:
+    build: ../services/python/fraud-signals
+    environment: *common
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["8900:8900"]
 
 volumes:
   pgdata:

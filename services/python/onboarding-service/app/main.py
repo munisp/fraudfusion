@@ -30,7 +30,7 @@ from fastapi import Depends, FastAPI, HTTPException, Path, Query, status
 
 import json
 
-from app import kyb_verification, webhook_emitter
+from app import integration, kyb_verification, webhook_emitter
 from app.auth import Principal, get_current_principal, require_admin
 from app.db import Database, get_db
 from app.schemas import (
@@ -523,6 +523,30 @@ def create_app() -> FastAPI:
         """Verify document content and persist the verdict on the row."""
         verdict = kyb_verification.verify_kyb_documents(
             documents, business_name, cac_number)
+        # Loan-stacking advisory: if this business is simultaneously stacking
+        # loan applications across lenders, the fraud-signals service knows
+        # (lenders ingest application events there keyed by CAC number).
+        # Advisory only — never changes the KYB verdict.
+        stacking_block: dict = {"status": "unavailable",
+                                "reason": integration.INTEGRATION_UNAVAILABLE_REASON
+                                or "FRAUD_SIGNALS_URL not configured"}
+        if integration.INTEGRATION_AVAILABLE and cac_number:
+            res = integration.flows.fraud_signal_loan_stacking(
+                cac_number,
+                {"document_authenticity_score": 60
+                 if verdict["verdict"] == "rejected" else None},
+                integration.fresh_mesh())
+            if res["status"] == "ok":
+                stacking_block = {"status": "ok",
+                                  "score": res["data"].get("score"),
+                                  "verdict": res["data"].get("verdict"),
+                                  "factors": [f["code"] for f in
+                                              res["data"].get("factors", [])],
+                                  "latency_ms": res["latency_ms"]}
+            else:
+                stacking_block = {"status": res["status"],
+                                  "reason": res.get("reason")}
+        verdict["loan_stacking_signals"] = stacking_block
         db.execute(
             # SQLite stores the verdict as plain TEXT; Postgres needs the
             # explicit cast because psycopg binds str as text and text->jsonb

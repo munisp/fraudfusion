@@ -1,0 +1,615 @@
+{
+  "generated_at": "2026-10-30T12:00:00+00:00",
+  "note": "Scores computed by the Python reference implementation; every language port must match score (3dp) and verdict.",
+  "cases": [
+    {
+      "detector": "app_scam",
+      "payload": {
+        "payee_is_new": true,
+        "payee_age_hours": 0.2,
+        "amount_ngn": 500000,
+        "customer_avg_amount": 10000,
+        "session_seconds": 20,
+        "device_is_new": true,
+        "payee_mule_score": 0.8
+      },
+      "history": [],
+      "expected": {
+        "score": 1.0,
+        "verdict": "block",
+        "factor_codes": [
+          "new_payee",
+          "payee_just_added",
+          "amount_outlier",
+          "rushed_session",
+          "new_device",
+          "payee_mule_like"
+        ]
+      }
+    },
+    {
+      "detector": "app_scam",
+      "payload": {
+        "amount_ngn": 5000,
+        "customer_avg_amount": 8000,
+        "session_seconds": 300
+      },
+      "history": [
+        {
+          "payload": {},
+          "created_at": "2026-10-29T12:00:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.05,
+        "verdict": "clear",
+        "factor_codes": []
+      }
+    },
+    {
+      "detector": "mule",
+      "payload": {},
+      "history": [
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s0"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s1"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s2"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s3"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s4"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 100000,
+            "counterparty": "s5"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "out",
+            "amount_ngn": 95000,
+            "counterparty": "x0"
+          },
+          "created_at": "2026-10-30T00:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "out",
+            "amount_ngn": 95000,
+            "counterparty": "x1"
+          },
+          "created_at": "2026-10-30T00:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "out",
+            "amount_ngn": 95000,
+            "counterparty": "x2"
+          },
+          "created_at": "2026-10-30T00:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "out",
+            "amount_ngn": 95000,
+            "counterparty": "x3"
+          },
+          "created_at": "2026-10-30T00:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "out",
+            "amount_ngn": 95000,
+            "counterparty": "x4"
+          },
+          "created_at": "2026-10-30T00:00:00+00:00"
+        },
+        {
+          "payload": {
+            "direction": "out",
+            "amount_ngn": 95000,
+            "counterparty": "x5"
+          },
+          "created_at": "2026-10-30T00:00:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.65,
+        "verdict": "review",
+        "factor_codes": [
+          "pass_through",
+          "fan_in"
+        ]
+      }
+    },
+    {
+      "detector": "mule",
+      "payload": {
+        "dormant_days_before": 120,
+        "shared_device_accounts": 4
+      },
+      "history": [
+        {
+          "payload": {
+            "direction": "in",
+            "amount_ngn": 10000,
+            "counterparty": "a"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.45,
+        "verdict": "review",
+        "factor_codes": [
+          "dormancy_burst",
+          "shared_device_cluster"
+        ]
+      }
+    },
+    {
+      "detector": "agent",
+      "payload": {
+        "baseline_tx_per_day": 1,
+        "float_mismatch_ngn": 250000,
+        "distance_from_registered_km": 12
+      },
+      "history": [
+        {
+          "payload": {
+            "type": "cash_out",
+            "amount_ngn": 48000
+          },
+          "created_at": "2026-10-30T10:48:00+00:00"
+        },
+        {
+          "payload": {
+            "type": "cash_out",
+            "amount_ngn": 48000
+          },
+          "created_at": "2026-10-30T10:48:00+00:00"
+        },
+        {
+          "payload": {
+            "type": "cash_out",
+            "amount_ngn": 48000
+          },
+          "created_at": "2026-10-30T10:48:00+00:00"
+        },
+        {
+          "payload": {
+            "type": "cash_out",
+            "amount_ngn": 48000
+          },
+          "created_at": "2026-10-30T10:48:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 1.0,
+        "verdict": "block",
+        "factor_codes": [
+          "velocity_spike",
+          "structuring",
+          "off_location",
+          "float_diversion"
+        ]
+      }
+    },
+    {
+      "detector": "agent",
+      "payload": {
+        "baseline_tx_per_day": 10,
+        "distance_from_registered_km": 1
+      },
+      "history": [
+        {
+          "payload": {
+            "type": "cash_out",
+            "amount_ngn": 20000
+          },
+          "created_at": "2026-10-30T10:48:00+00:00"
+        },
+        {
+          "payload": {
+            "type": "cash_in",
+            "amount_ngn": 15000
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.05,
+        "verdict": "clear",
+        "factor_codes": []
+      }
+    },
+    {
+      "detector": "loan_stacking",
+      "payload": {
+        "thin_file": true
+      },
+      "history": [
+        {
+          "payload": {
+            "lender_id": "lender0"
+          },
+          "created_at": "2026-10-28T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "lender_id": "lender1"
+          },
+          "created_at": "2026-10-28T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "lender_id": "lender2"
+          },
+          "created_at": "2026-10-28T12:00:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.55,
+        "verdict": "review",
+        "factor_codes": [
+          "multi_lender_stack",
+          "thin_file"
+        ]
+      }
+    },
+    {
+      "detector": "loan_stacking",
+      "payload": {
+        "document_authenticity_score": 72,
+        "first_payment_default": true
+      },
+      "history": [],
+      "expected": {
+        "score": 0.65,
+        "verdict": "review",
+        "factor_codes": [
+          "first_payment_default",
+          "forged_income_docs"
+        ]
+      }
+    },
+    {
+      "detector": "issuance",
+      "payload": {
+        "peer_officer_mean_per_day": 5,
+        "peer_officer_std_per_day": 2,
+        "issued_hour_local": 2,
+        "registry_survey_mismatch": true
+      },
+      "history": [
+        {
+          "payload": {
+            "certificate": "C0"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C1"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C2"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C3"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C4"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C5"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C6"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C7"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C8"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C9"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C10"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C11"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C12"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C13"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C14"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C15"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C16"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C17"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C18"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C19"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.85,
+        "verdict": "block",
+        "factor_codes": [
+          "officer_velocity_outlier",
+          "after_hours_issuance",
+          "registry_survey_mismatch"
+        ]
+      }
+    },
+    {
+      "detector": "issuance",
+      "payload": {
+        "peer_officer_mean_per_day": 5,
+        "peer_officer_std_per_day": 2,
+        "issued_hour_local": 11
+      },
+      "history": [
+        {
+          "payload": {
+            "certificate": "C1"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C1"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C1"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        },
+        {
+          "payload": {
+            "certificate": "C1"
+          },
+          "created_at": "2026-10-30T11:31:12+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.05,
+        "verdict": "clear",
+        "factor_codes": []
+      }
+    },
+    {
+      "detector": "channel",
+      "payload": {
+        "channel": "ussd",
+        "sim_change_hours": 3,
+        "alert_integrity_fail": true
+      },
+      "history": [],
+      "expected": {
+        "score": 0.8,
+        "verdict": "block",
+        "factor_codes": [
+          "ussd_after_sim_change",
+          "bank_alert_integrity_fail"
+        ]
+      }
+    },
+    {
+      "detector": "channel",
+      "payload": {
+        "channel": "ussd",
+        "sim_change_hours": 200,
+        "phone_tenure_days": 400
+      },
+      "history": [],
+      "expected": {
+        "score": 0.05,
+        "verdict": "clear",
+        "factor_codes": []
+      }
+    },
+    {
+      "detector": "ghost_payroll",
+      "payload": {
+        "employee_id": "e1",
+        "bank_account_hash": "A",
+        "identity_hash": "X"
+      },
+      "history": [
+        {
+          "payload": {
+            "employee_id": "e2",
+            "bank_account_hash": "A",
+            "identity_hash": "X"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        },
+        {
+          "payload": {
+            "employee_id": "e3",
+            "bank_account_hash": "A",
+            "identity_hash": "Y"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 0.9,
+        "verdict": "block",
+        "factor_codes": [
+          "shared_salary_account",
+          "duplicate_identity"
+        ]
+      }
+    },
+    {
+      "detector": "ghost_payroll",
+      "payload": {
+        "employee_id": "e1",
+        "deceased_registry_hit": true
+      },
+      "history": [],
+      "expected": {
+        "score": 0.7,
+        "verdict": "block",
+        "factor_codes": [
+          "deceased_registry_hit"
+        ]
+      }
+    },
+    {
+      "detector": "subsidy",
+      "payload": {
+        "farm_hectares": 2,
+        "claim_ngn": 2000000,
+        "farm_geocode_outside_lga": true,
+        "no_field_activity_evidence": true,
+        "claim_id": "c1",
+        "identity_hash": "X"
+      },
+      "history": [
+        {
+          "payload": {
+            "claim_id": "c2",
+            "identity_hash": "X"
+          },
+          "created_at": "2026-10-29T12:00:00+00:00"
+        }
+      ],
+      "expected": {
+        "score": 1.0,
+        "verdict": "block",
+        "factor_codes": [
+          "implausible_claim_ratio",
+          "farm_outside_lga",
+          "duplicate_claimant",
+          "no_field_activity"
+        ]
+      }
+    },
+    {
+      "detector": "subsidy",
+      "payload": {
+        "farm_hectares": 5,
+        "claim_ngn": 200000,
+        "claim_id": "c1",
+        "identity_hash": "X"
+      },
+      "history": [],
+      "expected": {
+        "score": 0.05,
+        "verdict": "clear",
+        "factor_codes": []
+      }
+    }
+  ]
+}

@@ -526,3 +526,36 @@ class TestNameSimilarity:
     def test_distinct_names_low(self):
         assert kyb_verification.name_similarity(
             "Acme Logistics Ltd", "Omega Petroleum Plc") < 0.5
+
+
+class TestLoanStackingAdvisory:
+    def test_unconfigured_fraud_signals_is_honest_block(self, db, monkeypatch):
+        monkeypatch.delenv("FRAUD_SIGNALS_URL", raising=False)
+        client = make_client(db, TENANT)
+        resp = submit(client, [cac_cert(), memart()])
+        assert resp.status_code == 201, resp.text
+        v = client.get(
+            f"/api/v1/onboarding/kyb/{resp.json()['applicationId']}/verification"
+        ).json()
+        assert v["loan_stacking_signals"]["status"] == "unavailable"
+
+    def test_stacking_signal_folded_into_verdict(self, db, monkeypatch):
+        from app import integration
+        monkeypatch.setattr(
+            integration.flows, "fraud_signal_loan_stacking",
+            lambda subject_id, payload, mesh=None: {
+                "status": "ok", "latency_ms": 1.5,
+                "data": {"score": 0.55, "verdict": "review",
+                         "factors": [{"code": "multi_lender_stack"}]}})
+        client = make_client(db, TENANT)
+        resp = submit(client, [cac_cert(), memart()])
+        assert resp.status_code == 201, resp.text
+        v = client.get(
+            f"/api/v1/onboarding/kyb/{resp.json()['applicationId']}/verification"
+        ).json()
+        block = v["loan_stacking_signals"]
+        assert block["status"] == "ok"
+        assert block["verdict"] == "review"
+        assert block["factors"] == ["multi_lender_stack"]
+        # Advisory only: the KYB verdict itself is unchanged.
+        assert v["verdict"] in ("verified", "manual_review")

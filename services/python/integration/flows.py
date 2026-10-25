@@ -86,3 +86,65 @@ def onboarding_kyb_status(app_id: str,
 def doc_intel_analyze(payload: dict, mesh: Optional[Mesh] = None) -> dict[str, Any]:
     return (mesh or get_mesh()).doc_intel.post("/documents/intelligence",
                                                payload)
+
+
+# ---------------------------------------------------------------------------
+# fraud-signals-service — developing-market fraud detectors
+# ---------------------------------------------------------------------------
+
+def fraud_signal(detector: str, subject_id: str, payload: dict,
+                 events: Optional[list] = None,
+                 mesh: Optional[Mesh] = None) -> dict[str, Any]:
+    """Evaluate one fraud-signal detector via the mesh.
+
+    Returns the service's {score, verdict, factors, audit_hash} envelope, or
+    the mesh's fail-closed {"status": "unavailable", ...} when the service is
+    down — callers MUST treat both as advisory unless they explicitly check
+    the verdict field.
+    """
+    body: dict[str, Any] = {"subject_id": subject_id, "payload": payload}
+    if events is not None:
+        body["events"] = events
+    return (mesh or get_mesh()).fraud_signals.post(
+        f"/api/v1/signals/{detector}", body)
+
+
+def fraud_signal_app_scam(subject_id: str, payload: dict,
+                          mesh: Optional[Mesh] = None) -> dict[str, Any]:
+    return fraud_signal("app_scam", subject_id, payload, mesh=mesh)
+
+
+def fraud_signal_mule(subject_id: str, payload: dict,
+                      events: Optional[list] = None,
+                      mesh: Optional[Mesh] = None) -> dict[str, Any]:
+    return fraud_signal("mule", subject_id, payload, events=events, mesh=mesh)
+
+
+def fraud_signal_agent(subject_id: str, payload: dict,
+                       mesh: Optional[Mesh] = None) -> dict[str, Any]:
+    return fraud_signal("agent", subject_id, payload, mesh=mesh)
+
+
+def fraud_signal_loan_stacking(subject_id: str, payload: dict,
+                               mesh: Optional[Mesh] = None) -> dict[str, Any]:
+    return fraud_signal("loan_stacking", subject_id, payload, mesh=mesh)
+
+
+def fraud_signal_issuance(subject_id: str, payload: dict,
+                          mesh: Optional[Mesh] = None) -> dict[str, Any]:
+    return fraud_signal("issuance", subject_id, payload, mesh=mesh)
+
+
+def fraud_signal_channel(subject_id: str, payload: dict,
+                         mesh: Optional[Mesh] = None) -> dict[str, Any]:
+    return fraud_signal("channel", subject_id, payload, mesh=mesh)
+
+
+def fraud_signal_ghost_payroll(subject_id: str, payload: dict,
+                               mesh: Optional[Mesh] = None) -> dict[str, Any]:
+    return fraud_signal("ghost_payroll", subject_id, payload, mesh=mesh)
+
+
+def fraud_signal_subsidy(subject_id: str, payload: dict,
+                         mesh: Optional[Mesh] = None) -> dict[str, Any]:
+    return fraud_signal("subsidy", subject_id, payload, mesh=mesh)

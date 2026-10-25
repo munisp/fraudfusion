@@ -718,6 +718,7 @@ def due_diligence(payload: DueDiligenceInput,
     reasons: list[dict[str, str]] = []   # legacy severity list (back-compat)
     factors: list[dict[str, Any]] = []   # F6 explainable scoring
     signals: dict[str, Any] = {}
+    parcel: Optional[dict[str, Any]] = None
 
     def _factor(code: str, detail: str, severity: str = "medium",
                 penalty: Optional[int] = None) -> None:
@@ -874,6 +875,41 @@ def due_diligence(payload: DueDiligenceInput,
                     "seller name matched the PEP list", "medium")
         scored = risk.score_factors(factors)  # re-score with screening factors
     signals["identity_screening"] = screening_block
+    # Issuance-anomaly advisory: a certificate can be GENUINE yet
+    # fraudulently ISSUED (insider). The fraud-signals service holds the
+    # issuing officer's issuance history; we send what we know locally
+    # (officer id from the parcel record, issuance hour) and the service
+    # adds its own velocity baseline. Advisory only — fail-closed block.
+    issuance_block: dict[str, Any] = {"status": "unavailable",
+                                      "reason": mesh_boot.INTEGRATION_UNAVAILABLE_REASON
+                                      or "FRAUD_SIGNALS_URL not configured"}
+    officer = parcel.get("registered_by") if parcel else None
+    if mesh_boot.INTEGRATION_AVAILABLE and officer:
+        iss_payload: dict[str, Any] = {}
+        try:
+            hour = _parse_dt(parcel["created_at"]).hour
+            iss_payload["issued_hour_local"] = hour
+        except Exception:
+            pass
+        iss = mesh_boot.flows.fraud_signal_issuance(
+            str(officer), iss_payload, mesh_boot.fresh_mesh())
+        if iss["status"] == "ok":
+            issuance_block = {"status": "ok",
+                              "score": iss["data"].get("score"),
+                              "verdict": iss["data"].get("verdict"),
+                              "factors": [f["code"] for f in
+                                          iss["data"].get("factors", [])],
+                              "latency_ms": iss["latency_ms"]}
+            if iss["data"].get("verdict") in ("review", "block"):
+                _factor("issuance_anomaly",
+                        "issuing officer's issuance pattern is anomalous "
+                        f"(fraud-signals verdict: {iss['data']['verdict']})",
+                        "medium" if iss["data"]["verdict"] == "review" else "high")
+                scored = risk.score_factors(factors)
+        else:
+            issuance_block = {"status": iss["status"],
+                              "reason": iss.get("reason")}
+    signals["issuance_anomaly"] = issuance_block
     # Back-compat: the legacy severity verdict and the score band are both
     # reported; the headline verdict is the STRICTER of the two so existing
     # integrators never see a downgrade silently.

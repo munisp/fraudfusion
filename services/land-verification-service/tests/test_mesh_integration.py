@@ -28,11 +28,14 @@ def client(store):
     return TestClient(app)
 
 
-def _register(client, ref="MESH-1"):
-    return client.post("/api/v1/parcels", json={
+def _register(client, ref="MESH-1", registered_by=None):
+    body = {
         "parcel_ref": ref, "state": "Lagos", "lga": "Eti-Osa",
         "certificate_number": f"CERT-{ref}", "owner_name": "Chief Seller",
-        "notice_period_days": 0})
+        "notice_period_days": 0}
+    if registered_by:
+        body["registered_by"] = registered_by
+    return client.post("/api/v1/parcels", json=body)
 
 
 class TestSellerScreening:
@@ -92,3 +95,39 @@ class TestMeshStatusEndpoint:
         assert body["mesh"] == "ok"
         assert "kyc" in body["services"]
         assert body["services"]["kyc"]["configured"] is False
+
+
+class TestIssuanceAnomaly:
+    def test_unconfigured_fraud_signals_is_honest_block(self, client, monkeypatch):
+        monkeypatch.delenv("FRAUD_SIGNALS_URL", raising=False)
+        _register(client)
+        body = client.post("/api/v1/due-diligence", json={
+            "state": "Lagos", "parcel_ref": "MESH-1"}).json()
+        assert body["signals"]["issuance_anomaly"]["status"] == "unavailable"
+
+    def test_issuance_anomaly_adds_factor(self, client, monkeypatch):
+        monkeypatch.setenv("FRAUD_SIGNALS_URL", "http://signals:8600")
+        monkeypatch.setattr(
+            mesh_boot.flows, "fraud_signal_issuance",
+            lambda subject_id, payload, mesh=None: {
+                "status": "ok", "latency_ms": 2.0,
+                "data": {"score": 0.85, "verdict": "block",
+                         "factors": [{"code": "officer_velocity_outlier"}]}})
+        _register(client, ref="MESH-2", registered_by="officer-9")
+        body = client.post("/api/v1/due-diligence", json={
+            "state": "Lagos", "parcel_ref": "MESH-2"}).json()
+        block = body["signals"]["issuance_anomaly"]
+        assert block["status"] == "ok" and block["verdict"] == "block"
+        assert "issuance_anomaly" in {f["code"] for f in body["factors"]}
+
+    def test_clean_issuance_no_factor(self, client, monkeypatch):
+        monkeypatch.setattr(
+            mesh_boot.flows, "fraud_signal_issuance",
+            lambda subject_id, payload, mesh=None: {
+                "status": "ok", "latency_ms": 1.0,
+                "data": {"score": 0.05, "verdict": "clear", "factors": []}})
+        _register(client, ref="MESH-3", registered_by="officer-1")
+        body = client.post("/api/v1/due-diligence", json={
+            "state": "Lagos", "parcel_ref": "MESH-3"}).json()
+        assert body["signals"]["issuance_anomaly"]["verdict"] == "clear"
+        assert "issuance_anomaly" not in {f["code"] for f in body["factors"]}

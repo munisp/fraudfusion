@@ -38,6 +38,7 @@ REGISTRY = {
     "billing": "BILLING_SERVICE_URL",
     "webhook": "WEBHOOK_SERVICE_URL",
     "doc_intel": "DOC_INTEL_URL",
+    "fraud_signals": "FRAUD_SIGNALS_URL",
 }
 
 
